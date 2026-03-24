@@ -1,0 +1,16 @@
+# Base de datos — cada cliente tiene la suya, no se sube al repo
+*.db
+
+# Fotos de productos — son datos del cliente, no código
+fotos_productos/
+
+# Archivos de Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Variables de entorno
+.env
