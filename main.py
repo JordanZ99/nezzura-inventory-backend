@@ -19,7 +19,7 @@ app = FastAPI(
 
 import os
 
-URL_PRODUCCION = os.getenv("FRONTEND_URL", "https://goyangi.vercel.app")
+URL_PRODUCCION = os.getenv("FRONTEND_URL", "https://goyangi-frontend.vercel.app")
 
 origenes_permitidos = [
     "http://localhost:3000",
