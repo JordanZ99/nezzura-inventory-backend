@@ -35,17 +35,18 @@ def insertar_venta(venta: dict) -> None:
 
 def actualizar_venta(
     venta_id: int,
+    fecha: str,
     cantidad: int,
     precio_real: float,
     total_venta: float,
     ganancia_bruta: float
 ) -> dict:
-    """Corrige cantidad y precio de una venta existente."""
+    """Corrige fecha, cantidad y precio de una venta existente."""
     execute("""
         UPDATE ventas
-        SET Cantidad=%s, Precio_Real=%s, Total_Venta=%s, Ganancia_Bruta=%s
+        SET Fecha=%s, Cantidad=%s, Precio_Real=%s, Total_Venta=%s, Ganancia_Bruta=%s
         WHERE id=%s
-    """, (cantidad, precio_real, total_venta, ganancia_bruta, venta_id))
+    """, (fecha, cantidad, precio_real, total_venta, ganancia_bruta, venta_id))
     return {"ok": True, "id": venta_id}
 
 

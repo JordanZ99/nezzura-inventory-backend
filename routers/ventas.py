@@ -23,6 +23,7 @@ class Carrito(BaseModel):
     items: list[ItemCarrito]
 
 class ActualizarVenta(BaseModel):
+    fecha         : str
     cantidad      : int
     precio_real   : float
     total_venta   : float
@@ -72,9 +73,9 @@ def cobrar_carrito(carrito: Carrito):
 
 @router.patch("/{venta_id}")
 def corregir_venta(venta_id: int, data: ActualizarVenta):
-    """Corrige cantidad o precio de una venta registrada por error."""
+    """Corrige la fecha, cantidad o precio de una venta registrada por error."""
     return actualizar_venta(
-        venta_id, data.cantidad,
+        venta_id, data.fecha, data.cantidad,
         data.precio_real, data.total_venta, data.ganancia_bruta
     )
 
