@@ -6,7 +6,16 @@
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel
 from typing import Optional
-import os, shutil, uuid
+import os, uuid
+import cloudinary
+import cloudinary.uploader
+import cloudinary.api
+
+cloudinary.config(
+    cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
+    api_key=os.getenv("CLOUDINARY_API_KEY"),
+    api_secret=os.getenv("CLOUDINARY_API_SECRET")
+)
 
 from database.lotes import (
     get_lotes, get_productos_meta, get_inventario_consolidado,
@@ -16,8 +25,6 @@ from database.lotes import (
 router = APIRouter(prefix="/inventario", tags=["Inventario"])
 
 FOTOS_DIR = "fotos_productos"
-os.makedirs(FOTOS_DIR, exist_ok=True)
-
 
 # --- Modelos Pydantic (validan los datos que llegan) ---
 
@@ -92,12 +99,16 @@ def restockear(data: Restock):
 
 @router.post("/foto/{producto}")
 async def subir_foto(producto: str, foto: UploadFile = File(...)):
-    """Sube la foto de un producto y devuelve la ruta guardada."""
-    ext      = foto.filename.split(".")[-1]
-    filename = f"{FOTOS_DIR}/{producto}_{uuid.uuid4().hex[:8]}.{ext}"
-    with open(filename, "wb") as f:
-        shutil.copyfileobj(foto.file, f)
-    return {"ruta": filename}
+    """Sube la foto de un producto a Cloudinary y devuelve la URL segura."""
+    try:
+        resultado = cloudinary.uploader.upload(
+            foto.file,
+            folder="productos",
+            public_id=f"{producto}_{uuid.uuid4().hex[:8]}"
+        )
+        return {"ruta": resultado.get("secure_url")}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error subiendo a Cloudinary: {str(e)}")
 
 
 @router.patch("/{producto}")
