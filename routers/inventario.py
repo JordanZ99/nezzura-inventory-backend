@@ -51,6 +51,7 @@ class ActualizarProducto(BaseModel):
 class ActualizarLote(BaseModel):
     costo       : float
     precio_venta: float
+    stock       : int
 
 
 # --- Endpoints ---
@@ -140,5 +141,5 @@ def editar_producto(producto: str, data: ActualizarProducto):
 
 @router.patch("/lote/{id_lote}")
 def editar_lote(id_lote: str, data: ActualizarLote):
-    """Actualiza costo y precio de venta de un lote específico."""
-    return actualizar_lote(id_lote, data.costo, data.precio_venta)
+    """Actualiza costo, precio de venta y stock de un lote específico."""
+    return actualizar_lote(id_lote, data.costo, data.precio_venta, data.stock)

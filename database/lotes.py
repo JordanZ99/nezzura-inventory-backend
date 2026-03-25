@@ -121,11 +121,11 @@ def actualizar_producto(
     return {"ok": True, "producto": producto, "estado": estado}
 
 
-def actualizar_lote(id_lote: str, costo: float, precio_venta: float) -> dict:
-    """Actualiza costo y precio de un lote específico."""
+def actualizar_lote(id_lote: str, costo: float, precio_venta: float, stock: int) -> dict:
+    """Actualiza costo, precio de venta y stock de un lote específico."""
     execute("""
-        UPDATE lotes SET Costo=%s, Precio_Venta=%s WHERE ID_Lote=%s
-    """, (costo, precio_venta, id_lote))
+        UPDATE lotes SET Costo=%s, Precio_Venta=%s, Stock_Lote=%s WHERE ID_Lote=%s
+    """, (costo, precio_venta, stock, id_lote))
     return {"ok": True, "id_lote": id_lote}
 
 
