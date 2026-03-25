@@ -101,8 +101,9 @@ def restockear(data: Restock):
 async def subir_foto(producto: str, foto: UploadFile = File(...)):
     """Sube la foto de un producto a Cloudinary y devuelve la URL segura."""
     try:
+        contents = await foto.read()
         resultado = cloudinary.uploader.upload(
-            foto.file,
+            contents,
             folder="productos",
             public_id=f"{producto}_{uuid.uuid4().hex[:8]}"
         )
