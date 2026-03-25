@@ -51,3 +51,13 @@ app.include_router(gastos.router)
 @app.get("/")
 def root():
     return {"mensaje": "Goyangi Store API funcionando ✓"}
+
+
+@app.get("/init-db")
+def forzar_init_db():
+    """Re-crea las tablas si fueron borradas accidentalmente."""
+    try:
+        inicializar_db()
+        return {"ok": True, "mensaje": "Tablas verificadas / creadas correctamente ✓"}
+    except Exception as e:
+        return {"ok": False, "mensaje": str(e)}
