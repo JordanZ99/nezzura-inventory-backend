@@ -6,7 +6,7 @@
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel
 from typing import Optional
-import os, uuid
+import os, uuid, re
 import cloudinary
 import cloudinary.uploader
 import cloudinary.api
@@ -21,6 +21,7 @@ from database.lotes import (
     get_lotes, get_productos_meta, get_inventario_consolidado,
     get_detalle_lotes, agregar_lote, actualizar_producto, actualizar_lote
 )
+from database.conexion import query
 
 router = APIRouter(prefix="/inventario", tags=["Inventario"])
 
@@ -115,6 +116,25 @@ async def subir_foto(producto: str, foto: UploadFile = File(...)):
 @router.patch("/{producto}")
 def editar_producto(producto: str, data: ActualizarProducto):
     """Actualiza metadatos (descripción, imagen, estado) de un producto."""
+    try:
+        old_meta = query("SELECT Imagen FROM productos WHERE Producto=%s", (producto,))
+        if old_meta:
+            old_url = old_meta[0]["imagen"]
+            # Si cambió la imagen y la antigua era de Cloudinary, la borramos para no gastar espacio
+            if old_url and old_url != data.imagen and "res.cloudinary.com" in old_url:
+                partes = old_url.split("/upload/")
+                if len(partes) > 1:
+                    ruta = partes[1]
+                    # Quitar el posible prefijo de versión, ej: v170966456/productos/hash.jpg -> productos/hash.jpg
+                    if re.match(r'^v\d+/', ruta):
+                        ruta = ruta.split("/", 1)[1]
+                    # Quitar la extensión .jpg/.png
+                    public_id = ruta.rsplit(".", 1)[0]
+                    # Eliminamos la imagen antigua
+                    cloudinary.uploader.destroy(public_id)
+    except Exception as e:
+        print(f"Error interno borrando foto antigua de Cloudinary: {e}")
+
     return actualizar_producto(producto, data.descripcion, data.imagen, data.estado)
 
 
