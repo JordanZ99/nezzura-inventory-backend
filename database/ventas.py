@@ -51,6 +51,26 @@ def actualizar_venta(
 
 
 def eliminar_venta(venta_id: int) -> dict:
-    """Elimina una venta por id."""
+    """Elimina una venta por id y restaura el stock al inventario."""
+    # 1. Leer los datos de la venta
+    venta_rows = query("SELECT * FROM ventas WHERE id=%s", (venta_id,))
+    if not venta_rows:
+        return {"ok": False, "mensaje": "Venta no encontrada"}
+    
+    v = venta_rows[0]
+
+    # 2. Restaurar el stock
+    # Importamos aquí para evitar referencias circulares
+    from database.lotes import agregar_lote
+    
+    agregar_lote(
+        producto=v["producto"],
+        descripcion="", 
+        costo=v["costo_unitario"],
+        precio_venta=v["precio_lista"],
+        stock=v["cantidad"]
+    )
+
+    # 3. Eliminar el registro
     execute("DELETE FROM ventas WHERE id=%s", (venta_id,))
-    return {"ok": True, "id": venta_id}
+    return {"ok": True, "id": venta_id, "stock_restaurado": v["cantidad"]}
