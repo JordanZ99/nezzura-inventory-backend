@@ -8,6 +8,7 @@ import os
 import psycopg2
 from psycopg2 import pool
 from psycopg2.extras import RealDictCursor
+from psycopg2.errors import UndefinedTable
 from dotenv import load_dotenv
 from pathlib import Path
 
@@ -37,6 +38,15 @@ def query(sql: str, params: tuple = None) -> list[dict]:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(sql, params or ())
             return [dict(row) for row in cur.fetchall()]
+    except UndefinedTable:
+        conn.rollback()
+        inicializar_db()
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, params or ())
+            return [dict(row) for row in cur.fetchall()]
+    except Exception as e:
+        conn.rollback()
+        raise e
     finally:
         release_conn(conn)
 
@@ -45,6 +55,12 @@ def execute(sql: str, params: tuple = None) -> None:
     """Ejecuta INSERT, UPDATE o DELETE."""
     conn = get_conn()
     try:
+        with conn.cursor() as cur:
+            cur.execute(sql, params or ())
+        conn.commit()
+    except UndefinedTable:
+        conn.rollback()
+        inicializar_db()
         with conn.cursor() as cur:
             cur.execute(sql, params or ())
         conn.commit()
