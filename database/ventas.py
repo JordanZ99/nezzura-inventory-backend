@@ -1,8 +1,5 @@
-# ==============================================================================
-# backend/database/ventas.py
-# CRUD sobre la tabla ventas.
-# ==============================================================================
-
+import psycopg2
+import psycopg2.extras
 from database.conexion import query, execute
 
 
@@ -42,55 +39,88 @@ def actualizar_venta(
     ganancia_bruta: float
 ) -> dict:
     """Corrige fecha, cantidad y precio de una venta existente ajustando el stock."""
-    # 1. Leer los datos de la venta actual
-    venta_rows = query("SELECT * FROM ventas WHERE id=%s", (venta_id,))
-    if not venta_rows:
-        return {"ok": False, "mensaje": "Venta no encontrada"}
-        
-    v = venta_rows[0]
-    vieja_cantidad = int(v["cantidad"])
-    dif = cantidad - vieja_cantidad
-    
-    # 2. Ajustar inventario si la cantidad cambió
-    if dif > 0:
-        # Aumentó la cantidad vendida, descontar de inventario
-        lotes = query("""
-            SELECT * FROM lotes
-            WHERE Producto=%s AND Stock_Lote > 0 AND Estado='Activo'
-            ORDER BY Fecha_Entrada ASC
-        """, (v["producto"],))
-        
-        stock_disponible = sum(int(l["stock_lote"]) for l in lotes)
-        if stock_disponible < dif:
-            return {"ok": False, "mensaje": f"Stock insuficiente para editar la venta. Faltan {dif - stock_disponible} unidades de '{v['producto']}'."}
-            
-        restante = dif
-        for lote in lotes:
-            if restante <= 0: break
-            consumir = min(restante, int(lote["stock_lote"]))
-            nuevo_stock = int(lote["stock_lote"]) - consumir
-            execute("UPDATE lotes SET Stock_Lote=%s WHERE ID_Lote=%s", (nuevo_stock, lote["id_lote"]))
-            restante -= consumir
-            
-    elif dif < 0:
-        # Disminuyó la cantidad vendida, restaurar al inventario
-        from database.lotes import agregar_lote
-        agregar_lote(
-            producto=v["producto"],
-            descripcion="", 
-            costo=v["costo_unitario"],
-            precio_venta=v["precio_lista"],
-            stock=abs(dif)
-        )
+    from database.conexion import get_conn, release_conn
+    from database.lotes import agregar_lote
 
-    # 3. Guardar los cambios
-    execute("""
-        UPDATE ventas
-        SET Fecha=%s, Cantidad=%s, Precio_Real=%s, Total_Venta=%s, Ganancia_Bruta=%s
-        WHERE id=%s
-    """, (fecha, cantidad, precio_real, total_venta, ganancia_bruta, venta_id))
-    
-    return {"ok": True, "id": venta_id}
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # 1. Bloquear la fila para evitar que otras peticiones la lean simultáneamente
+            cur.execute("SELECT * FROM ventas WHERE id=%s FOR UPDATE", (venta_id,))
+            v = cur.fetchone()
+            
+            if not v:
+                return {"ok": False, "mensaje": "Venta no encontrada"}
+                
+            vieja_cantidad = int(v["cantidad"])
+            dif = cantidad - vieja_cantidad
+            
+            # 2. Ajustar inventario si la cantidad cambió
+            if dif > 0:
+                # Aumentó la cantidad vendida, descontar de inventario
+                cur.execute("""
+                    SELECT * FROM lotes
+                    WHERE Producto=%s AND Stock_Lote > 0 AND Estado='Activo'
+                    ORDER BY Fecha_Entrada ASC
+                    FOR UPDATE
+                """, (v["producto"],))
+                lotes = [dict(row) for row in cur.fetchall()]
+                
+                stock_disponible = sum(int(l["stock_lote"]) for l in lotes)
+                if stock_disponible < dif:
+                    conn.rollback()
+                    return {"ok": False, "mensaje": f"Stock insuficiente para editar la venta. Faltan {dif - stock_disponible} unidades de '{v['producto']}'."}
+                    
+                restante = dif
+                for lote in lotes:
+                    if restante <= 0: break
+                    consumir = min(restante, int(lote["stock_lote"]))
+                    nuevo_stock = int(lote["stock_lote"]) - consumir
+                    cur.execute("UPDATE lotes SET Stock_Lote=%s WHERE ID_Lote=%s", (nuevo_stock, lote["id_lote"]))
+                    restante -= consumir
+                    
+            elif dif < 0:
+                # Disminuyó la cantidad vendida, restaurar al inventario
+                cant_a_restaurar = abs(dif)
+                # Buscamos lote existente en esta misma transacción
+                cur.execute("""
+                    SELECT id_lote, stock_lote FROM lotes
+                    WHERE Producto=%s AND Costo=%s AND Precio_Venta=%s AND Estado='Activo'
+                    FOR UPDATE LIMIT 1
+                """, (v["producto"], v["costo_unitario"], v["precio_lista"]))
+                lote_existente = cur.fetchone()
+
+                if lote_existente:
+                    cur.execute(
+                        "UPDATE lotes SET Stock_Lote = Stock_Lote + %s WHERE ID_Lote = %s",
+                        (cant_a_restaurar, lote_existente["id_lote"])
+                    )
+                else:
+                    import uuid
+                    import datetime
+                    id_lote = str(uuid.uuid4())[:12]
+                    fecha_lote = str(datetime.datetime.now())
+                    cur.execute("""
+                        INSERT INTO lotes (ID_Lote, Producto, Costo, Precio_Venta,
+                                           Stock_Lote, Fecha_Entrada, Estado)
+                        VALUES (%s, %s, %s, %s, %s, %s, 'Activo')
+                    """, (id_lote, v["producto"], v["costo_unitario"], v["precio_lista"], cant_a_restaurar, fecha_lote))
+
+            # 3. Guardar los cambios en la venta
+            cur.execute("""
+                UPDATE ventas
+                SET Fecha=%s, Cantidad=%s, Precio_Real=%s, Total_Venta=%s, Ganancia_Bruta=%s
+                WHERE id=%s
+            """, (fecha, cantidad, precio_real, total_venta, ganancia_bruta, venta_id))
+            
+            conn.commit()
+            return {"ok": True, "id": venta_id}
+            
+    except Exception as e:
+        conn.rollback()
+        return {"ok": False, "mensaje": f"Error interno: {str(e)}"}
+    finally:
+        release_conn(conn)
 
 
 def eliminar_venta(venta_id: int) -> dict:
