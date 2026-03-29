@@ -41,12 +41,55 @@ def actualizar_venta(
     total_venta: float,
     ganancia_bruta: float
 ) -> dict:
-    """Corrige fecha, cantidad y precio de una venta existente."""
+    """Corrige fecha, cantidad y precio de una venta existente ajustando el stock."""
+    # 1. Leer los datos de la venta actual
+    venta_rows = query("SELECT * FROM ventas WHERE id=%s", (venta_id,))
+    if not venta_rows:
+        return {"ok": False, "mensaje": "Venta no encontrada"}
+        
+    v = venta_rows[0]
+    vieja_cantidad = int(v["cantidad"])
+    dif = cantidad - vieja_cantidad
+    
+    # 2. Ajustar inventario si la cantidad cambió
+    if dif > 0:
+        # Aumentó la cantidad vendida, descontar de inventario
+        lotes = query("""
+            SELECT * FROM lotes
+            WHERE Producto=%s AND Stock_Lote > 0 AND Estado='Activo'
+            ORDER BY Fecha_Entrada ASC
+        """, (v["producto"],))
+        
+        stock_disponible = sum(int(l["stock_lote"]) for l in lotes)
+        if stock_disponible < dif:
+            return {"ok": False, "mensaje": f"Stock insuficiente para editar la venta. Faltan {dif - stock_disponible} unidades de '{v['producto']}'."}
+            
+        restante = dif
+        for lote in lotes:
+            if restante <= 0: break
+            consumir = min(restante, int(lote["stock_lote"]))
+            nuevo_stock = int(lote["stock_lote"]) - consumir
+            execute("UPDATE lotes SET Stock_Lote=%s WHERE ID_Lote=%s", (nuevo_stock, lote["id_lote"]))
+            restante -= consumir
+            
+    elif dif < 0:
+        # Disminuyó la cantidad vendida, restaurar al inventario
+        from database.lotes import agregar_lote
+        agregar_lote(
+            producto=v["producto"],
+            descripcion="", 
+            costo=v["costo_unitario"],
+            precio_venta=v["precio_lista"],
+            stock=abs(dif)
+        )
+
+    # 3. Guardar los cambios
     execute("""
         UPDATE ventas
         SET Fecha=%s, Cantidad=%s, Precio_Real=%s, Total_Venta=%s, Ganancia_Bruta=%s
         WHERE id=%s
     """, (fecha, cantidad, precio_real, total_venta, ganancia_bruta, venta_id))
+    
     return {"ok": True, "id": venta_id}
 
 

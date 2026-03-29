@@ -74,10 +74,13 @@ def cobrar_carrito(carrito: Carrito):
 @router.patch("/{venta_id}")
 def corregir_venta(venta_id: int, data: ActualizarVenta):
     """Corrige la fecha, cantidad o precio de una venta registrada por error."""
-    return actualizar_venta(
+    resultado = actualizar_venta(
         venta_id, data.fecha, data.cantidad,
         data.precio_real, data.total_venta, data.ganancia_bruta
     )
+    if not resultado.get("ok"):
+        raise HTTPException(status_code=400, detail=resultado.get("mensaje", "Error al actualizar venta"))
+    return resultado
 
 
 @router.delete("/{venta_id}")
