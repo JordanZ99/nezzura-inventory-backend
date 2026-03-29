@@ -16,8 +16,8 @@ def insertar_venta(venta: dict) -> None:
     execute("""
         INSERT INTO ventas
             (Fecha, Producto, Cantidad, Precio_Lista,
-             Precio_Real, Costo_Unitario, Total_Venta, Ganancia_Bruta)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+             Precio_Real, Costo_Unitario, Total_Venta, Ganancia_Bruta, Estado)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'Activo')
     """, (
         venta["fecha"],
         venta["producto"],
@@ -49,8 +49,8 @@ def actualizar_venta(
             cur.execute("SELECT * FROM ventas WHERE id=%s FOR UPDATE", (venta_id,))
             v = cur.fetchone()
             
-            if not v:
-                return {"ok": False, "mensaje": "Venta no encontrada"}
+            if not v or v.get("estado") == "Inactivo":
+                return {"ok": False, "mensaje": "Venta no encontrada o anulada"}
                 
             vieja_cantidad = int(v["cantidad"])
             dif = cantidad - vieja_cantidad
@@ -124,13 +124,15 @@ def actualizar_venta(
 
 
 def eliminar_venta(venta_id: int) -> dict:
-    """Elimina una venta por id y restaura el stock al inventario."""
+    """Anula una venta por id y restaura el stock al inventario sin borrar el registro."""
     # 1. Leer los datos de la venta
     venta_rows = query("SELECT * FROM ventas WHERE id=%s", (venta_id,))
     if not venta_rows:
         return {"ok": False, "mensaje": "Venta no encontrada"}
     
     v = venta_rows[0]
+    if v.get("estado") == "Inactivo":
+        return {"ok": False, "mensaje": "La venta ya está anulada"}
 
     # 2. Restaurar el stock
     # Importamos aquí para evitar referencias circulares
@@ -144,6 +146,6 @@ def eliminar_venta(venta_id: int) -> dict:
         stock=v["cantidad"]
     )
 
-    # 3. Eliminar el registro
-    execute("DELETE FROM ventas WHERE id=%s", (venta_id,))
+    # 3. Anular el registro en lugar de eliminarlo
+    execute("UPDATE ventas SET Estado='Inactivo' WHERE id=%s", (venta_id,))
     return {"ok": True, "id": venta_id, "stock_restaurado": v["cantidad"]}

@@ -107,9 +107,17 @@ def inicializar_db():
                     Precio_Real     REAL,
                     Costo_Unitario  REAL,
                     Total_Venta     REAL,
-                    Ganancia_Bruta  REAL
+                    Ganancia_Bruta  REAL,
+                    Estado          TEXT DEFAULT 'Activo'
                 )
             """)
+            
+            # Asegurar que la columna exista en bases de datos antiguas
+            try:
+                cur.execute("ALTER TABLE ventas ADD COLUMN IF NOT EXISTS Estado TEXT DEFAULT 'Activo'")
+            except Exception as e:
+                pass
+                
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS gastos (
                     id          SERIAL PRIMARY KEY,
