@@ -11,7 +11,17 @@ from database.conexion import query, execute
 def get_lotes() -> list[dict]:
     """Lee lotes + metadatos de productos en un JOIN."""
     return query("""
-        SELECT l.*, p.Imagen, p.Descripcion
+        SELECT 
+            l.id as id,
+            l.id_lote as id_lote,
+            l.producto as producto,
+            l.costo as costo,
+            l.precio_venta as precio_venta,
+            l.stock_lote as stock_lote,
+            l.fecha_entrada as fecha_entrada,
+            l.estado as estado,
+            p.Imagen as imagen, 
+            p.Descripcion as descripcion
         FROM lotes l
         LEFT JOIN productos p ON l.Producto = p.Producto
         WHERE l.Estado = 'Activo'
@@ -21,7 +31,7 @@ def get_lotes() -> list[dict]:
 
 def get_productos_meta() -> list[dict]:
     """Lee la tabla productos (metadatos)."""
-    return query("SELECT * FROM productos ORDER BY Producto ASC")
+    return query("SELECT Producto as producto, Descripcion as descripcion, Imagen as imagen, Estado as estado FROM productos ORDER BY Producto ASC")
 
 
 def get_inventario_consolidado() -> list[dict]:
@@ -31,10 +41,10 @@ def get_inventario_consolidado() -> list[dict]:
     """
     return query("""
         SELECT
-            l.Producto,
-            p.Descripcion,
-            p.Imagen,
-            p.Estado,
+            l.Producto                                               AS producto,
+            p.Descripcion                                            AS descripcion,
+            p.Imagen                                                 AS imagen,
+            p.Estado                                                 AS estado,
             SUM(l.Stock_Lote)                                        AS stock_total,
             MAX(l.Precio_Venta)                                      AS precio_venta,
             SUM(l.Costo * l.Stock_Lote) / NULLIF(SUM(l.Stock_Lote), 0) AS costo_promedio
@@ -49,7 +59,9 @@ def get_inventario_consolidado() -> list[dict]:
 def get_detalle_lotes(producto: str) -> list[dict]:
     """Devuelve los lotes activos de un producto específico."""
     return query("""
-        SELECT * FROM lotes
+        SELECT 
+            id, id_lote, producto, costo, precio_venta, stock_lote, fecha_entrada, estado 
+        FROM lotes
         WHERE Producto = %s AND Estado = 'Activo' AND Stock_Lote > 0
         ORDER BY Fecha_Entrada DESC
     """, (producto,))

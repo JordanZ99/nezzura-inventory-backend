@@ -6,7 +6,7 @@ from database.conexion import query, execute
 def get_ventas(limit: int = 500) -> list[dict]:
     """Lee ventas ordenadas por fecha descendente."""
     return query(
-        "SELECT * FROM ventas ORDER BY Fecha DESC LIMIT %s",
+        "SELECT id, fecha, producto, cantidad, precio_lista, precio_real, costo_unitario, total_venta, ganancia_bruta, estado FROM ventas ORDER BY Fecha DESC LIMIT %s",
         (limit,)
     )
 

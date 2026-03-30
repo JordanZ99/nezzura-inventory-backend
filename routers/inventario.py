@@ -118,7 +118,7 @@ async def subir_foto(producto: str, foto: UploadFile = File(...)):
 def editar_producto(producto: str, data: ActualizarProducto):
     """Actualiza metadatos (descripción, imagen, estado) de un producto."""
     try:
-        old_meta = query("SELECT Imagen FROM productos WHERE Producto=%s", (producto,))
+        old_meta = query("SELECT Imagen as imagen FROM productos WHERE Producto=%s", (producto,))
         if old_meta:
             old_url = old_meta[0]["imagen"]
             # Si cambió la imagen y la antigua era de Cloudinary, la borramos para no gastar espacio
