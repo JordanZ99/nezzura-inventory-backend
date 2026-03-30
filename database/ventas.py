@@ -17,8 +17,8 @@ def insertar_venta(venta: dict) -> None:
     execute("""
         INSERT INTO ventas
             (Fecha, Producto, Cantidad, Precio_Lista,
-             Precio_Real, Costo_Unitario, Total_Venta, Ganancia_Bruta, Estado)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'Activo')
+             Precio_Real, Costo_Unitario, Total_Venta, Ganancia_Bruta, Estado, ID_Lote)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'Activo', %s)
     """, (
         venta["fecha"],
         p_name,
@@ -28,6 +28,7 @@ def insertar_venta(venta: dict) -> None:
         venta["costo_unitario"],
         venta["total_venta"],
         venta["ganancia_bruta"],
+        venta.get("id_lote")
     ))
 
 

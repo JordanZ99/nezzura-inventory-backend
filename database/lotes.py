@@ -139,9 +139,20 @@ def actualizar_producto(
 
 def actualizar_lote(id_lote: str, costo: float, precio_venta: float, stock: int) -> dict:
     """Actualiza costo, precio de venta y stock de un lote específico."""
+    # 1. Actualizar el lote
     execute("""
         UPDATE lotes SET Costo=%s, Precio_Venta=%s, Stock_Lote=%s WHERE ID_Lote=%s
     """, (costo, precio_venta, stock, id_lote))
+
+    # 2. Recalcular ganancias en ventas asociadas a este lote
+    # Ganancia = (Precio_Real - Nuevo_Costo) * Cantidad
+    execute("""
+        UPDATE ventas 
+        SET Costo_Unitario = %s,
+            Ganancia_Bruta = (Precio_Real - %s) * Cantidad
+        WHERE ID_Lote = %s AND Estado = 'Activo'
+    """, (costo, costo, id_lote))
+
     return {"ok": True, "id_lote": id_lote}
 
 
@@ -192,6 +203,7 @@ def descontar_stock_peps(
             "costo_unitario" : float(lote["costo"]),
             "total_venta"    : precio_real * consumir,
             "ganancia_bruta" : (precio_real - float(lote["costo"])) * consumir,
+            "id_lote"        : lote["id_lote"]
         })
         restante -= consumir
 
