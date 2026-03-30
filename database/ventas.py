@@ -13,6 +13,7 @@ def get_ventas(limit: int = 500) -> list[dict]:
 
 def insertar_venta(venta: dict) -> None:
     """Inserta una fila en la tabla ventas."""
+    p_name = str(venta.get("producto", "")).strip()
     execute("""
         INSERT INTO ventas
             (Fecha, Producto, Cantidad, Precio_Lista,
@@ -20,7 +21,7 @@ def insertar_venta(venta: dict) -> None:
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'Activo')
     """, (
         venta["fecha"],
-        venta["producto"],
+        p_name,
         venta["cantidad"],
         venta["precio_lista"],
         venta["precio_real"],

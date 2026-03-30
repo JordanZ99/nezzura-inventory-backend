@@ -75,6 +75,8 @@ def agregar_lote(
     stock: int,
     imagen: str = "No hay foto"
 ) -> dict:
+    producto = producto.strip()
+    descripcion = descripcion.strip()
     """
     Crea producto si no existe, luego inserta un lote nuevo
     o suma stock si ya existe uno con el mismo costo y precio.
@@ -119,6 +121,8 @@ def actualizar_producto(
     imagen: str,
     estado: str
 ) -> dict:
+    producto = producto.strip()
+    descripcion = descripcion.strip()
     """Actualiza metadatos. Si pasa a Inactivo, desactiva todos sus lotes."""
     execute("""
         UPDATE productos SET Descripcion=%s, Imagen=%s, Estado=%s
@@ -146,6 +150,7 @@ def descontar_stock_peps(
     cantidad_total: int,
     precio_real: float
 ) -> list[dict] | None:
+    producto = producto.strip()
     """
     Algoritmo PEPS: descuenta del lote más antiguo primero.
     Retorna lista de registros de venta o None si no hay stock.
