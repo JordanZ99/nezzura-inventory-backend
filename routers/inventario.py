@@ -36,6 +36,7 @@ class NuevoProducto(BaseModel):
     precio_venta: float
     stock       : int
     imagen      : str  = "No hay foto"
+    categoria   : str  = "General"
 
 class Restock(BaseModel):
     producto    : str
@@ -47,6 +48,7 @@ class ActualizarProducto(BaseModel):
     descripcion: str
     imagen     : str
     estado     : str
+    categoria  : str
 
 class ActualizarLote(BaseModel):
     costo       : float
@@ -86,7 +88,7 @@ def crear_producto(data: NuevoProducto):
     return agregar_lote(
         data.producto, data.descripcion,
         data.costo, data.precio_venta,
-        data.stock, data.imagen
+        data.stock, data.imagen, data.categoria
     )
 
 
@@ -136,7 +138,7 @@ def editar_producto(producto: str, data: ActualizarProducto):
     except Exception as e:
         print(f"Error interno borrando foto antigua de Cloudinary: {e}")
 
-    return actualizar_producto(producto, data.descripcion, data.imagen, data.estado)
+    return actualizar_producto(producto, data.descripcion, data.imagen, data.estado, data.categoria)
 
 
 @router.patch("/lote/{id_lote}")

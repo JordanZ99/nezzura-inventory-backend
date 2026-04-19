@@ -82,7 +82,8 @@ def inicializar_db():
                     Producto    TEXT NOT NULL UNIQUE,
                     Descripcion TEXT,
                     Imagen      TEXT DEFAULT 'No hay foto',
-                    Estado      TEXT DEFAULT 'Activo'
+                    Estado      TEXT DEFAULT 'Activo',
+                    Categoria   TEXT DEFAULT 'General'
                 )
             """)
             cur.execute("""
@@ -116,6 +117,11 @@ def inicializar_db():
             try:
                 cur.execute("ALTER TABLE ventas ADD COLUMN IF NOT EXISTS Estado TEXT DEFAULT 'Activo'")
                 cur.execute("ALTER TABLE ventas ADD COLUMN IF NOT EXISTS ID_Lote TEXT")
+            except Exception as e:
+                pass
+
+            try:
+                cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS Categoria TEXT DEFAULT 'General'")
             except Exception as e:
                 pass
                 

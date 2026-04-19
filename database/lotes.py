@@ -21,7 +21,8 @@ def get_lotes() -> list[dict]:
             l.fecha_entrada as fecha_entrada,
             l.estado as estado,
             p.Imagen as imagen, 
-            p.Descripcion as descripcion
+            p.Descripcion as descripcion,
+            p.Categoria as categoria
         FROM lotes l
         LEFT JOIN productos p ON l.Producto = p.Producto
         WHERE l.Estado = 'Activo'
@@ -31,7 +32,7 @@ def get_lotes() -> list[dict]:
 
 def get_productos_meta() -> list[dict]:
     """Lee la tabla productos (metadatos)."""
-    return query("SELECT Producto as producto, Descripcion as descripcion, Imagen as imagen, Estado as estado FROM productos ORDER BY Producto ASC")
+    return query("SELECT Producto as producto, Descripcion as descripcion, Imagen as imagen, Estado as estado, Categoria as categoria FROM productos ORDER BY Producto ASC")
 
 
 def get_inventario_consolidado() -> list[dict]:
@@ -45,13 +46,14 @@ def get_inventario_consolidado() -> list[dict]:
             p.Descripcion                                            AS descripcion,
             p.Imagen                                                 AS imagen,
             p.Estado                                                 AS estado,
+            p.Categoria                                              AS categoria,
             SUM(l.Stock_Lote)                                        AS stock_total,
             MAX(l.Precio_Venta)                                      AS precio_venta,
             SUM(l.Costo * l.Stock_Lote) / NULLIF(SUM(l.Stock_Lote), 0) AS costo_promedio
         FROM lotes l
         LEFT JOIN productos p ON l.Producto = p.Producto
         WHERE l.Estado = 'Activo' AND l.Stock_Lote > 0
-        GROUP BY l.Producto, p.Descripcion, p.Imagen, p.Estado
+        GROUP BY l.Producto, p.Descripcion, p.Imagen, p.Estado, p.Categoria
         ORDER BY l.Producto ASC
     """)
 
@@ -73,7 +75,8 @@ def agregar_lote(
     costo: float,
     precio_venta: float,
     stock: int,
-    imagen: str = "No hay foto"
+    imagen: str = "No hay foto",
+    categoria: str = "General"
 ) -> dict:
     producto = producto.strip()
     descripcion = descripcion.strip()
@@ -83,13 +86,14 @@ def agregar_lote(
     """
     # Upsert en productos
     execute("""
-        INSERT INTO productos (Producto, Descripcion, Imagen, Estado)
-        VALUES (%s, %s, %s, 'Activo')
+        INSERT INTO productos (Producto, Descripcion, Imagen, Estado, Categoria)
+        VALUES (%s, %s, %s, 'Activo', %s)
         ON CONFLICT(Producto) DO UPDATE SET
             Descripcion = EXCLUDED.Descripcion,
+            Categoria = EXCLUDED.Categoria,
             Imagen = CASE WHEN EXCLUDED.Imagen != 'No hay foto'
                          THEN EXCLUDED.Imagen ELSE productos.Imagen END
-    """, (producto, descripcion, imagen))
+    """, (producto, descripcion, imagen, categoria))
 
     # Buscar lote existente con mismo costo y precio
     existente = query("""
@@ -119,15 +123,16 @@ def actualizar_producto(
     producto: str,
     descripcion: str,
     imagen: str,
-    estado: str
+    estado: str,
+    categoria: str
 ) -> dict:
     producto = producto.strip()
     descripcion = descripcion.strip()
     """Actualiza metadatos. Si pasa a Inactivo, desactiva todos sus lotes."""
     execute("""
-        UPDATE productos SET Descripcion=%s, Imagen=%s, Estado=%s
+        UPDATE productos SET Descripcion=%s, Imagen=%s, Estado=%s, Categoria=%s
         WHERE Producto=%s
-    """, (descripcion, imagen, estado, producto))
+    """, (descripcion, imagen, estado, categoria, producto))
 
     if estado == "Inactivo":
         execute(
