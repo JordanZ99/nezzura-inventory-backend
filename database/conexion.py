@@ -15,7 +15,7 @@ from pathlib import Path
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 DATABASE_URL = os.getenv("DATABASE_URL")
-DEFAULT_TENANT_ID = "00000000-0000-0000-0000-000000000000"
+DEFAULT_TENANT_ID = "854d3200-9a78-47cb-874a-9f44d9b036d8"
 
 try:
     _pool = pool.SimpleConnectionPool(1, 10, DATABASE_URL)
