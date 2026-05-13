@@ -95,8 +95,7 @@ def inicializar_db():
             cur.execute("""
                 INSERT INTO tenants (id, nombre, email)
                 VALUES (%s, 'Goyangi Principal', 'admin@goyangi.com')
-                ON CONFLICT (id) DO NOTHING
-                ON CONFLICT (email) DO NOTHING
+                ON CONFLICT DO NOTHING
             """, (DEFAULT_TENANT_ID,))
 
             # 3. Tablas Core
