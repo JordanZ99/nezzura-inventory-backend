@@ -3,10 +3,9 @@
 # Endpoints de gastos del negocio.
 # ==============================================================================
 
-from fastapi import APIRouter
-from pydantic import BaseModel
-
 from database.gastos import get_gastos, insertar_gasto, eliminar_gasto
+from dependencies import get_tenant_id
+from fastapi import APIRouter, Depends
 
 router = APIRouter(prefix="/gastos", tags=["Gastos"])
 
@@ -19,18 +18,18 @@ class NuevoGasto(BaseModel):
 
 
 @router.get("/")
-def listar_gastos():
-    """Historial completo de gastos."""
-    return get_gastos()
+def listar_gastos(tenant_id: str = Depends(get_tenant_id)):
+    """Historial completo de gastos filtrado por tenant."""
+    return get_gastos(tenant_id)
 
 
 @router.post("/")
-def crear_gasto(data: NuevoGasto):
-    """Registra un nuevo gasto."""
-    return insertar_gasto(data.fecha, data.categoria, data.descripcion, data.monto)
+def crear_gasto(data: NuevoGasto, tenant_id: str = Depends(get_tenant_id)):
+    """Registra un nuevo gasto vinculado a un tenant."""
+    return insertar_gasto(data.fecha, data.categoria, data.descripcion, data.monto, tenant_id)
 
 
 @router.delete("/{gasto_id}")
-def borrar_gasto(gasto_id: int):
-    """Elimina un gasto por id."""
-    return eliminar_gasto(gasto_id)
+def borrar_gasto(gasto_id: int, tenant_id: str = Depends(get_tenant_id)):
+    """Elimina un gasto por id y tenant."""
+    return eliminar_gasto(gasto_id, tenant_id)

@@ -22,6 +22,8 @@ from database.lotes import (
     get_detalle_lotes, agregar_lote, actualizar_producto, actualizar_lote
 )
 from database.conexion import query
+from dependencies import get_tenant_id
+from fastapi import Depends
 
 router = APIRouter(prefix="/inventario", tags=["Inventario"])
 
@@ -59,45 +61,47 @@ class ActualizarLote(BaseModel):
 # --- Endpoints ---
 
 @router.get("/")
-def listar_inventario():
+def listar_inventario(tenant_id: str = Depends(get_tenant_id)):
     """Vista consolidada: un producto = una fila con stock total."""
-    return get_inventario_consolidado()
+    return get_inventario_consolidado(tenant_id)
 
 
 @router.get("/lotes")
-def listar_lotes():
+def listar_lotes(tenant_id: str = Depends(get_tenant_id)):
     """Todos los lotes activos con detalle de costo y stock por lote."""
-    return get_lotes()
+    return get_lotes(tenant_id)
 
 
 @router.get("/lotes/{producto}")
-def lotes_por_producto(producto: str):
+def lotes_por_producto(producto: str, tenant_id: str = Depends(get_tenant_id)):
     """Lotes activos de un producto específico."""
-    return get_detalle_lotes(producto)
+    return get_detalle_lotes(producto, tenant_id)
 
 
 @router.get("/productos")
-def listar_productos():
+def listar_productos(tenant_id: str = Depends(get_tenant_id)):
     """Metadatos de todos los productos."""
-    return get_productos_meta()
+    return get_productos_meta(tenant_id)
 
 
 @router.post("/")
-def crear_producto(data: NuevoProducto):
+def crear_producto(data: NuevoProducto, tenant_id: str = Depends(get_tenant_id)):
     """Registra un producto nuevo con su primer lote."""
     return agregar_lote(
         data.producto, data.descripcion,
         data.costo, data.precio_venta,
-        data.stock, data.imagen, data.categoria
+        data.stock, data.imagen, data.categoria,
+        tenant_id
     )
 
 
 @router.post("/restock")
-def restockear(data: Restock):
+def restockear(data: Restock, tenant_id: str = Depends(get_tenant_id)):
     """Añade stock a un producto existente (nuevo lote o suma al existente)."""
     return agregar_lote(
         data.producto, "",
-        data.costo, data.precio_venta, data.stock
+        data.costo, data.precio_venta, data.stock,
+        tenant_id=tenant_id
     )
 
 
@@ -117,10 +121,10 @@ async def subir_foto(producto: str, foto: UploadFile = File(...)):
 
 
 @router.patch("/{producto}")
-def editar_producto(producto: str, data: ActualizarProducto):
+def editar_producto(producto: str, data: ActualizarProducto, tenant_id: str = Depends(get_tenant_id)):
     """Actualiza metadatos (descripción, imagen, estado) de un producto."""
     try:
-        old_meta = query("SELECT Imagen as imagen FROM productos WHERE Producto=%s", (producto,))
+        old_meta = query("SELECT Imagen as imagen FROM productos WHERE Producto=%s AND tenant_id=%s", (producto, tenant_id))
         if old_meta:
             old_url = old_meta[0]["imagen"]
             # Si cambió la imagen y la antigua era de Cloudinary, la borramos para no gastar espacio
@@ -138,10 +142,10 @@ def editar_producto(producto: str, data: ActualizarProducto):
     except Exception as e:
         print(f"Error interno borrando foto antigua de Cloudinary: {e}")
 
-    return actualizar_producto(producto, data.descripcion, data.imagen, data.estado, data.categoria)
+    return actualizar_producto(producto, data.descripcion, data.imagen, data.estado, data.categoria, tenant_id)
 
 
 @router.patch("/lote/{id_lote}")
-def editar_lote(id_lote: str, data: ActualizarLote):
+def editar_lote(id_lote: str, data: ActualizarLote, tenant_id: str = Depends(get_tenant_id)):
     """Actualiza costo, precio de venta y stock de un lote específico."""
-    return actualizar_lote(id_lote, data.costo, data.precio_venta, data.stock)
+    return actualizar_lote(id_lote, data.costo, data.precio_venta, data.stock, tenant_id)
