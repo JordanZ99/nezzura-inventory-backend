@@ -7,6 +7,7 @@ from database.lotes  import descontar_stock_peps
 from database.ventas import get_ventas, insertar_venta, actualizar_venta, eliminar_venta
 from dependencies import get_tenant_id
 from fastapi import APIRouter, HTTPException, Depends
+from pydantic import BaseModel
 
 router = APIRouter(prefix="/ventas", tags=["Ventas"])
 

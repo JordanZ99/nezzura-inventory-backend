@@ -6,6 +6,7 @@
 from database.gastos import get_gastos, insertar_gasto, eliminar_gasto
 from dependencies import get_tenant_id
 from fastapi import APIRouter, Depends
+from pydantic import BaseModel
 
 router = APIRouter(prefix="/gastos", tags=["Gastos"])
 
