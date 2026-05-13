@@ -2,9 +2,6 @@ import psycopg2.extras
 from database.conexion import query, execute, DEFAULT_TENANT_ID
 
 
-from database.conexion import query, execute, DEFAULT_TENANT_ID
-
-
 def get_ventas(limit: int = 500, tenant_id: str = DEFAULT_TENANT_ID) -> list[dict]:
     """Lee ventas ordenadas por fecha descendente y filtradas por tenant."""
     return query(

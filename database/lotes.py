@@ -81,7 +81,6 @@ def agregar_lote(
     costo: float,
     precio_venta: float,
     stock: int,
-    stock: int,
     imagen: str = "No hay foto",
     categoria: str = "General",
     tenant_id: str = DEFAULT_TENANT_ID
