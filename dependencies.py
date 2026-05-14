@@ -54,7 +54,7 @@ def get_tenant_id(
         payload = jwt.decode(
             token,
             SUPABASE_JWT_SECRET,
-            algorithms=["HS256"],
+            algorithms=["HS256", "ES256"],
             audience="authenticated",
         )
     except jwt.ExpiredSignatureError:
