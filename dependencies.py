@@ -20,17 +20,10 @@ SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", os.getenv("NEXT_PUBLIC_SUPABA
 _DEV_MODE = not SUPABASE_URL
 
 # URL de las llaves públicas
-JWKS_URL = f"{SUPABASE_URL}/auth/v1/jwks"
+JWKS_URL = f"{SUPABASE_URL}/auth/v1/.well-known/jwks.json"
 
-# Cliente JWKS con headers para evitar el 401 de Supabase
-# Pasamos la anon key en el header 'apikey' como pide Supabase
-jwks_client = PyJWKClient(
-    JWKS_URL, 
-    headers={
-        "apikey": SUPABASE_ANON_KEY,
-        "Authorization": f"Bearer {SUPABASE_ANON_KEY}"
-    }
-) if not _DEV_MODE else None
+# Cliente JWKS
+jwks_client = PyJWKClient(JWKS_URL) if not _DEV_MODE else None
 
 _bearer_scheme = HTTPBearer(auto_error=False)
 
