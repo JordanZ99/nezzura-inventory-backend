@@ -29,10 +29,10 @@ origenes_permitidos = [
     URL_PRODUCCION
 ]
 
-# CORS cerrado: protege el backend de peticiones hechas desde otras páginas piratas
+# CORS abierto temporalmente para diagnóstico
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origenes_permitidos,
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
