@@ -74,7 +74,7 @@ def listar_lotes(tenant_id: str = Depends(get_tenant_id)):
     """Todos los lotes activos con detalle de costo y stock por lote."""
     print(f"DEBUG: listar_lotes — Tenant ID: {tenant_id}")
     resultado = get_lotes(tenant_id)
-    print(f"DEBUG: listar_lotes — Resultados: {len(resultado)}")
+    print(f"DEBUG: listar_lotes — Resultados encontrados: {len(resultado)}")
     return resultado
 
 
