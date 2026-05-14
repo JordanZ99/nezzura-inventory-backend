@@ -17,6 +17,10 @@ SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET", "")
 # En modo desarrollo (sin secret configurado) devuelve el tenant por defecto
 _DEV_MODE = not SUPABASE_JWT_SECRET
 
+print(f"DEBUG AUTH: JWT Secret cargado? {'SÍ' if not _DEV_MODE else 'NO (Modo DEV)'}")
+if not _DEV_MODE:
+    print(f"DEBUG AUTH: Longitud del Secret: {len(SUPABASE_JWT_SECRET)}")
+
 _bearer_scheme = HTTPBearer(auto_error=False)
 
 
@@ -54,14 +58,22 @@ def get_tenant_id(
             audience="authenticated",
         )
     except jwt.ExpiredSignatureError:
+        print("DEBUG AUTH: Token expirado")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Token expirado. Inicia sesión nuevamente.",
         )
-    except jwt.InvalidTokenError as e:
+    except jwt.InvalidSignatureError:
+        print("DEBUG AUTH: Firma inválida. El SUPABASE_JWT_SECRET no coincide con la firma del token.")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Token inválido: {str(e)}",
+            detail="Error de firma - verifica la Secret en Render",
+        )
+    except jwt.InvalidTokenError as e:
+        print(f"DEBUG AUTH: Error de validación JWT: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Token inválido o malformado: {str(e)}",
         )
 
     # El 'sub' de Supabase es el auth.uid(), que coincide con el tenant_id
