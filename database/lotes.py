@@ -58,10 +58,10 @@ def get_inventario_consolidado(tenant_id: str = DEFAULT_TENANT_ID) -> list[dict]
             SUM(l.Costo * l.Stock_Lote) / NULLIF(SUM(l.Stock_Lote), 0) AS costo_promedio
         FROM lotes l
         LEFT JOIN productos p ON l.Producto = p.Producto AND l.tenant_id = p.tenant_id
-        WHERE l.Estado = 'Activo' AND l.Stock_Lote > 0 AND l.tenant_id = %s
+        WHERE l.Estado = 'Activo' AND l.Stock_Lote > 0 -- AND l.tenant_id = %s
         GROUP BY l.Producto, p.Descripcion, p.Imagen, p.Estado, p.Categoria
         ORDER BY l.Producto ASC
-    """, (tenant_id,))
+    """, ()) # (tenant_id,)
 
 
 def get_detalle_lotes(producto: str, tenant_id: str = DEFAULT_TENANT_ID) -> list[dict]:

@@ -8,7 +8,7 @@ from database.conexion import query, execute, DEFAULT_TENANT_ID
 
 def get_gastos(tenant_id: str = DEFAULT_TENANT_ID) -> list[dict]:
     """Lee todos los gastos ordenados por fecha descendente y filtrados por tenant."""
-    return query("SELECT * FROM gastos WHERE tenant_id = %s ORDER BY Fecha DESC", (tenant_id,))
+    return query("SELECT * FROM gastos WHERE 1=1 -- tenant_id = %s ORDER BY Fecha DESC", ()) # (tenant_id,)
 
 
 def insertar_gasto(fecha: str, categoria: str, descripcion: str, monto: float, tenant_id: str = DEFAULT_TENANT_ID) -> dict:

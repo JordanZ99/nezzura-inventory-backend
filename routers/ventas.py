@@ -35,7 +35,10 @@ class ActualizarVenta(BaseModel):
 @router.get("/")
 def listar_ventas(limit: int = 500, tenant_id: str = Depends(get_tenant_id)):
     """Historial de ventas ordenado por fecha descendente y filtrado por tenant."""
-    return get_ventas(limit, tenant_id)
+    print(f"DEBUG: listar_ventas — Tenant ID: {tenant_id}")
+    resultado = get_ventas(limit, tenant_id)
+    print(f"DEBUG: listar_ventas — Resultados: {len(resultado)}")
+    return resultado
 
 
 @router.post("/cobrar")

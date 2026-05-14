@@ -63,13 +63,19 @@ class ActualizarLote(BaseModel):
 @router.get("/")
 def listar_inventario(tenant_id: str = Depends(get_tenant_id)):
     """Vista consolidada: un producto = una fila con stock total."""
-    return get_inventario_consolidado(tenant_id)
+    print(f"DEBUG: listar_inventario — Tenant ID: {tenant_id}")
+    resultado = get_inventario_consolidado(tenant_id)
+    print(f"DEBUG: listar_inventario — Resultados: {len(resultado)}")
+    return resultado
 
 
 @router.get("/lotes")
 def listar_lotes(tenant_id: str = Depends(get_tenant_id)):
     """Todos los lotes activos con detalle de costo y stock por lote."""
-    return get_lotes(tenant_id)
+    print(f"DEBUG: listar_lotes — Tenant ID: {tenant_id}")
+    resultado = get_lotes(tenant_id)
+    print(f"DEBUG: listar_lotes — Resultados: {len(resultado)}")
+    return resultado
 
 
 @router.get("/lotes/{producto}")
@@ -81,7 +87,10 @@ def lotes_por_producto(producto: str, tenant_id: str = Depends(get_tenant_id)):
 @router.get("/productos")
 def listar_productos(tenant_id: str = Depends(get_tenant_id)):
     """Metadatos de todos los productos."""
-    return get_productos_meta(tenant_id)
+    print(f"DEBUG: listar_productos — Tenant ID: {tenant_id}")
+    resultado = get_productos_meta(tenant_id)
+    print(f"DEBUG: listar_productos — Resultados: {len(resultado)}")
+    return resultado
 
 
 @router.post("/")

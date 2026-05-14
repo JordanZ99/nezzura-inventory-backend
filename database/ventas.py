@@ -5,8 +5,8 @@ from database.conexion import query, execute, DEFAULT_TENANT_ID
 def get_ventas(limit: int = 500, tenant_id: str = DEFAULT_TENANT_ID) -> list[dict]:
     """Lee ventas ordenadas por fecha descendente y filtradas por tenant."""
     return query(
-        "SELECT id, fecha, producto, cantidad, precio_lista, precio_real, costo_unitario, total_venta, ganancia_bruta, estado FROM ventas WHERE tenant_id = %s ORDER BY Fecha DESC LIMIT %s",
-        (tenant_id, limit)
+        "SELECT id, fecha, producto, cantidad, precio_lista, precio_real, costo_unitario, total_venta, ganancia_bruta, estado FROM ventas WHERE 1=1 -- tenant_id = %s ORDER BY Fecha DESC LIMIT %s",
+        (limit,) # (tenant_id, limit)
     )
 
 

@@ -21,7 +21,10 @@ class NuevoGasto(BaseModel):
 @router.get("/")
 def listar_gastos(tenant_id: str = Depends(get_tenant_id)):
     """Historial completo de gastos filtrado por tenant."""
-    return get_gastos(tenant_id)
+    print(f"DEBUG: listar_gastos — Tenant ID: {tenant_id}")
+    resultado = get_gastos(tenant_id)
+    print(f"DEBUG: listar_gastos — Resultados: {len(resultado)}")
+    return resultado
 
 
 @router.post("/")
