@@ -14,14 +14,14 @@ from database.conexion import DEFAULT_TENANT_ID
 # ---------------------------------------------------------------------------
 # Configuración
 # ---------------------------------------------------------------------------
-# Obtenemos la URL y nos aseguramos de que NO tenga barra al final
-raw_url = os.getenv("SUPABASE_URL", os.getenv("NEXT_PUBLIC_SUPABASE_URL", ""))
-SUPABASE_URL = raw_url.rstrip("/")
-
+# Priorizamos SUPABASE_URL, fallback a NEXT_PUBLIC_SUPABASE_URL
+SUPABASE_URL = os.getenv("SUPABASE_URL", os.getenv("NEXT_PUBLIC_SUPABASE_URL", ""))
 _DEV_MODE = not SUPABASE_URL
 
-# URL de las llaves públicas de Supabase (formato estándar)
-JWKS_URL = f"{SUPABASE_URL}/auth/v1/.well-known/jwks.json"
+# Intentaremos la ruta estándar de Supabase
+JWKS_URL = f"{SUPABASE_URL}/auth/v1/jwks"
+
+print(f"DEBUG AUTH: Configurando JWKS en {JWKS_URL}")
 
 # Cliente para manejar las llaves dinámicamente
 jwks_client = PyJWKClient(JWKS_URL) if not _DEV_MODE else None
@@ -31,10 +31,6 @@ _bearer_scheme = HTTPBearer(auto_error=False)
 def get_tenant_id(
     credentials: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
 ) -> str:
-    """
-    Verifica el token contra las llaves públicas de Supabase.
-    Soporta HS256 y ES256 automáticamente.
-    """
     if _DEV_MODE:
         return DEFAULT_TENANT_ID
 
@@ -46,7 +42,7 @@ def get_tenant_id(
 
     token = credentials.credentials
     try:
-        # Obtenemos la llave de firma directamente del JWT
+        # Obtenemos la llave de firma
         signing_key = jwks_client.get_signing_key_from_jwt(token)
         
         payload = jwt.decode(
@@ -56,16 +52,14 @@ def get_tenant_id(
             audience="authenticated",
         )
         
-        tenant_id = payload.get("sub")
-        if not tenant_id:
-            raise HTTPException(status_code=401, detail="El token no contiene el ID de usuario (sub)")
-            
-        return tenant_id
+        tid = payload.get("sub")
+        if not tid:
+            raise Exception("Token no contiene el campo 'sub'")
+        return tid
 
     except Exception as e:
-        # Imprimimos el error exacto para verlo en Render
-        print(f"DEBUG AUTH: Fallo crítico de validación: {str(e)}")
+        print(f"DEBUG AUTH: Fallo crítico: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Error de autenticación: {str(e)}. Revisa la URL de Supabase en Render.",
+            detail=f"Error de validación (JWKS): {str(e)}. Verifica la URL de Supabase.",
         )
