@@ -50,7 +50,20 @@ app.include_router(gastos.router)
 
 @app.get("/")
 def root():
-    return {"mensaje": "Goyangi Store API funcionando ✓"}
+    from database.conexion import query
+    stats = {}
+    try:
+        stats["productos"] = query("SELECT COUNT(*) as c FROM productos")[0]["c"]
+        stats["lotes"] = query("SELECT COUNT(*) as c FROM lotes")[0]["c"]
+        stats["ventas"] = query("SELECT COUNT(*) as c FROM ventas")[0]["c"]
+        stats["gastos"] = query("SELECT COUNT(*) as c FROM gastos")[0]["c"]
+        return {
+            "mensaje": "Goyangi Store API funcionando ✓",
+            "database_stats": stats,
+            "nota": "Si los números son 0, el backend está conectado a una DB vacía."
+        }
+    except Exception as e:
+        return {"mensaje": "Error obteniendo stats", "error": str(e)}
 
 
 @app.get("/init-db")
