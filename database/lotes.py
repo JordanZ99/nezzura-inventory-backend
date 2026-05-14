@@ -25,9 +25,9 @@ def get_lotes(tenant_id: str = DEFAULT_TENANT_ID) -> list[dict]:
             p.Categoria as categoria
         FROM lotes l
         LEFT JOIN productos p ON l.Producto = p.Producto AND l.tenant_id = p.tenant_id
-        WHERE l.Estado = 'Activo' AND l.tenant_id = %s
+        WHERE l.Estado = 'Activo' -- AND l.tenant_id = %s
         ORDER BY l.Producto, l.Fecha_Entrada ASC
-    """, (tenant_id,))
+    """, ()) # (tenant_id,)
 
 
 def get_productos_meta(tenant_id: str = DEFAULT_TENANT_ID) -> list[dict]:
