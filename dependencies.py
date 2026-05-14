@@ -14,11 +14,13 @@ from database.conexion import DEFAULT_TENANT_ID
 # ---------------------------------------------------------------------------
 # Configuración
 # ---------------------------------------------------------------------------
-# Priorizamos SUPABASE_URL, fallback a NEXT_PUBLIC_SUPABASE_URL
-SUPABASE_URL = os.getenv("SUPABASE_URL", os.getenv("NEXT_PUBLIC_SUPABASE_URL", ""))
+# Obtenemos la URL y nos aseguramos de que NO tenga barra al final
+raw_url = os.getenv("SUPABASE_URL", os.getenv("NEXT_PUBLIC_SUPABASE_URL", ""))
+SUPABASE_URL = raw_url.rstrip("/")
+
 _DEV_MODE = not SUPABASE_URL
 
-# URL de las llaves públicas de Supabase
+# URL de las llaves públicas de Supabase (formato estándar)
 JWKS_URL = f"{SUPABASE_URL}/auth/v1/.well-known/jwks.json"
 
 # Cliente para manejar las llaves dinámicamente
@@ -30,8 +32,8 @@ def get_tenant_id(
     credentials: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
 ) -> str:
     """
-    Extrae y verifica el token usando las llaves públicas de Supabase (JWKS).
-    Esto soporta automáticamente tanto HS256 como ES256.
+    Verifica el token contra las llaves públicas de Supabase.
+    Soporta HS256 y ES256 automáticamente.
     """
     if _DEV_MODE:
         return DEFAULT_TENANT_ID
@@ -56,13 +58,14 @@ def get_tenant_id(
         
         tenant_id = payload.get("sub")
         if not tenant_id:
-            raise HTTPException(status_code=401, detail="Token sin 'sub'")
+            raise HTTPException(status_code=401, detail="El token no contiene el ID de usuario (sub)")
             
         return tenant_id
 
     except Exception as e:
-        print(f"DEBUG AUTH: Fallo en verificación JWKS: {str(e)}")
+        # Imprimimos el error exacto para verlo en Render
+        print(f"DEBUG AUTH: Fallo crítico de validación: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Error de autenticación: {str(e)}. Verifica que SUPABASE_URL esté en Render.",
+            detail=f"Error de autenticación: {str(e)}. Revisa la URL de Supabase en Render.",
         )
