@@ -13,70 +13,48 @@ from database.conexion import DEFAULT_TENANT_ID
 # ---------------------------------------------------------------------------
 # Configuración
 # ---------------------------------------------------------------------------
-SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET", "")
-# En modo desarrollo (sin secret configurado) devuelve el tenant por defecto
-_DEV_MODE = not SUPABASE_JWT_SECRET
+import requests
+from jwt import PyJWKClient
 
-print(f"DEBUG AUTH: JWT Secret cargado? {'SÍ' if not _DEV_MODE else 'NO (Modo DEV)'}")
-if not _DEV_MODE:
-    print(f"DEBUG AUTH: Longitud del Secret: {len(SUPABASE_JWT_SECRET)}")
+SUPABASE_URL = os.getenv("NEXT_PUBLIC_SUPABASE_URL", "")
+# En modo desarrollo (sin URL configurada) devuelve el tenant por defecto
+_DEV_MODE = not SUPABASE_URL
+JWKS_URL = f"{SUPABASE_URL}/auth/v1/jwks"
 
+# Cliente para manejar las llaves dinámicamente
+jwks_client = PyJWKClient(JWKS_URL)
 _bearer_scheme = HTTPBearer(auto_error=False)
-
 
 def get_tenant_id(
     credentials: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
 ) -> str:
-    """
-    Extrae el tenant_id (= sub del JWT) del token Bearer enviado por el frontend.
-
-    Modo desarrollo (SUPABASE_JWT_SECRET vacío):
-        Devuelve DEFAULT_TENANT_ID para que la app siga funcionando sin login.
-
-    Modo producción:
-        Verifica la firma del token con el JWT secret de Supabase y extrae
-        el claim 'sub' (= auth.uid()), que es el tenant_id del usuario.
-    """
     if _DEV_MODE:
-        # Sin secret configurado → modo desarrollo, usa tenant por defecto
         return DEFAULT_TENANT_ID
 
-    # Modo producción: el token es obligatorio
     if credentials is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Token de autenticación requerido.",
-            headers={"WWW-Authenticate": "Bearer"},
         )
 
     token = credentials.credentials
     try:
+        # Obtenemos la llave correcta automáticamente desde Supabase
+        signing_key = jwks_client.get_signing_key_from_jwt(token)
+        
         payload = jwt.decode(
             token,
-            SUPABASE_JWT_SECRET,
+            signing_key.key,
             algorithms=["HS256", "ES256"],
             audience="authenticated",
         )
-    except jwt.ExpiredSignatureError:
-        print("DEBUG AUTH: Token expirado")
+    except Exception as e:
+        print(f"DEBUG AUTH: Error validando token: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token expirado. Inicia sesión nuevamente.",
-        )
-    except jwt.InvalidSignatureError:
-        print("DEBUG AUTH: Firma inválida. El SUPABASE_JWT_SECRET no coincide con la firma del token.")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Error de firma - verifica la Secret en Render",
-        )
-    except jwt.InvalidTokenError as e:
-        print(f"DEBUG AUTH: Error de validación JWT: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Token inválido o malformado: {str(e)}",
+            detail=f"Error de autenticación: {str(e)}",
         )
 
-    # El 'sub' de Supabase es el auth.uid(), que coincide con el tenant_id
     tenant_id = payload.get("sub")
     if not tenant_id:
         raise HTTPException(
