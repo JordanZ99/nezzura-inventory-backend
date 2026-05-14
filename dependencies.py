@@ -14,17 +14,24 @@ from database.conexion import DEFAULT_TENANT_ID
 # ---------------------------------------------------------------------------
 # Configuración
 # ---------------------------------------------------------------------------
-# Priorizamos SUPABASE_URL, fallback a NEXT_PUBLIC_SUPABASE_URL
 SUPABASE_URL = os.getenv("SUPABASE_URL", os.getenv("NEXT_PUBLIC_SUPABASE_URL", ""))
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", os.getenv("NEXT_PUBLIC_SUPABASE_ANON_KEY", ""))
+
 _DEV_MODE = not SUPABASE_URL
 
-# Intentaremos la ruta estándar de Supabase
+# URL de las llaves públicas
 JWKS_URL = f"{SUPABASE_URL}/auth/v1/jwks"
 
-print(f"DEBUG AUTH: Configurando JWKS en {JWKS_URL}")
+# Cliente JWKS con headers para evitar el 401 de Supabase
+# Pasamos la anon key en el header 'apikey' como pide Supabase
+jwks_client = PyJWKClient(
+    JWKS_URL, 
+    headers={
+        "apikey": SUPABASE_ANON_KEY,
+        "Authorization": f"Bearer {SUPABASE_ANON_KEY}"
+    }
+) if not _DEV_MODE else None
 
-# Cliente para manejar las llaves dinámicamente
-jwks_client = PyJWKClient(JWKS_URL) if not _DEV_MODE else None
 _bearer_scheme = HTTPBearer(auto_error=False)
 
 
@@ -42,7 +49,7 @@ def get_tenant_id(
 
     token = credentials.credentials
     try:
-        # Obtenemos la llave de firma
+        # Intentamos obtener la llave de firma
         signing_key = jwks_client.get_signing_key_from_jwt(token)
         
         payload = jwt.decode(
@@ -54,12 +61,12 @@ def get_tenant_id(
         
         tid = payload.get("sub")
         if not tid:
-            raise Exception("Token no contiene el campo 'sub'")
+            raise Exception("El token no contiene el ID de usuario (sub)")
         return tid
 
     except Exception as e:
-        print(f"DEBUG AUTH: Fallo crítico: {str(e)}")
+        print(f"DEBUG AUTH: Fallo en la validación: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Error de validación (JWKS): {str(e)}. Verifica la URL de Supabase.",
+            detail=f"Error de acceso: {str(e)}. Revisa las llaves en Render.",
         )
