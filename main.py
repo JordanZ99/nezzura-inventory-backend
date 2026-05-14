@@ -29,10 +29,10 @@ origenes_permitidos = [
     URL_PRODUCCION
 ]
 
-# CORS abierto temporalmente para diagnóstico
+# CORS seguro con orígenes explícitos
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=origenes_permitidos,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
