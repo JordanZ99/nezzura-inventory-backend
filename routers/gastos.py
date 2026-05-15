@@ -4,7 +4,7 @@
 # ==============================================================================
 
 from database.gastos import get_gastos, insertar_gasto, eliminar_gasto
-from dependencies import get_tenant_id
+from dependencies import validar_sesion
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 
@@ -19,21 +19,19 @@ class NuevoGasto(BaseModel):
 
 
 @router.get("/")
-def listar_gastos(tenant_id: str = Depends(get_tenant_id)):
-    """Historial completo de gastos filtrado por tenant."""
-    print(f"DEBUG: listar_gastos — Tenant ID: {tenant_id}")
-    resultado = get_gastos(tenant_id)
-    print(f"DEBUG: listar_gastos — Resultados: {len(resultado)}")
+def listar_gastos(_: bool = Depends(validar_sesion)):
+    """Historial completo de gastos."""
+    resultado = get_gastos()
     return resultado
 
 
 @router.post("/")
-def crear_gasto(data: NuevoGasto, tenant_id: str = Depends(get_tenant_id)):
-    """Registra un nuevo gasto vinculado a un tenant."""
-    return insertar_gasto(data.fecha, data.categoria, data.descripcion, data.monto, tenant_id)
+def crear_gasto(data: NuevoGasto, _: bool = Depends(validar_sesion)):
+    """Registra un nuevo gasto."""
+    return insertar_gasto(data.fecha, data.categoria, data.descripcion, data.monto)
 
 
 @router.delete("/{gasto_id}")
-def borrar_gasto(gasto_id: int, tenant_id: str = Depends(get_tenant_id)):
-    """Elimina un gasto por id y tenant."""
-    return eliminar_gasto(gasto_id, tenant_id)
+def borrar_gasto(gasto_id: int, _: bool = Depends(validar_sesion)):
+    """Elimina un gasto por id."""
+    return eliminar_gasto(gasto_id)

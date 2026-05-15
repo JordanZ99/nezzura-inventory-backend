@@ -15,7 +15,6 @@ from pathlib import Path
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 DATABASE_URL = os.getenv("DATABASE_URL")
-DEFAULT_TENANT_ID = "854d3200-9a78-47cb-874a-9f44d9b036d8"
 
 try:
     _pool = pool.SimpleConnectionPool(1, 10, DATABASE_URL)
@@ -73,44 +72,22 @@ def execute(sql: str, params: tuple = None) -> None:
 
 
 def inicializar_db():
-    """Crea las tablas si no existen al arrancar y maneja la migración a multitenant."""
+    """Crea las tablas si no existen al arrancar."""
     conn = get_conn()
     try:
         with conn.cursor() as cur:
-            # 1. Tabla de Tenants (Clientes/Cuentas)
+            # 1. Tablas Core
             cur.execute("""
-                CREATE TABLE IF NOT EXISTS tenants (
-                    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                    nombre      TEXT NOT NULL,
-                    email       TEXT NOT NULL UNIQUE,
-                    plan        TEXT DEFAULT 'basico',
-                    activo      BOOLEAN DEFAULT true,
-                    creado_en   TIMESTAMP DEFAULT now()
-                )
-            """)
-
-            # 2. Crear Tenant por defecto para datos huérfanos/actuales
-            # Usamos un UUID estático para el primer tenant para facilitar la transición
-            DEFAULT_TENANT_ID = "00000000-0000-0000-0000-000000000000"
-            cur.execute("""
-                INSERT INTO tenants (id, nombre, email)
-                VALUES (%s, 'Goyangi Principal', 'admin@goyangi.com')
-                ON CONFLICT DO NOTHING
-            """, (DEFAULT_TENANT_ID,))
-
-            # 3. Tablas Core
-            cur.execute(f"""
                 CREATE TABLE IF NOT EXISTS productos (
                     id          SERIAL PRIMARY KEY,
                     Producto    TEXT NOT NULL UNIQUE,
                     Descripcion TEXT,
                     Imagen      TEXT DEFAULT 'No hay foto',
                     Estado      TEXT DEFAULT 'Activo',
-                    Categoria   TEXT DEFAULT 'General',
-                    tenant_id   UUID REFERENCES tenants(id) DEFAULT '{DEFAULT_TENANT_ID}'
+                    Categoria   TEXT DEFAULT 'General'
                 )
             """)
-            cur.execute(f"""
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS lotes (
                     id            SERIAL PRIMARY KEY,
                     ID_Lote       TEXT NOT NULL UNIQUE,
@@ -119,11 +96,10 @@ def inicializar_db():
                     Precio_Venta  REAL DEFAULT 0,
                     Stock_Lote    INTEGER DEFAULT 0,
                     Fecha_Entrada TEXT,
-                    Estado        TEXT DEFAULT 'Activo',
-                    tenant_id     UUID REFERENCES tenants(id) DEFAULT '{DEFAULT_TENANT_ID}'
+                    Estado        TEXT DEFAULT 'Activo'
                 )
             """)
-            cur.execute(f"""
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS ventas (
                     id              SERIAL PRIMARY KEY,
                     Fecha           TEXT,
@@ -135,30 +111,20 @@ def inicializar_db():
                     Total_Venta     REAL,
                     Ganancia_Bruta  REAL,
                     Estado          TEXT DEFAULT 'Activo',
-                    ID_Lote         TEXT,
-                    tenant_id       UUID REFERENCES tenants(id) DEFAULT '{DEFAULT_TENANT_ID}'
+                    ID_Lote         TEXT
                 )
             """)
-            cur.execute(f"""
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS gastos (
                     id          SERIAL PRIMARY KEY,
                     Fecha       TEXT,
                     Categoria   TEXT,
                     Descripcion TEXT,
-                    Monto       REAL,
-                    tenant_id   UUID REFERENCES tenants(id) DEFAULT '{DEFAULT_TENANT_ID}'
+                    Monto       REAL
                 )
             """)
             
-            # 4. Migración: Asegurar columnas en tablas que ya existen
-            tablas = ["productos", "lotes", "ventas", "gastos"]
-            for tabla in tablas:
-                try:
-                    cur.execute(f"ALTER TABLE {tabla} ADD COLUMN IF NOT EXISTS tenant_id UUID REFERENCES tenants(id) DEFAULT '{DEFAULT_TENANT_ID}'")
-                except Exception:
-                    pass
-
-            # Columnas adicionales específicas
+            # 2. Asegurar columnas específicas si las tablas ya existían
             try:
                 cur.execute("ALTER TABLE ventas ADD COLUMN IF NOT EXISTS Estado TEXT DEFAULT 'Activo'")
                 cur.execute("ALTER TABLE ventas ADD COLUMN IF NOT EXISTS ID_Lote TEXT")
@@ -168,4 +134,4 @@ def inicializar_db():
                 
         conn.commit()
     finally:
-        release_conn(conn)
+        release_conn(conn)

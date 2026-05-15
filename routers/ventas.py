@@ -5,7 +5,7 @@
 
 from database.lotes  import descontar_stock_peps
 from database.ventas import get_ventas, insertar_venta, actualizar_venta, eliminar_venta
-from dependencies import get_tenant_id
+from dependencies import validar_sesion
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 
@@ -33,27 +33,24 @@ class ActualizarVenta(BaseModel):
 # --- Endpoints ---
 
 @router.get("/")
-def listar_ventas(limit: int = 500, tenant_id: str = Depends(get_tenant_id)):
-    """Historial de ventas ordenado por fecha descendente y filtrado por tenant."""
-    print(f"DEBUG: listar_ventas — Tenant ID: {tenant_id}")
-    resultado = get_ventas(limit, tenant_id)
-    print(f"DEBUG: listar_ventas — Resultados: {len(resultado)}")
+def listar_ventas(limit: int = 500, _: bool = Depends(validar_sesion)):
+    """Historial de ventas ordenado por fecha descendente."""
+    resultado = get_ventas(limit)
     return resultado
 
 
 @router.post("/cobrar")
-def cobrar_carrito(carrito: Carrito, tenant_id: str = Depends(get_tenant_id)):
+def cobrar_carrito(carrito: Carrito, _: bool = Depends(validar_sesion)):
     """
     Procesa el carrito completo de una sola vez.
     Aplica PEPS a cada item, valida stock antes de guardar cualquier venta.
-    Si un item falla, no se guarda nada.
     """
     ventas_a_guardar = []
     errores          = []
 
     # Paso 1 — validar todo antes de guardar nada
     for item in carrito.items:
-        resultado = descontar_stock_peps(item.producto, item.cantidad, item.precio_real, tenant_id)
+        resultado = descontar_stock_peps(item.producto, item.cantidad, item.precio_real)
         if resultado is None:
             errores.append(f"Stock insuficiente para {item.producto}")
         else:
@@ -64,7 +61,7 @@ def cobrar_carrito(carrito: Carrito, tenant_id: str = Depends(get_tenant_id)):
 
     # Paso 2 — guardar todas las ventas
     for venta in ventas_a_guardar:
-        insertar_venta(venta, tenant_id)
+        insertar_venta(venta)
 
     total = sum(v["total_venta"] for v in ventas_a_guardar)
     return {
@@ -75,12 +72,11 @@ def cobrar_carrito(carrito: Carrito, tenant_id: str = Depends(get_tenant_id)):
 
 
 @router.patch("/{venta_id}")
-def corregir_venta(venta_id: int, data: ActualizarVenta, tenant_id: str = Depends(get_tenant_id)):
+def corregir_venta(venta_id: int, data: ActualizarVenta, _: bool = Depends(validar_sesion)):
     """Corrige la fecha, cantidad o precio de una venta registrada por error."""
     resultado = actualizar_venta(
         venta_id, data.fecha, data.cantidad,
-        data.precio_real, data.total_venta, data.ganancia_bruta,
-        tenant_id
+        data.precio_real, data.total_venta, data.ganancia_bruta
     )
     if not resultado.get("ok"):
         raise HTTPException(status_code=400, detail=resultado.get("mensaje", "Error al actualizar venta"))
@@ -88,6 +84,6 @@ def corregir_venta(venta_id: int, data: ActualizarVenta, tenant_id: str = Depend
 
 
 @router.delete("/{venta_id}")
-def borrar_venta(venta_id: int, tenant_id: str = Depends(get_tenant_id)):
+def borrar_venta(venta_id: int, _: bool = Depends(validar_sesion)):
     """Elimina una venta por id."""
-    return eliminar_venta(venta_id, tenant_id)
+    return eliminar_venta(venta_id)

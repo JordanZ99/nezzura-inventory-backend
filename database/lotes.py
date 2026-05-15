@@ -5,11 +5,11 @@
 
 import uuid
 import datetime
-from database.conexion import query, execute, DEFAULT_TENANT_ID
+from database.conexion import query, execute
 
 
-def get_lotes(tenant_id: str = DEFAULT_TENANT_ID) -> list[dict]:
-    """Lee lotes + metadatos de productos en un JOIN, filtrado por tenant."""
+def get_lotes() -> list[dict]:
+    """Lee lotes + metadatos de productos en un JOIN."""
     return query("""
         SELECT 
             l.id as id,
@@ -24,27 +24,25 @@ def get_lotes(tenant_id: str = DEFAULT_TENANT_ID) -> list[dict]:
             p.Descripcion as descripcion,
             p.Categoria as categoria
         FROM lotes l
-        LEFT JOIN productos p ON l.Producto = p.Producto AND l.tenant_id = p.tenant_id
-        WHERE l.Estado = 'Activo' -- AND l.tenant_id = %s
+        LEFT JOIN productos p ON l.Producto = p.Producto
+        WHERE l.Estado = 'Activo'
         ORDER BY l.Producto, l.Fecha_Entrada ASC
-    """, ()) # (tenant_id,)
+    """)
 
 
-def get_productos_meta(tenant_id: str = DEFAULT_TENANT_ID) -> list[dict]:
-    """Lee la tabla productos (metadatos) filtrada por tenant."""
+def get_productos_meta() -> list[dict]:
+    """Lee la tabla productos (metadatos)."""
     return query("""
         SELECT Producto as producto, Descripcion as descripcion, Imagen as imagen, Estado as estado, Categoria as categoria 
         FROM productos 
-        WHERE tenant_id = %s
         ORDER BY Producto ASC
-    """, (tenant_id,))
+    """)
 
 
-def get_inventario_consolidado(tenant_id: str = DEFAULT_TENANT_ID) -> list[dict]:
+def get_inventario_consolidado() -> list[dict]:
     """
     Devuelve una fila por producto con stock total,
     precio del lote más reciente y costo promedio ponderado.
-    Filtrado por tenant.
     """
     return query("""
         SELECT
@@ -57,22 +55,22 @@ def get_inventario_consolidado(tenant_id: str = DEFAULT_TENANT_ID) -> list[dict]
             MAX(l.Precio_Venta)                                      AS precio_venta,
             SUM(l.Costo * l.Stock_Lote) / NULLIF(SUM(l.Stock_Lote), 0) AS costo_promedio
         FROM lotes l
-        LEFT JOIN productos p ON l.Producto = p.Producto AND l.tenant_id = p.tenant_id
-        WHERE l.Estado = 'Activo' AND l.Stock_Lote > 0 -- AND l.tenant_id = %s
+        LEFT JOIN productos p ON l.Producto = p.Producto
+        WHERE l.Estado = 'Activo' AND l.Stock_Lote > 0
         GROUP BY l.Producto, p.Descripcion, p.Imagen, p.Estado, p.Categoria
         ORDER BY l.Producto ASC
-    """, ()) # (tenant_id,)
+    """)
 
 
-def get_detalle_lotes(producto: str, tenant_id: str = DEFAULT_TENANT_ID) -> list[dict]:
-    """Devuelve los lotes activos de un producto específico y tenant específico."""
+def get_detalle_lotes(producto: str) -> list[dict]:
+    """Devuelve los lotes activos de un producto específico."""
     return query("""
         SELECT 
             id, id_lote, producto, costo, precio_venta, stock_lote, fecha_entrada, estado 
         FROM lotes
-        WHERE Producto = %s AND Estado = 'Activo' AND Stock_Lote > 0 AND tenant_id = %s
+        WHERE Producto = %s AND Estado = 'Activo' AND Stock_Lote > 0
         ORDER BY Fecha_Entrada DESC
-    """, (producto, tenant_id))
+    """, (producto,))
 
 
 def agregar_lote(
@@ -82,8 +80,7 @@ def agregar_lote(
     precio_venta: float,
     stock: int,
     imagen: str = "No hay foto",
-    categoria: str = "General",
-    tenant_id: str = DEFAULT_TENANT_ID
+    categoria: str = "General"
 ) -> dict:
     producto = producto.strip()
     descripcion = descripcion.strip()
@@ -93,21 +90,21 @@ def agregar_lote(
     """
     # Upsert en productos
     execute("""
-        INSERT INTO productos (Producto, Descripcion, Imagen, Estado, Categoria, tenant_id)
-        VALUES (%s, %s, %s, 'Activo', %s, %s)
+        INSERT INTO productos (Producto, Descripcion, Imagen, Estado, Categoria)
+        VALUES (%s, %s, %s, 'Activo', %s)
         ON CONFLICT(Producto) DO UPDATE SET
             Descripcion = EXCLUDED.Descripcion,
             Categoria = EXCLUDED.Categoria,
             Imagen = CASE WHEN EXCLUDED.Imagen != 'No hay foto'
                          THEN EXCLUDED.Imagen ELSE productos.Imagen END
-    """, (producto, descripcion, imagen, categoria, tenant_id))
+    """, (producto, descripcion, imagen, categoria))
 
     # Buscar lote existente con mismo costo y precio
     existente = query("""
         SELECT id_lote FROM lotes
-        WHERE Producto=%s AND Costo=%s AND Precio_Venta=%s AND Estado='Activo' AND tenant_id=%s
+        WHERE Producto=%s AND Costo=%s AND Precio_Venta=%s AND Estado='Activo'
         LIMIT 1
-    """, (producto, costo, precio_venta, tenant_id))
+    """, (producto, costo, precio_venta))
 
     if existente:
         execute(
@@ -120,9 +117,9 @@ def agregar_lote(
         fecha   = str(datetime.datetime.now())
         execute("""
             INSERT INTO lotes (ID_Lote, Producto, Costo, Precio_Venta,
-                               Stock_Lote, Fecha_Entrada, Estado, tenant_id)
-            VALUES (%s, %s, %s, %s, %s, %s, 'Activo', %s)
-        """, (id_lote, producto, costo, precio_venta, stock, fecha, tenant_id))
+                               Stock_Lote, Fecha_Entrada, Estado)
+            VALUES (%s, %s, %s, %s, %s, %s, 'Activo')
+        """, (id_lote, producto, costo, precio_venta, stock, fecha))
         return {"accion": "lote_creado", "producto": producto, "id_lote": id_lote}
 
 
@@ -131,40 +128,38 @@ def actualizar_producto(
     descripcion: str,
     imagen: str,
     estado: str,
-    categoria: str,
-    tenant_id: str = DEFAULT_TENANT_ID
+    categoria: str
 ) -> dict:
     producto = producto.strip()
     descripcion = descripcion.strip()
     """Actualiza metadatos. Si pasa a Inactivo, desactiva todos sus lotes."""
     execute("""
         UPDATE productos SET Descripcion=%s, Imagen=%s, Estado=%s, Categoria=%s
-        WHERE Producto=%s AND tenant_id=%s
-    """, (descripcion, imagen, estado, categoria, producto, tenant_id))
+        WHERE Producto=%s
+    """, (descripcion, imagen, estado, categoria, producto))
 
     if estado == "Inactivo":
         execute(
-            "UPDATE lotes SET Estado='Inactivo' WHERE Producto=%s AND tenant_id=%s",
-            (producto, tenant_id)
+            "UPDATE lotes SET Estado='Inactivo' WHERE Producto=%s",
+            (producto,)
         )
     return {"ok": True, "producto": producto, "estado": estado}
 
 
-def actualizar_lote(id_lote: str, costo: float, precio_venta: float, stock: int, tenant_id: str = DEFAULT_TENANT_ID) -> dict:
+def actualizar_lote(id_lote: str, costo: float, precio_venta: float, stock: int) -> dict:
     """Actualiza costo, precio de venta y stock de un lote específico."""
     # 1. Actualizar el lote
     execute("""
-        UPDATE lotes SET Costo=%s, Precio_Venta=%s, Stock_Lote=%s WHERE ID_Lote=%s AND tenant_id=%s
-    """, (costo, precio_venta, stock, id_lote, tenant_id))
+        UPDATE lotes SET Costo=%s, Precio_Venta=%s, Stock_Lote=%s WHERE ID_Lote=%s
+    """, (costo, precio_venta, stock, id_lote))
 
     # 2. Recalcular ganancias en ventas asociadas a este lote
-    # Ganancia = (Precio_Real - Nuevo_Costo) * Cantidad
     execute("""
         UPDATE ventas 
         SET Costo_Unitario = %s,
             Ganancia_Bruta = (Precio_Real - %s) * Cantidad
-        WHERE ID_Lote = %s AND Estado = 'Activo' AND tenant_id=%s
-    """, (costo, costo, id_lote, tenant_id))
+        WHERE ID_Lote = %s AND Estado = 'Activo'
+    """, (costo, costo, id_lote))
 
     return {"ok": True, "id_lote": id_lote}
 
@@ -172,8 +167,7 @@ def actualizar_lote(id_lote: str, costo: float, precio_venta: float, stock: int,
 def descontar_stock_peps(
     producto: str,
     cantidad_total: int,
-    precio_real: float,
-    tenant_id: str = DEFAULT_TENANT_ID
+    precio_real: float
 ) -> list[dict] | None:
     producto = producto.strip()
     """
@@ -182,9 +176,9 @@ def descontar_stock_peps(
     """
     lotes = query("""
         SELECT * FROM lotes
-        WHERE Producto=%s AND Stock_Lote > 0 AND Estado='Activo' AND tenant_id=%s
+        WHERE Producto=%s AND Stock_Lote > 0 AND Estado='Activo'
         ORDER BY Fecha_Entrada ASC
-    """, (producto, tenant_id))
+    """, (producto,))
 
     if not lotes:
         return None
@@ -204,8 +198,8 @@ def descontar_stock_peps(
         nuevo_stock = int(lote["stock_lote"]) - consumir
 
         execute(
-            "UPDATE lotes SET Stock_Lote=%s WHERE ID_Lote=%s AND tenant_id=%s",
-            (nuevo_stock, lote["id_lote"], tenant_id)
+            "UPDATE lotes SET Stock_Lote=%s WHERE ID_Lote=%s",
+            (nuevo_stock, lote["id_lote"])
         )
 
         ventas_generadas.append({
@@ -217,8 +211,7 @@ def descontar_stock_peps(
             "costo_unitario" : float(lote["costo"]),
             "total_venta"    : precio_real * consumir,
             "ganancia_bruta" : (precio_real - float(lote["costo"])) * consumir,
-            "id_lote"        : lote["id_lote"],
-            "tenant_id"      : tenant_id
+            "id_lote"        : lote["id_lote"]
         })
         restante -= consumir
 
