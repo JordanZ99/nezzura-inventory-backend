@@ -69,34 +69,34 @@ def obtener_mi_perfil(tenant_id: str = Depends(get_tenant_id)):
 
 
 @router.get("/")
-def listar_inventario(_: bool = Depends(validar_sesion)):
+def listar_inventario(tenant_id: str = Depends(get_tenant_id)):
     """Vista consolidada: un producto = una fila con stock total."""
-    resultado = get_inventario_consolidado()
+    resultado = get_inventario_consolidado(tenant_id)
     return resultado
 
 
 @router.get("/lotes")
-def listar_lotes(_: bool = Depends(validar_sesion)):
+def listar_lotes(tenant_id: str = Depends(get_tenant_id)):
     """Todos los lotes activos con detalle de costo y stock por lote."""
-    resultado = get_lotes()
+    resultado = get_lotes(tenant_id)
     return resultado
 
 
 @router.get("/lotes/{producto}")
-def lotes_por_producto(producto: str, _: bool = Depends(validar_sesion)):
+def lotes_por_producto(producto: str, tenant_id: str = Depends(get_tenant_id)):
     """Lotes activos de un producto específico."""
-    return get_detalle_lotes(producto)
+    return get_detalle_lotes(producto, tenant_id)
 
 
 @router.get("/productos")
-def listar_productos(_: bool = Depends(validar_sesion)):
+def listar_productos(tenant_id: str = Depends(get_tenant_id)):
     """Metadatos de todos los productos."""
-    resultado = get_productos_meta()
+    resultado = get_productos_meta(tenant_id)
     return resultado
 
 
 @router.post("/")
-def crear_producto(data: NuevoProducto, _: bool = Depends(validar_sesion)):
+def crear_producto(data: NuevoProducto, tenant_id: str = Depends(get_tenant_id)):
     """Registra un producto nuevo con su primer lote."""
     return agregar_lote(
         data.producto, data.descripcion,
@@ -106,7 +106,7 @@ def crear_producto(data: NuevoProducto, _: bool = Depends(validar_sesion)):
 
 
 @router.post("/restock")
-def restockear(data: Restock, _: bool = Depends(validar_sesion)):
+def restockear(data: Restock, tenant_id: str = Depends(get_tenant_id)):
     """Añade stock a un producto existente (nuevo lote o suma al existente)."""
     return agregar_lote(
         data.producto, "",
@@ -115,7 +115,7 @@ def restockear(data: Restock, _: bool = Depends(validar_sesion)):
 
 
 @router.post("/foto/{producto}")
-async def subir_foto(producto: str, foto: UploadFile = File(...), _: bool = Depends(validar_sesion)):
+async def subir_foto(producto: str, foto: UploadFile = File(...), tenant_id: str = Depends(get_tenant_id)):
     """Sube la foto de un producto a Cloudinary y devuelve la URL segura."""
     try:
         contents = await foto.read()
@@ -130,7 +130,7 @@ async def subir_foto(producto: str, foto: UploadFile = File(...), _: bool = Depe
 
 
 @router.patch("/{producto}")
-def editar_producto(producto: str, data: ActualizarProducto, _: bool = Depends(validar_sesion)):
+def editar_producto(producto: str, data: ActualizarProducto, tenant_id: str = Depends(get_tenant_id)):
     """Actualiza metadatos (descripción, imagen, estado) de un producto."""
     try:
         old_meta = query("SELECT Imagen as imagen FROM productos WHERE Producto=%s", (producto,))
@@ -151,7 +151,7 @@ def editar_producto(producto: str, data: ActualizarProducto, _: bool = Depends(v
 
 
 @router.patch("/lote/{id_lote}")
-def editar_lote(id_lote: str, data: ActualizarLote, _: bool = Depends(validar_sesion)):
+def editar_lote(id_lote: str, data: ActualizarLote, tenant_id: str = Depends(get_tenant_id)):
     """Actualiza costo, precio de venta y stock de un lote específico."""
     return actualizar_lote(id_lote, data.costo, data.precio_venta, data.stock)
 

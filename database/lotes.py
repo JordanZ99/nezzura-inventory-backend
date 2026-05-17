@@ -30,16 +30,17 @@ def get_lotes() -> list[dict]:
     """)
 
 
-def get_productos_meta() -> list[dict]:
+def get_productos_meta(tenant_id: str) -> list[dict]:
     """Lee la tabla productos (metadatos)."""
     return query("""
         SELECT Producto as producto, Descripcion as descripcion, Imagen as imagen, Estado as estado, Categoria as categoria 
         FROM productos 
+        WHERE Tenant_ID = %s
         ORDER BY Producto ASC
-    """)
+    """,  (tenant_id,))
 
 
-def get_inventario_consolidado() -> list[dict]:
+def get_inventario_consolidado(tenant_id: str) -> list[dict]:
     """
     Devuelve una fila por producto con stock total,
     precio del lote más reciente y costo promedio ponderado.
@@ -55,11 +56,11 @@ def get_inventario_consolidado() -> list[dict]:
             MAX(l.Precio_Venta)                                      AS precio_venta,
             SUM(l.Costo * l.Stock_Lote) / NULLIF(SUM(l.Stock_Lote), 0) AS costo_promedio
         FROM lotes l
-        LEFT JOIN productos p ON l.Producto = p.Producto
-        WHERE l.Estado = 'Activo' AND l.Stock_Lote > 0
+        LEFT JOIN productos p ON l.Producto = p.Producto AND l.Tenant_ID = p.Tenant_ID
+        WHERE l.Estado = 'Activo' AND l.Stock_Lote > 0 AND l.Tenant_ID = %s
         GROUP BY l.Producto, p.Descripcion, p.Imagen, p.Estado, p.Categoria
         ORDER BY l.Producto ASC
-    """)
+    """, (tenant_id,))
 
 
 def get_detalle_lotes(producto: str) -> list[dict]:
