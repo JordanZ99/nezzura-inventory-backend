@@ -101,7 +101,8 @@ def crear_producto(data: NuevoProducto, tenant_id: str = Depends(get_tenant_id))
     return agregar_lote(
         data.producto, data.descripcion,
         data.costo, data.precio_venta,
-        data.stock, data.imagen, data.categoria
+        data.stock, data.imagen, data.categoria,
+        tenant_id
     )
 
 
@@ -109,8 +110,12 @@ def crear_producto(data: NuevoProducto, tenant_id: str = Depends(get_tenant_id))
 def restockear(data: Restock, tenant_id: str = Depends(get_tenant_id)):
     """Añade stock a un producto existente (nuevo lote o suma al existente)."""
     return agregar_lote(
-        data.producto, "",
-        data.costo, data.precio_venta, data.stock
+        producto=data.producto,
+        descripcion="",
+        costo=data.costo,
+        precio_venta=data.precio_venta,
+        stock=data.stock,
+        tenant_id=tenant_id
     )
 
 
@@ -147,13 +152,13 @@ def editar_producto(producto: str, data: ActualizarProducto, tenant_id: str = De
     except Exception as e:
         print(f"Error interno borrando foto antigua de Cloudinary: {e}")
 
-    return actualizar_producto(producto, data.descripcion, data.imagen, data.estado, data.categoria)
+    return actualizar_producto(producto, data.descripcion, data.imagen, data.estado, data.categoria, tenant_id)
 
 
 @router.patch("/lote/{id_lote}")
 def editar_lote(id_lote: str, data: ActualizarLote, tenant_id: str = Depends(get_tenant_id)):
     """Actualiza costo, precio de venta y stock de un lote específico."""
-    return actualizar_lote(id_lote, data.costo, data.precio_venta, data.stock)
+    return actualizar_lote(id_lote, data.costo, data.precio_venta, data.stock, tenant_id)
 
     # En backend/routers/inventario.py (o donde prefieras)
 
