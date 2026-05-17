@@ -6,8 +6,7 @@
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Depends
 from pydantic import BaseModel
 from typing import Optional
-from database.auth_utils 
-import get_tenant_id
+from database.auth_utils import get_tenant_id
 import os, uuid, re
 import cloudinary
 import cloudinary.uploader
