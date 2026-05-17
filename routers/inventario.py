@@ -6,10 +6,13 @@
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Depends
 from pydantic import BaseModel
 from typing import Optional
+from database.auth_utils 
+import get_tenant_id
 import os, uuid, re
 import cloudinary
 import cloudinary.uploader
 import cloudinary.api
+
 
 cloudinary.config(
     cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
@@ -56,6 +59,15 @@ class ActualizarLote(BaseModel):
 
 
 # --- Endpoints ---
+
+@router.get("/me")
+def obtener_mi_perfil(tenant_id: str = Depends(get_tenant_id)):
+    """
+    Este endpoint está protegido. 
+    Lee el JWT del Header, lo decodifica y devuelve el ID del usuario.
+    """
+    return {"tenant_id": tenant_id}
+
 
 @router.get("/")
 def listar_inventario(_: bool = Depends(validar_sesion)):
@@ -143,3 +155,6 @@ def editar_producto(producto: str, data: ActualizarProducto, _: bool = Depends(v
 def editar_lote(id_lote: str, data: ActualizarLote, _: bool = Depends(validar_sesion)):
     """Actualiza costo, precio de venta y stock de un lote específico."""
     return actualizar_lote(id_lote, data.costo, data.precio_venta, data.stock)
+
+    # En backend/routers/inventario.py (o donde prefieras)
+

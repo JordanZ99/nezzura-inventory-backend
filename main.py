@@ -75,3 +75,5 @@ def forzar_init_db():
         return {"ok": True, "mensaje": "Tablas verificadas / creadas correctamente ✓"}
     except Exception as e:
         return {"ok": False, "mensaje": str(e)}
+
+
