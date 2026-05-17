@@ -94,7 +94,7 @@ def agregar_lote(
     execute("""
         INSERT INTO productos (Producto, Descripcion, Imagen, Estado, Categoria, tenant_id)
         VALUES (%s, %s, %s, 'Activo', %s, %s)
-        ON CONFLICT(Producto) DO UPDATE SET
+        ON CONFLICT(Producto, tenant_id) DO UPDATE SET
             Descripcion = EXCLUDED.Descripcion,
             Categoria = EXCLUDED.Categoria,
             Imagen = CASE WHEN EXCLUDED.Imagen != 'No hay foto'
@@ -104,13 +104,13 @@ def agregar_lote(
     # Buscar lote existente con mismo costo y precio
     existente = query("""
         SELECT id_lote FROM lotes
-        WHERE Producto=%s AND Costo=%s AND Precio_Venta=%s AND Estado='Activo' AND Tenant_ID = %s
+        WHERE Producto=%s AND Costo=%s AND Precio_Venta=%s AND Estado='Activo' AND tenant_id = %s
         LIMIT 1
     """, (producto, costo, precio_venta, tenant_id))
 
     if existente:
         execute(
-            "UPDATE lotes SET Stock_Lote = Stock_Lote + %s WHERE ID_Lote = %s AND Tenant_ID = %s",
+            "UPDATE lotes SET Stock_Lote = Stock_Lote + %s WHERE ID_Lote = %s AND tenant_id = %s",
             (stock, existente[0]["id_lote"], tenant_id)
         )
         return {"accion": "stock_sumado", "producto": producto, "cantidad": stock}
