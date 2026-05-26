@@ -121,15 +121,50 @@ def restockear(data: Restock, tenant_id: str = Depends(get_tenant_id)):
 
 @router.post("/foto/{producto}")
 async def subir_foto(producto: str, foto: UploadFile = File(...), tenant_id: str = Depends(get_tenant_id)):
-    """Sube la foto de un producto a Cloudinary y devuelve la URL segura."""
+    """
+    Sube la foto de un producto a Cloudinary y devuelve la URL segura.
+
+    Validaciones de seguridad:
+    - El archivo no debe exceder 1 MB (1024 KB). Esto es una red de seguridad,
+      ya que el frontend ya comprime las imágenes a ~300 KB como máximo.
+    - Se pasa la opción quality=auto a Cloudinary para que optimice aún más
+      el peso del archivo sin pérdida de calidad visible.
+    """
     try:
+        # Leemos el contenido del archivo subido
         contents = await foto.read()
+
+        # Obtenemos el tamaño en kilobytes para validación
+        tamano_kb = len(contents) / 1024
+
+        # Límite de seguridad: rechazamos archivos mayores a 1 MB
+        # (el frontend ya comprime a ~300 KB, pero validamos en backend
+        #  por si alguien llama la API directamente sin pasar por el frontend)
+        MAX_TAMANO_KB = 1024  # 1 MB
+        if tamano_kb > MAX_TAMANO_KB:
+            raise HTTPException(
+                status_code=413,
+                detail=f"La imagen es demasiado grande ({tamano_kb:.0f} KB). "
+                       f"El máximo permitido es {MAX_TAMANO_KB} KB. "
+                       "El frontend comprime automáticamente las imágenes "
+                       "antes de subirlas para evitar este error."
+            )
+
+        # Subimos a Cloudinary con optimización automática de calidad
         resultado = cloudinary.uploader.upload(
             contents,
             folder="productos",
-            public_id=f"{producto}_{uuid.uuid4().hex[:8]}"
+            public_id=f"{producto}_{uuid.uuid4().hex[:8]}",
+            # quality="auto" permite que Cloudinary optimice el peso
+            # del archivo automáticamente, reduciendo el espacio en disco
+            quality="auto:best",
+            # fetch_format convierte automáticamente al formato más eficiente
+            fetch_format="auto"
         )
         return {"ruta": resultado.get("secure_url")}
+    except HTTPException:
+        # Re-lanzamos excepciones HTTP para que FastAPI las maneje
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error subiendo a Cloudinary: {str(e)}")
 
