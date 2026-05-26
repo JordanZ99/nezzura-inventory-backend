@@ -26,7 +26,7 @@ origenes_permitidos = [
     "http://localhost:3001",
     "http://127.0.0.1:3000",
     "http://127.0.0.1:3001",
-    "https://github.com/JordanZ99/goyangi-frontend/tree/bugsMenores",
+    "https://goyangi-frontend-git-bugsmenores-jordanz99s-projects.vercel.app",
     "https://goyangi-frontend-git-multitenant-jordanz99s-projects.vercel.app",
     URL_PRODUCCION
 ]
