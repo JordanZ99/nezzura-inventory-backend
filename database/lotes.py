@@ -5,12 +5,97 @@
 
 import uuid
 import datetime
+import re
 from database.conexion import query, execute
+
+# ==============================================================================
+# Funciones auxiliares para el manejo de categorías (Many-to-Many)
+# ==============================================================================
+
+
+def _slugify(texto: str) -> str:
+    """
+    Convierte un nombre de categoría en un slug URL-amigable.
+    Ej: 'Accesorios de Moda' → 'accesorios-de-moda'
+    """
+    texto = texto.lower().strip()
+    # Reemplazar espacios y caracteres no alfanuméricos (excepto guiones) por guiones
+    texto = re.sub(r'[^a-z0-9áéíóúüñ\s-]', '', texto)
+    texto = re.sub(r'[\s-]+', '-', texto)
+    return texto.strip('-')
+
+
+def _sincronizar_categorias(producto_id: int, categorias: list[str], tenant_id: str) -> None:
+    """
+    Sincroniza las categorías de un producto en la tabla pivote (producto_categorias).
+    
+    Estrategia:
+    1. Elimina todas las relaciones existentes para este producto en producto_categorias.
+    2. Por cada nombre de categoría, hace un upsert en la tabla 'categorias' y
+       crea la relación en 'producto_categorias'.
+    
+    Args:
+        producto_id: ID numérico del producto (productos.id)
+        categorias: Lista de nombres de categorías a asignar
+        tenant_id: UUID del tenant propietario
+    """
+    # Normalizar: limpiar espacios y eliminar duplicados preservando orden
+    categorias = list(dict.fromkeys([c.strip() for c in categorias if c.strip()]))
+    if not categorias:
+        categorias = ["General"]
+
+    # 1. Eliminar relaciones existentes para este producto
+    execute(
+        "DELETE FROM producto_categorias WHERE producto_id = %s",
+        (producto_id,)
+    )
+
+    # 2. Upsert cada categoría y crear la relación
+    for nombre in categorias:
+        slug = _slugify(nombre)
+
+        # Upsert: si ya existe (tenant_id, nombre), devuelve el id existente
+        result = query("""
+            INSERT INTO categorias (tenant_id, nombre, slug)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (tenant_id, nombre) DO UPDATE SET
+                slug = EXCLUDED.slug
+            RETURNING id
+        """, (tenant_id, nombre, slug))
+
+        categoria_id = result[0]["id"]
+
+        # Insertar en la tabla pivote (ignorar si ya existe por alguna razón)
+        execute(
+            "INSERT INTO producto_categorias (producto_id, categoria_id) VALUES (%s, %s) ON CONFLICT DO NOTHING",
+            (producto_id, categoria_id)
+        )
+
+
+def _obtener_categorias_subquery(alias: str) -> str:
+    """
+    Genera una subquery SQL correlacionada para obtener las categorías
+    de un producto como un array de nombres.
+    
+    Úsala en cualquier SELECT que necesite incluir categorías sin importar
+    la columna antigua Categoria de la tabla productos.
+    
+    Args:
+        alias: Alias de la tabla productos (e.g. 'p')
+    """
+    return f"""COALESCE(
+        (SELECT array_agg(c.nombre ORDER BY c.nombre)
+         FROM producto_categorias pc
+         JOIN categorias c ON pc.categoria_id = c.id
+         WHERE pc.producto_id = {alias}.id),
+        ARRAY['General']
+    ) AS categoria"""
 
 
 def get_lotes(tenant_id: str) -> list[dict]:
     """Lee lotes + metadatos de productos en un JOIN."""
-    return query("""
+    cat_subquery = _obtener_categorias_subquery("p")
+    return query(f"""
         SELECT 
             l.id as id,
             l.id_lote as id_lote,
@@ -22,7 +107,7 @@ def get_lotes(tenant_id: str) -> list[dict]:
             l.estado as estado,
             p.Imagen as imagen, 
             p.Descripcion as descripcion,
-            p.Categoria as categoria
+            {cat_subquery}
         FROM lotes l
         LEFT JOIN productos p ON l.Producto = p.Producto AND l.tenant_id = p.tenant_id
         WHERE l.Estado = 'Activo' AND l.tenant_id = %s
@@ -31,9 +116,15 @@ def get_lotes(tenant_id: str) -> list[dict]:
 
 
 def get_productos_meta(tenant_id: str) -> list[dict]:
-    """Lee la tabla productos (metadatos)."""
-    return query("""
-        SELECT Producto as producto, Descripcion as descripcion, Imagen as imagen, Estado as estado, Categoria as categoria 
+    """Lee la tabla productos (metadatos) con sus categorías desde la relación Many-to-Many."""
+    cat_subquery = _obtener_categorias_subquery("productos")
+    return query(f"""
+        SELECT 
+            Producto as producto, 
+            Descripcion as descripcion, 
+            Imagen as imagen, 
+            Estado as estado, 
+            {cat_subquery}
         FROM productos 
         WHERE Tenant_ID = %s
         ORDER BY Producto ASC
@@ -43,22 +134,23 @@ def get_productos_meta(tenant_id: str) -> list[dict]:
 def get_inventario_consolidado(tenant_id: str) -> list[dict]:
     """
     Devuelve una fila por producto con stock total,
-    precio del lote más reciente y costo promedio ponderado.
+    precio del lote más reciente, costo promedio ponderado y categorías.
     """
-    return query("""
+    cat_subquery = _obtener_categorias_subquery("p")
+    return query(f"""
         SELECT
             l.Producto                                               AS producto,
             p.Descripcion                                            AS descripcion,
             p.Imagen                                                 AS imagen,
             p.Estado                                                 AS estado,
-            p.Categoria                                              AS categoria,
+            {cat_subquery},
             SUM(l.Stock_Lote)                                        AS stock_total,
             MAX(l.Precio_Venta)                                      AS precio_venta,
             SUM(l.Costo * l.Stock_Lote) / NULLIF(SUM(l.Stock_Lote), 0) AS costo_promedio
         FROM lotes l
         LEFT JOIN productos p ON l.Producto = p.Producto AND l.Tenant_ID = p.Tenant_ID
         WHERE l.Estado = 'Activo' AND l.Tenant_ID = %s
-        GROUP BY l.Producto, p.Descripcion, p.Imagen, p.Estado, p.Categoria
+        GROUP BY l.Producto, p.Descripcion, p.Imagen, p.Estado, p.id
         ORDER BY l.Producto ASC
     """, (tenant_id,))
 
@@ -86,22 +178,26 @@ def agregar_lote(
 ) -> dict:
     producto = producto.strip()
     descripcion = descripcion.strip()
-    # Normalizar: trim cada valor y eliminar duplicados preservando orden
-    categoria = list(dict.fromkeys([c.strip() for c in categoria if c.strip()]))
     """
     Crea producto si no existe, luego inserta un lote nuevo
     o suma stock si ya existe uno con el mismo costo y precio.
+    Las categorías se guardan en la tabla pivote producto_categorias.
     """
-    # Upsert en productos
-    execute("""
-        INSERT INTO productos (Producto, Descripcion, Imagen, Estado, Categoria, tenant_id)
-        VALUES (%s, %s, %s, 'Activo', %s, %s)
+    # Upsert en productos (YA NO incluye Categoria, se maneja aparte)
+    result = query("""
+        INSERT INTO productos (Producto, Descripcion, Imagen, Estado, tenant_id)
+        VALUES (%s, %s, %s, 'Activo', %s)
         ON CONFLICT(Producto, tenant_id) DO UPDATE SET
             Descripcion = EXCLUDED.Descripcion,
-            Categoria = EXCLUDED.Categoria,
             Imagen = CASE WHEN EXCLUDED.Imagen != 'No hay foto'
                          THEN EXCLUDED.Imagen ELSE productos.Imagen END
-    """, (producto, descripcion, imagen, categoria, tenant_id))
+        RETURNING id
+    """, (producto, descripcion, imagen, tenant_id))
+
+    product_id = result[0]["id"]
+
+    # Sincronizar categorías en la tabla pivote (Many-to-Many)
+    _sincronizar_categorias(product_id, categoria, tenant_id)
 
     # Buscar lote existente con mismo costo y precio
     existente = query("""
@@ -137,13 +233,24 @@ def actualizar_producto(
 ) -> dict:
     producto = producto.strip()
     descripcion = descripcion.strip()
-    # Normalizar: trim cada valor y eliminar duplicados preservando orden
-    categoria = list(dict.fromkeys([c.strip() for c in categoria if c.strip()]))
-    """Actualiza metadatos. Si pasa a Inactivo, desactiva todos sus lotes."""
+    """
+    Actualiza metadatos de un producto y sus categorías (Many-to-Many).
+    Si pasa a Inactivo, desactiva todos sus lotes.
+    """
+    # Actualizar producto (YA NO incluye Categoria)
     execute("""
-        UPDATE productos SET Descripcion=%s, Imagen=%s, Estado=%s, Categoria=%s
+        UPDATE productos SET Descripcion=%s, Imagen=%s, Estado=%s
         WHERE Producto=%s AND tenant_id = %s
-    """, (descripcion, imagen, estado, categoria, producto, tenant_id))
+    """, (descripcion, imagen, estado, producto, tenant_id))
+
+    # Obtener el ID numérico del producto para la tabla pivote
+    prod = query(
+        "SELECT id FROM productos WHERE Producto = %s AND tenant_id = %s",
+        (producto, tenant_id)
+    )
+    if prod:
+        # Sincronizar categorías en la tabla pivote
+        _sincronizar_categorias(prod[0]["id"], categoria, tenant_id)
 
     if estado == "Inactivo":
         execute(
@@ -153,40 +260,121 @@ def actualizar_producto(
     return {"ok": True, "producto": producto, "estado": estado}
 
 
+def listar_categorias(tenant_id: str) -> list[dict]:
+    """
+    Devuelve todas las categorías del tenant con el conteo de productos asociados.
+    Útil para mostrar en la gestión de categorías del frontend.
+    """
+    return query("""
+        SELECT
+            c.id,
+            c.nombre,
+            c.slug,
+            COUNT(pc.producto_id) AS total_productos
+        FROM categorias c
+        LEFT JOIN producto_categorias pc ON pc.categoria_id = c.id
+        WHERE c.tenant_id = %s
+        GROUP BY c.id, c.nombre, c.slug
+        ORDER BY c.nombre ASC
+    """, (tenant_id,))
+
+
+def crear_categoria(nombre: str, tenant_id: str) -> dict:
+    """
+    Crea una categoría nueva para el tenant.
+    Si ya existe, retorna la existente.
+    """
+    nombre = nombre.strip()
+    slug = _slugify(nombre)
+
+    result = query("""
+        INSERT INTO categorias (tenant_id, nombre, slug)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (tenant_id, nombre) DO NOTHING
+        RETURNING id, nombre, slug
+    """, (tenant_id, nombre, slug))
+
+    if not result:
+        # Si no se insertó es porque ya existe, la recuperamos
+        existente = query(
+            "SELECT id, nombre, slug FROM categorias WHERE nombre = %s AND tenant_id = %s",
+            (nombre, tenant_id)
+        )
+        if existente:
+            return {"ok": True, "categoria": existente[0], "mensaje": f"La categoría '{nombre}' ya existía"}
+        return {"ok": False, "mensaje": "Error al crear la categoría"}
+
+    return {"ok": True, "categoria": result[0], "mensaje": f"Categoría '{nombre}' creada"}
+
+
+def renombrar_categoria(viejo_nombre: str, nuevo_nombre: str, tenant_id: str) -> dict:
+    """
+    Cambia el nombre de una categoría y actualiza su slug.
+    Retorna la categoría actualizada o un error si no existe.
+    """
+    viejo_nombre = viejo_nombre.strip()
+    nuevo_nombre = nuevo_nombre.strip()
+    nuevo_slug = _slugify(nuevo_nombre)
+
+    result = query("""
+        UPDATE categorias
+        SET nombre = %s, slug = %s
+        WHERE nombre = %s AND tenant_id = %s
+        RETURNING id, nombre, slug
+    """, (nuevo_nombre, nuevo_slug, viejo_nombre, tenant_id))
+
+    if not result:
+        return {"ok": False, "mensaje": f"Categoría '{viejo_nombre}' no encontrada"}
+
+    return {
+        "ok": True,
+        "categoria": result[0]
+    }
+
+
 def eliminar_categoria_de_productos(categoria: str, tenant_id: str) -> dict:
     """
     Elimina una categoría de todos los productos del tenant.
-    Si tras la eliminación el array queda vacío, se asigna ['General'].
+    Busca la categoría por nombre en la tabla 'categorias',
+    elimina todas las relaciones en 'producto_categorias' y
+    luego elimina la categoría misma.
     """
     categoria = categoria.strip()
-    productos = get_productos_meta(tenant_id)
-    actualizados = 0
 
-    for prod in productos:
-        cats = prod.get("categoria", [])
-        # Normalizar: si viene como string (p.ej. '{General,Llavero}'), convertir a lista
-        if isinstance(cats, str):
-            s = cats.strip()
-            if s.startswith("{") and s.endswith("}"):
-                cats = [c.strip() for c in s[1:-1].split(",") if c.strip()]
-            elif s.startswith("[") and s.endswith("]"):
-                import json
-                cats = json.loads(s)
-            else:
-                cats = [c.strip() for c in s.split(",") if c.strip()]
+    # Buscar la categoría por nombre y tenant
+    result = query(
+        "SELECT id FROM categorias WHERE nombre = %s AND tenant_id = %s",
+        (categoria, tenant_id)
+    )
 
-        if categoria not in cats:
-            continue
+    if not result:
+        return {
+            "ok": True,
+            "categoria_eliminada": categoria,
+            "productos_actualizados": 0
+        }
 
-        cats = [c for c in cats if c != categoria]
-        if not cats:
-            cats = ["General"]
+    cat_id = result[0]["id"]
 
-        execute(
-            "UPDATE productos SET Categoria=%s WHERE Producto=%s AND tenant_id=%s",
-            (cats, prod["producto"], tenant_id)
-        )
-        actualizados += 1
+    # Contar cuántos productos tenían esta categoría
+    affected = query(
+        "SELECT COUNT(*) as count FROM producto_categorias WHERE categoria_id = %s",
+        (cat_id,)
+    )
+    actualizados = affected[0]["count"] if affected else 0
+
+    # Eliminar relaciones en la tabla pivote (CASCADE también lo haría,
+    # pero hacemos DELETE explícito para claridad y control)
+    execute(
+        "DELETE FROM producto_categorias WHERE categoria_id = %s",
+        (cat_id,)
+    )
+
+    # Eliminar la categoría de la tabla madre
+    execute(
+        "DELETE FROM categorias WHERE id = %s AND tenant_id = %s",
+        (cat_id, tenant_id)
+    )
 
     return {
         "ok": True,
