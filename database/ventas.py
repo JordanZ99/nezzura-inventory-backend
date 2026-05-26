@@ -6,7 +6,7 @@ from database.conexion import query, execute
 def get_ventas(tenant_id: str, limit: int = 500) -> list[dict]:
     """Lee ventas del usuario ordenadas por fecha descendente."""
     return query(
-        "SELECT id, fecha, producto, cantidad, precio_lista, precio_real, costo_unitario, total_venta, ganancia_bruta, estado FROM ventas WHERE tenant_id = %s ORDER BY Fecha DESC LIMIT %s",
+        "SELECT id, n_ticket, fecha, producto, cantidad, precio_lista, precio_real, costo_unitario, total_venta, ganancia_bruta, estado FROM ventas WHERE tenant_id = %s ORDER BY Fecha DESC LIMIT %s",
         (tenant_id, limit)
     )
 
