@@ -217,6 +217,10 @@ def descontar_stock_peps(
             "UPDATE lotes SET Stock_Lote=%s WHERE ID_Lote=%s AND tenant_id = %s",
             (nuevo_stock, lote["id_lote"], tenant_id)
         )
+        
+        # Actualizar el valor en memoria para que la segunda pasada (negativos)
+        # vea el stock correcto, no el valor original de la consulta.
+        lote["stock_lote"] = nuevo_stock
 
         ventas_generadas.append({
             "fecha"          : str(datetime.datetime.now()),
