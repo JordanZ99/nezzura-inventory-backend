@@ -81,7 +81,7 @@ def agregar_lote(
     precio_venta: float,
     stock: int,
     imagen: str = "No hay foto",
-    categoria: str = "General",
+    categoria: list[str] = ["General"],
     tenant_id: str = ""
 ) -> dict:
     producto = producto.strip()
@@ -130,7 +130,7 @@ def actualizar_producto(
     descripcion: str,
     imagen: str,
     estado: str,
-    categoria: str,
+    categoria: list[str],
     tenant_id: str
 ) -> dict:
     producto = producto.strip()

@@ -37,7 +37,7 @@ class NuevoProducto(BaseModel):
     precio_venta: float
     stock       : int
     imagen      : str  = "No hay foto"
-    categoria   : str  = "General"
+    categoria   : list[str]  = ["General"]
 
 class Restock(BaseModel):
     producto    : str
@@ -49,7 +49,7 @@ class ActualizarProducto(BaseModel):
     descripcion: str
     imagen     : str
     estado     : str
-    categoria  : str
+    categoria  : list[str]
 
 class ActualizarLote(BaseModel):
     costo       : float
