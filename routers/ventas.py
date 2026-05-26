@@ -30,18 +30,20 @@ def listar_ventas(limit: int = 500, tenant_id: str = Depends(get_tenant_id)):
 
 @router.post("/cobrar")
 def cobrar_carrito(carrito: Carrito, tenant_id: str = Depends(get_tenant_id)):
+    """
+    Cobra los items del carrito.
+    
+    NOTA: Ya NO se valida stock insuficiente. Si no hay suficiente inventario,
+    el stock se manejará en negativo para permitir la venta.
+    La advertencia al usuario se maneja desde el frontend.
+    """
     ventas_a_guardar = []
-    errores          = []
 
     for item in carrito.items:
+        # descontar_stock_peps ahora siempre devuelve una lista (nunca None)
+        # porque permite stock negativo
         resultado = descontar_stock_peps(item.producto, item.cantidad, item.precio_real, tenant_id)
-        if resultado is None:
-            errores.append(f"Stock insuficiente para {item.producto}")
-        else:
-            ventas_a_guardar.extend(resultado)
-
-    if errores:
-        raise HTTPException(status_code=400, detail=errores)
+        ventas_a_guardar.extend(resultado)
 
     for venta in ventas_a_guardar:
         insertar_venta(venta, tenant_id)
