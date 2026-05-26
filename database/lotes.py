@@ -86,6 +86,8 @@ def agregar_lote(
 ) -> dict:
     producto = producto.strip()
     descripcion = descripcion.strip()
+    # Normalizar: trim cada valor y eliminar duplicados preservando orden
+    categoria = list(dict.fromkeys([c.strip() for c in categoria if c.strip()]))
     """
     Crea producto si no existe, luego inserta un lote nuevo
     o suma stock si ya existe uno con el mismo costo y precio.
@@ -135,6 +137,8 @@ def actualizar_producto(
 ) -> dict:
     producto = producto.strip()
     descripcion = descripcion.strip()
+    # Normalizar: trim cada valor y eliminar duplicados preservando orden
+    categoria = list(dict.fromkeys([c.strip() for c in categoria if c.strip()]))
     """Actualiza metadatos. Si pasa a Inactivo, desactiva todos sus lotes."""
     execute("""
         UPDATE productos SET Descripcion=%s, Imagen=%s, Estado=%s, Categoria=%s
