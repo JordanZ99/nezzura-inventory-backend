@@ -21,7 +21,8 @@ cloudinary.config(
 
 from database.lotes import (
     get_lotes, get_productos_meta, get_inventario_consolidado,
-    get_detalle_lotes, agregar_lote, actualizar_producto, actualizar_lote
+    get_detalle_lotes, agregar_lote, actualizar_producto, actualizar_lote,
+    eliminar_categoria_de_productos
 )
 from database.conexion import query
 from dependencies import validar_sesion
@@ -195,5 +196,9 @@ def editar_lote(id_lote: str, data: ActualizarLote, tenant_id: str = Depends(get
     """Actualiza costo, precio de venta y stock de un lote específico."""
     return actualizar_lote(id_lote, data.costo, data.precio_venta, data.stock, tenant_id)
 
-    # En backend/routers/inventario.py (o donde prefieras)
+
+@router.delete("/categoria/{categoria}")
+def borrar_categoria(categoria: str, tenant_id: str = Depends(get_tenant_id)):
+    """Elimina una categoría de todos los productos del tenant."""
+    return eliminar_categoria_de_productos(categoria, tenant_id)
 

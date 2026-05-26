@@ -153,6 +153,48 @@ def actualizar_producto(
     return {"ok": True, "producto": producto, "estado": estado}
 
 
+def eliminar_categoria_de_productos(categoria: str, tenant_id: str) -> dict:
+    """
+    Elimina una categoría de todos los productos del tenant.
+    Si tras la eliminación el array queda vacío, se asigna ['General'].
+    """
+    categoria = categoria.strip()
+    productos = get_productos_meta(tenant_id)
+    actualizados = 0
+
+    for prod in productos:
+        cats = prod.get("categoria", [])
+        # Normalizar: si viene como string (p.ej. '{General,Llavero}'), convertir a lista
+        if isinstance(cats, str):
+            s = cats.strip()
+            if s.startswith("{") and s.endswith("}"):
+                cats = [c.strip() for c in s[1:-1].split(",") if c.strip()]
+            elif s.startswith("[") and s.endswith("]"):
+                import json
+                cats = json.loads(s)
+            else:
+                cats = [c.strip() for c in s.split(",") if c.strip()]
+
+        if categoria not in cats:
+            continue
+
+        cats = [c for c in cats if c != categoria]
+        if not cats:
+            cats = ["General"]
+
+        execute(
+            "UPDATE productos SET Categoria=%s WHERE Producto=%s AND tenant_id=%s",
+            (cats, prod["producto"], tenant_id)
+        )
+        actualizados += 1
+
+    return {
+        "ok": True,
+        "categoria_eliminada": categoria,
+        "productos_actualizados": actualizados
+    }
+
+
 def actualizar_lote(id_lote: str, costo: float, precio_venta: float, stock: int, tenant_id: str) -> dict:
     """Actualiza costo, precio de venta y stock de un lote específico."""
     # 1. Actualizar el lote
