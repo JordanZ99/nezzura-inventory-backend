@@ -229,13 +229,16 @@ def actualizar_producto(
     imagen: str,
     estado: str,
     categoria: list[str],
-    tenant_id: str
+    costo: float | None = None,
+    precio_venta: float | None = None,
+    tenant_id: str = ""
 ) -> dict:
     producto = producto.strip()
     descripcion = descripcion.strip()
     """
     Actualiza metadatos de un producto y sus categorías (Many-to-Many).
     Si pasa a Inactivo, desactiva todos sus lotes.
+    Si se proporcionan costo y/o precio_venta, actualiza todos los lotes activos.
     """
     # Actualizar producto (YA NO incluye Categoria)
     execute("""
@@ -251,6 +254,18 @@ def actualizar_producto(
     if prod:
         # Sincronizar categorías en la tabla pivote
         _sincronizar_categorias(prod[0]["id"], categoria, tenant_id)
+
+    # Actualizar costo y/o precio de venta en todos los lotes activos
+    if costo is not None:
+        execute(
+            "UPDATE lotes SET Costo=%s WHERE Producto=%s AND Estado='Activo' AND tenant_id=%s",
+            (costo, producto, tenant_id)
+        )
+    if precio_venta is not None:
+        execute(
+            "UPDATE lotes SET Precio_Venta=%s WHERE Producto=%s AND Estado='Activo' AND tenant_id=%s",
+            (precio_venta, producto, tenant_id)
+        )
 
     if estado == "Inactivo":
         execute(

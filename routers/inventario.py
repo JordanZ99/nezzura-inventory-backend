@@ -53,6 +53,8 @@ class ActualizarProducto(BaseModel):
     imagen     : str
     estado     : str
     categoria  : list[str]
+    costo      : Optional[float] = None
+    precio_venta: Optional[float] = None
 
 class ActualizarLote(BaseModel):
     costo       : float
@@ -196,7 +198,10 @@ def editar_producto(producto: str, data: ActualizarProducto, tenant_id: str = De
     except Exception as e:
         print(f"Error interno borrando foto antigua de Cloudinary: {e}")
 
-    return actualizar_producto(producto, data.descripcion, data.imagen, data.estado, data.categoria, tenant_id)
+    return actualizar_producto(
+        producto, data.descripcion, data.imagen, data.estado, data.categoria,
+        data.costo, data.precio_venta, tenant_id
+    )
 
 
 @router.patch("/lote/{id_lote}")
