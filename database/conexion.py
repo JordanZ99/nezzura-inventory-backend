@@ -37,13 +37,17 @@ def query(sql: str, params: tuple = None) -> list[dict]:
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(sql, params or ())
-            return [dict(row) for row in cur.fetchall()]
+            result = [dict(row) for row in cur.fetchall()]
+        conn.commit()
+        return result
     except UndefinedTable:
         conn.rollback()
         inicializar_db()
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(sql, params or ())
-            return [dict(row) for row in cur.fetchall()]
+            result = [dict(row) for row in cur.fetchall()]
+        conn.commit()
+        return result
     except Exception as e:
         conn.rollback()
         raise e
@@ -149,6 +153,13 @@ def inicializar_db():
                 cur.execute("ALTER TABLE ventas ADD COLUMN IF NOT EXISTS ID_Lote TEXT")
             except Exception:
                 pass
+
+            # Migración: asegurar tenant_id en tablas que lo necesitan
+            for tbl in ['productos', 'lotes', 'ventas', 'gastos']:
+                try:
+                    cur.execute(f"ALTER TABLE {tbl} ADD COLUMN IF NOT EXISTS tenant_id UUID")
+                except Exception:
+                    pass
                 
         conn.commit()
     finally:
