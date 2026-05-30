@@ -123,7 +123,10 @@ def get_productos_meta(tenant_id: str) -> list[dict]:
             Producto as producto, 
             Descripcion as descripcion, 
             Imagen as imagen, 
-            Estado as estado, 
+            Estado as estado,
+            codigo_interno,
+            codigo_barras,
+            ubicacion,
             {cat_subquery}
         FROM productos 
         WHERE Tenant_ID = %s
@@ -143,6 +146,9 @@ def get_inventario_consolidado(tenant_id: str) -> list[dict]:
             p.Descripcion                                            AS descripcion,
             p.Imagen                                                 AS imagen,
             p.Estado                                                 AS estado,
+            p.codigo_interno,
+            p.codigo_barras,
+            p.ubicacion,
             {cat_subquery},
             SUM(l.Stock_Lote)                                        AS stock_total,
             MAX(l.Precio_Venta)                                      AS precio_venta,
@@ -150,7 +156,7 @@ def get_inventario_consolidado(tenant_id: str) -> list[dict]:
         FROM lotes l
         LEFT JOIN productos p ON l.Producto = p.Producto AND l.Tenant_ID = p.Tenant_ID
         WHERE l.Estado = 'Activo' AND l.Tenant_ID = %s
-        GROUP BY l.Producto, p.Descripcion, p.Imagen, p.Estado, p.id
+        GROUP BY l.Producto, p.Descripcion, p.Imagen, p.Estado, p.id, p.codigo_interno, p.codigo_barras, p.ubicacion
         ORDER BY l.Producto ASC
     """, (tenant_id,))
 
@@ -174,7 +180,10 @@ def agregar_lote(
     stock: int,
     imagen: str = "No hay foto",
     categoria: list[str] = ["General"],
-    tenant_id: str = ""
+    tenant_id: str = "",
+    codigo_interno: str | None = None,
+    codigo_barras: str | None = None,
+    ubicacion: str | None = None
 ) -> dict:
     producto = producto.strip()
     descripcion = descripcion.strip()
@@ -185,14 +194,18 @@ def agregar_lote(
     """
     # Upsert en productos (YA NO incluye Categoria, se maneja aparte)
     result = query("""
-        INSERT INTO productos (Producto, Descripcion, Imagen, Estado, tenant_id)
-        VALUES (%s, %s, %s, 'Activo', %s)
+        INSERT INTO productos (Producto, Descripcion, Imagen, Estado, tenant_id,
+                               codigo_interno, codigo_barras, ubicacion)
+        VALUES (%s, %s, %s, 'Activo', %s, %s, %s, %s)
         ON CONFLICT(Producto, tenant_id) DO UPDATE SET
             Descripcion = EXCLUDED.Descripcion,
             Imagen = CASE WHEN EXCLUDED.Imagen != 'No hay foto'
-                         THEN EXCLUDED.Imagen ELSE productos.Imagen END
+                         THEN EXCLUDED.Imagen ELSE productos.Imagen END,
+            codigo_interno = COALESCE(EXCLUDED.codigo_interno, productos.codigo_interno),
+            codigo_barras = COALESCE(EXCLUDED.codigo_barras, productos.codigo_barras),
+            ubicacion = COALESCE(EXCLUDED.ubicacion, productos.ubicacion)
         RETURNING id
-    """, (producto, descripcion, imagen, tenant_id))
+    """, (producto, descripcion, imagen, tenant_id, codigo_interno, codigo_barras, ubicacion))
 
     product_id = result[0]["id"]
 
@@ -232,7 +245,10 @@ def actualizar_producto(
     costo: float | None = None,
     precio_venta: float | None = None,
     tenant_id: str = "",
-    nuevo_producto: str | None = None
+    nuevo_producto: str | None = None,
+    codigo_interno: str | None = None,
+    codigo_barras: str | None = None,
+    ubicacion: str | None = None
 ) -> dict:
     producto = producto.strip()
     descripcion = descripcion.strip()
@@ -241,6 +257,7 @@ def actualizar_producto(
     Si pasa a Inactivo, desactiva todos sus lotes.
     Si se proporcionan costo y/o precio_venta, actualiza todos los lotes activos.
     Si se proporciona nuevo_producto, renombra el producto en todas las tablas.
+    También actualiza codigo_interno, codigo_barras y ubicacion si se proporcionan.
     """
     nombre_final = producto
     if nuevo_producto is not None:
@@ -248,8 +265,13 @@ def actualizar_producto(
         if nombre_final and nombre_final != producto:
             # Renombrar en la tabla productos
             execute(
-                "UPDATE productos SET Producto=%s, Descripcion=%s, Imagen=%s, Estado=%s WHERE Producto=%s AND tenant_id=%s",
-                (nombre_final, descripcion, imagen, estado, producto, tenant_id)
+                "UPDATE productos SET Producto=%s, Descripcion=%s, Imagen=%s, Estado=%s, "
+                "codigo_interno=COALESCE(%s, codigo_interno), "
+                "codigo_barras=COALESCE(%s, codigo_barras), "
+                "ubicacion=COALESCE(%s, ubicacion) "
+                "WHERE Producto=%s AND tenant_id=%s",
+                (nombre_final, descripcion, imagen, estado,
+                 codigo_interno, codigo_barras, ubicacion, producto, tenant_id)
             )
             # Renombrar en lotes
             execute(
@@ -266,15 +288,21 @@ def actualizar_producto(
         else:
             # Si nuevo_producto está vacío o es igual, solo actualizar normal
             execute("""
-                UPDATE productos SET Descripcion=%s, Imagen=%s, Estado=%s
+                UPDATE productos SET Descripcion=%s, Imagen=%s, Estado=%s,
+                    codigo_interno=COALESCE(%s, codigo_interno),
+                    codigo_barras=COALESCE(%s, codigo_barras),
+                    ubicacion=COALESCE(%s, ubicacion)
                 WHERE Producto=%s AND tenant_id = %s
-            """, (descripcion, imagen, estado, producto, tenant_id))
+            """, (descripcion, imagen, estado, codigo_interno, codigo_barras, ubicacion, producto, tenant_id))
     else:
         # Actualizar producto sin renombrar
         execute("""
-            UPDATE productos SET Descripcion=%s, Imagen=%s, Estado=%s
+            UPDATE productos SET Descripcion=%s, Imagen=%s, Estado=%s,
+                codigo_interno=COALESCE(%s, codigo_interno),
+                codigo_barras=COALESCE(%s, codigo_barras),
+                ubicacion=COALESCE(%s, ubicacion)
             WHERE Producto=%s AND tenant_id = %s
-        """, (descripcion, imagen, estado, producto, tenant_id))
+        """, (descripcion, imagen, estado, codigo_interno, codigo_barras, ubicacion, producto, tenant_id))
 
     # Obtener el ID numérico del producto para la tabla pivote
     prod = query(

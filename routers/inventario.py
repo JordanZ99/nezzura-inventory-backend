@@ -34,13 +34,16 @@ router = APIRouter(prefix="/inventario", tags=["Inventario"])
 # --- Modelos Pydantic (validan los datos que llegan) ---
 
 class NuevoProducto(BaseModel):
-    producto    : str
-    descripcion : str  = ""
-    costo       : float
-    precio_venta: float
-    stock       : int
-    imagen      : str  = "No hay foto"
-    categoria   : list[str]  = ["General"]
+    producto       : str
+    descripcion    : str  = ""
+    costo          : float
+    precio_venta   : float
+    stock          : int
+    imagen         : str  = "No hay foto"
+    categoria      : list[str]  = ["General"]
+    codigo_interno : Optional[str] = None
+    codigo_barras  : Optional[str] = None
+    ubicacion      : Optional[str] = None
 
 class Restock(BaseModel):
     producto    : str
@@ -49,13 +52,16 @@ class Restock(BaseModel):
     stock       : int
 
 class ActualizarProducto(BaseModel):
-    descripcion: str
-    imagen     : str
-    estado     : str
-    categoria  : list[str]
-    costo      : Optional[float] = None
-    precio_venta: Optional[float] = None
-    producto   : Optional[str] = None
+    descripcion    : str
+    imagen         : str
+    estado         : str
+    categoria      : list[str]
+    costo          : Optional[float] = None
+    precio_venta   : Optional[float] = None
+    producto       : Optional[str] = None
+    codigo_interno : Optional[str] = None
+    codigo_barras  : Optional[str] = None
+    ubicacion      : Optional[str] = None
 
 class ActualizarLote(BaseModel):
     costo       : float
@@ -114,7 +120,10 @@ def crear_producto(data: NuevoProducto, tenant_id: str = Depends(get_tenant_id))
         data.producto, data.descripcion,
         data.costo, data.precio_venta,
         data.stock, data.imagen, data.categoria,
-        tenant_id
+        tenant_id,
+        codigo_interno=data.codigo_interno,
+        codigo_barras=data.codigo_barras,
+        ubicacion=data.ubicacion
     )
 
 
@@ -202,7 +211,10 @@ def editar_producto(producto: str, data: ActualizarProducto, tenant_id: str = De
     return actualizar_producto(
         producto, data.descripcion, data.imagen, data.estado, data.categoria,
         data.costo, data.precio_venta, tenant_id,
-        nuevo_producto=data.producto
+        nuevo_producto=data.producto,
+        codigo_interno=data.codigo_interno,
+        codigo_barras=data.codigo_barras,
+        ubicacion=data.ubicacion
     )
 
 
