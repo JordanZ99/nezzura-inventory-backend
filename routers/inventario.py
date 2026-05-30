@@ -55,6 +55,7 @@ class ActualizarProducto(BaseModel):
     categoria  : list[str]
     costo      : Optional[float] = None
     precio_venta: Optional[float] = None
+    producto   : Optional[str] = None
 
 class ActualizarLote(BaseModel):
     costo       : float
@@ -200,7 +201,8 @@ def editar_producto(producto: str, data: ActualizarProducto, tenant_id: str = De
 
     return actualizar_producto(
         producto, data.descripcion, data.imagen, data.estado, data.categoria,
-        data.costo, data.precio_venta, tenant_id
+        data.costo, data.precio_venta, tenant_id,
+        nuevo_producto=data.producto
     )
 
 

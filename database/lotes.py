@@ -231,7 +231,8 @@ def actualizar_producto(
     categoria: list[str],
     costo: float | None = None,
     precio_venta: float | None = None,
-    tenant_id: str = ""
+    tenant_id: str = "",
+    nuevo_producto: str | None = None
 ) -> dict:
     producto = producto.strip()
     descripcion = descripcion.strip()
@@ -239,12 +240,41 @@ def actualizar_producto(
     Actualiza metadatos de un producto y sus categorías (Many-to-Many).
     Si pasa a Inactivo, desactiva todos sus lotes.
     Si se proporcionan costo y/o precio_venta, actualiza todos los lotes activos.
+    Si se proporciona nuevo_producto, renombra el producto en todas las tablas.
     """
-    # Actualizar producto (YA NO incluye Categoria)
-    execute("""
-        UPDATE productos SET Descripcion=%s, Imagen=%s, Estado=%s
-        WHERE Producto=%s AND tenant_id = %s
-    """, (descripcion, imagen, estado, producto, tenant_id))
+    nombre_final = producto
+    if nuevo_producto is not None:
+        nombre_final = nuevo_producto.strip()
+        if nombre_final and nombre_final != producto:
+            # Renombrar en la tabla productos
+            execute(
+                "UPDATE productos SET Producto=%s, Descripcion=%s, Imagen=%s, Estado=%s WHERE Producto=%s AND tenant_id=%s",
+                (nombre_final, descripcion, imagen, estado, producto, tenant_id)
+            )
+            # Renombrar en lotes
+            execute(
+                "UPDATE lotes SET Producto=%s WHERE Producto=%s AND tenant_id=%s",
+                (nombre_final, producto, tenant_id)
+            )
+            # Renombrar en ventas
+            execute(
+                "UPDATE ventas SET Producto=%s WHERE Producto=%s AND tenant_id=%s",
+                (nombre_final, producto, tenant_id)
+            )
+            # Usar el nuevo nombre para el resto de operaciones
+            producto = nombre_final
+        else:
+            # Si nuevo_producto está vacío o es igual, solo actualizar normal
+            execute("""
+                UPDATE productos SET Descripcion=%s, Imagen=%s, Estado=%s
+                WHERE Producto=%s AND tenant_id = %s
+            """, (descripcion, imagen, estado, producto, tenant_id))
+    else:
+        # Actualizar producto sin renombrar
+        execute("""
+            UPDATE productos SET Descripcion=%s, Imagen=%s, Estado=%s
+            WHERE Producto=%s AND tenant_id = %s
+        """, (descripcion, imagen, estado, producto, tenant_id))
 
     # Obtener el ID numérico del producto para la tabla pivote
     prod = query(
