@@ -21,9 +21,12 @@ cloudinary.config(
 
 from database.lotes import (
     get_lotes, get_productos_meta, get_inventario_consolidado,
-    get_detalle_lotes, agregar_lote, actualizar_producto, actualizar_lote
+    get_detalle_lotes, agregar_lote, actualizar_producto, actualizar_lote,
+    eliminar_categoria_de_productos, listar_categorias, renombrar_categoria,
+    crear_categoria
 )
 from database.conexion import query
+from pydantic import Field
 from dependencies import validar_sesion
 
 router = APIRouter(prefix="/inventario", tags=["Inventario"])
@@ -37,7 +40,7 @@ class NuevoProducto(BaseModel):
     precio_venta: float
     stock       : int
     imagen      : str  = "No hay foto"
-    categoria   : str  = "General"
+    categoria   : list[str]  = ["General"]
 
 class Restock(BaseModel):
     producto    : str
@@ -49,12 +52,21 @@ class ActualizarProducto(BaseModel):
     descripcion: str
     imagen     : str
     estado     : str
-    categoria  : str
+    categoria  : list[str]
+    costo      : Optional[float] = None
+    precio_venta: Optional[float] = None
+    producto   : Optional[str] = None
 
 class ActualizarLote(BaseModel):
     costo       : float
     precio_venta: float
     stock       : int
+
+class CrearCategoria(BaseModel):
+    nombre: str = Field(..., min_length=1, description="Nombre de la categoría a crear")
+
+class RenombrarCategoria(BaseModel):
+    nuevo_nombre: str = Field(..., min_length=1, description="Nuevo nombre para la categoría")
 
 
 # --- Endpoints ---
@@ -187,7 +199,11 @@ def editar_producto(producto: str, data: ActualizarProducto, tenant_id: str = De
     except Exception as e:
         print(f"Error interno borrando foto antigua de Cloudinary: {e}")
 
-    return actualizar_producto(producto, data.descripcion, data.imagen, data.estado, data.categoria, tenant_id)
+    return actualizar_producto(
+        producto, data.descripcion, data.imagen, data.estado, data.categoria,
+        data.costo, data.precio_venta, tenant_id,
+        nuevo_producto=data.producto
+    )
 
 
 @router.patch("/lote/{id_lote}")
@@ -195,5 +211,30 @@ def editar_lote(id_lote: str, data: ActualizarLote, tenant_id: str = Depends(get
     """Actualiza costo, precio de venta y stock de un lote específico."""
     return actualizar_lote(id_lote, data.costo, data.precio_venta, data.stock, tenant_id)
 
-    # En backend/routers/inventario.py (o donde prefieras)
+
+@router.get("/categorias")
+def obtener_categorias(tenant_id: str = Depends(get_tenant_id)):
+    """Devuelve la lista de categorías del tenant con conteo de productos."""
+    return listar_categorias(tenant_id)
+
+
+@router.post("/categoria/crear")
+def crear_categoria_endpoint(data: CrearCategoria, tenant_id: str = Depends(get_tenant_id)):
+    """Crea una categoría nueva o devuelve la existente si ya existe."""
+    return crear_categoria(data.nombre, tenant_id)
+
+
+@router.patch("/categoria/{categoria}")
+def editar_categoria(categoria: str, data: RenombrarCategoria, tenant_id: str = Depends(get_tenant_id)):
+    """
+    Renombra una categoría existente.
+    Actualiza todas las relaciones automáticamente (el slug se recalcula).
+    """
+    return renombrar_categoria(categoria, data.nuevo_nombre, tenant_id)
+
+
+@router.delete("/categoria/{categoria}")
+def borrar_categoria(categoria: str, tenant_id: str = Depends(get_tenant_id)):
+    """Elimina una categoría de todos los productos del tenant."""
+    return eliminar_categoria_de_productos(categoria, tenant_id)
 

@@ -6,7 +6,7 @@ from database.conexion import query, execute
 def get_ventas(tenant_id: str, limit: int = 500) -> list[dict]:
     """Lee ventas del usuario ordenadas por fecha descendente."""
     return query(
-        "SELECT id, fecha, producto, cantidad, precio_lista, precio_real, costo_unitario, total_venta, ganancia_bruta, estado FROM ventas WHERE tenant_id = %s ORDER BY Fecha DESC LIMIT %s",
+        "SELECT id, n_ticket, fecha, producto, cantidad, precio_lista, precio_real, costo_unitario, total_venta, ganancia_bruta, estado FROM ventas WHERE tenant_id = %s ORDER BY Fecha DESC LIMIT %s",
         (tenant_id, limit)
     )
 
@@ -47,19 +47,23 @@ def actualizar_venta(venta_id: int, fecha: str, cantidad: int, precio_real: floa
             dif = cantidad - vieja_cantidad
             
             # 2. Ajustes de inventario según diferencia de cantidad
+            # NOTA: Ya no se valida stock insuficiente. Si no hay suficiente,
+            # el stock del lote más reciente quedará en negativo (ver descontar_stock_peps).
             if dif > 0:
-                cur.execute("SELECT * FROM lotes WHERE Producto=%s AND Stock_Lote > 0 AND Estado='Activo' AND tenant_id=%s ORDER BY Fecha_Entrada ASC FOR UPDATE", (v["producto"], tenant_id))
+                cur.execute("SELECT * FROM lotes WHERE Producto=%s AND Estado='Activo' AND tenant_id=%s ORDER BY Fecha_Entrada ASC FOR UPDATE", (v["producto"], tenant_id))
                 lotes = [dict(row) for row in cur.fetchall()]
-                stock_disp = sum(int(l["stock_lote"]) for l in lotes)
-                if stock_disp < dif:
-                    conn.rollback()
-                    return {"ok": False, "mensaje": "Stock insuficiente"}
                 restante = dif
                 for lote in lotes:
                     if restante <= 0: break
+                    if int(lote["stock_lote"]) <= 0:
+                        continue
                     cons = min(restante, int(lote["stock_lote"]))
                     cur.execute("UPDATE lotes SET Stock_Lote=%s WHERE ID_Lote=%s AND tenant_id=%s", (int(lote["stock_lote"]) - cons, lote["id_lote"], tenant_id))
                     restante -= cons
+                # Si aún falta, descontamos del lote más reciente (stock negativo)
+                if restante > 0 and lotes:
+                    ultimo = lotes[-1]
+                    cur.execute("UPDATE lotes SET Stock_Lote = Stock_Lote - %s WHERE ID_Lote=%s AND tenant_id=%s", (restante, ultimo["id_lote"], tenant_id))
             elif dif < 0:
                 restaurar = abs(dif)
                 cur.execute("SELECT id_lote, stock_lote FROM lotes WHERE Producto=%s AND Costo=%s AND Precio_Venta=%s AND Estado='Activo' AND tenant_id=%s FOR UPDATE LIMIT 1", (v["producto"], v["costo_unitario"], v["precio_lista"], tenant_id))

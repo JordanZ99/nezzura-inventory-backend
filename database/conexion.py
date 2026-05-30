@@ -37,13 +37,17 @@ def query(sql: str, params: tuple = None) -> list[dict]:
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(sql, params or ())
-            return [dict(row) for row in cur.fetchall()]
+            result = [dict(row) for row in cur.fetchall()]
+        conn.commit()
+        return result
     except UndefinedTable:
         conn.rollback()
         inicializar_db()
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(sql, params or ())
-            return [dict(row) for row in cur.fetchall()]
+            result = [dict(row) for row in cur.fetchall()]
+        conn.commit()
+        return result
     except Exception as e:
         conn.rollback()
         raise e
@@ -80,11 +84,30 @@ def inicializar_db():
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS productos (
                     id          SERIAL PRIMARY KEY,
-                    Producto    TEXT NOT NULL UNIQUE,
+                    Producto    TEXT NOT NULL,
                     Descripcion TEXT,
                     Imagen      TEXT DEFAULT 'No hay foto',
-                    Estado      TEXT DEFAULT 'Activo',
-                    Categoria   TEXT DEFAULT 'General'
+                    Estado      TEXT DEFAULT 'Activo'
+                )
+            """)
+            # Tabla de categorías (Many-to-Many con productos)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS categorias (
+                    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    tenant_id   UUID NOT NULL,
+                    nombre      TEXT NOT NULL,
+                    slug        TEXT NOT NULL,
+                    UNIQUE(tenant_id, nombre)
+                )
+            """)
+            # Tabla pivote: rompe la relación Muchos a Muchos entre productos y categorías
+            # producto_id es INTEGER porque productos.id es SERIAL
+            # categoria_id es UUID porque categorias.id es UUID
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS producto_categorias (
+                    producto_id   INTEGER NOT NULL REFERENCES productos(id) ON DELETE CASCADE,
+                    categoria_id  UUID    NOT NULL REFERENCES categorias(id) ON DELETE CASCADE,
+                    PRIMARY KEY (producto_id, categoria_id)
                 )
             """)
             cur.execute("""
@@ -128,9 +151,15 @@ def inicializar_db():
             try:
                 cur.execute("ALTER TABLE ventas ADD COLUMN IF NOT EXISTS Estado TEXT DEFAULT 'Activo'")
                 cur.execute("ALTER TABLE ventas ADD COLUMN IF NOT EXISTS ID_Lote TEXT")
-                cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS Categoria TEXT DEFAULT 'General'")
             except Exception:
                 pass
+
+            # Migración: asegurar tenant_id en tablas que lo necesitan
+            for tbl in ['productos', 'lotes', 'ventas', 'gastos']:
+                try:
+                    cur.execute(f"ALTER TABLE {tbl} ADD COLUMN IF NOT EXISTS tenant_id UUID")
+                except Exception:
+                    pass
                 
         conn.commit()
     finally:
