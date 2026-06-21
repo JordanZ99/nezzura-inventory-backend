@@ -23,7 +23,7 @@ from database.lotes import (
     get_lotes, get_productos_meta, get_inventario_consolidado,
     get_detalle_lotes, agregar_lote, actualizar_producto, actualizar_lote,
     eliminar_categoria_de_productos, listar_categorias, renombrar_categoria,
-    crear_categoria
+    crear_categoria, eliminar_lote
 )
 from database.conexion import query
 from pydantic import Field
@@ -222,6 +222,12 @@ def editar_producto(producto: str, data: ActualizarProducto, tenant_id: str = De
 def editar_lote(id_lote: str, data: ActualizarLote, tenant_id: str = Depends(get_tenant_id)):
     """Actualiza costo, precio de venta y stock de un lote específico."""
     return actualizar_lote(id_lote, data.costo, data.precio_venta, data.stock, tenant_id)
+
+
+@router.delete("/lote/{id_lote}")
+def borrar_lote(id_lote: str, tenant_id: str = Depends(get_tenant_id)):
+    """Da de baja un lote. Si es el último activo, también desactiva el producto."""
+    return eliminar_lote(id_lote, tenant_id)
 
 
 @router.get("/categorias")

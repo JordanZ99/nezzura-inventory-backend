@@ -474,6 +474,57 @@ def actualizar_lote(id_lote: str, costo: float, precio_venta: float, stock: int,
     return {"ok": True, "id_lote": id_lote}
 
 
+def eliminar_lote(id_lote: str, tenant_id: str) -> dict:
+    """
+    Da de baja un lote específico: lo marca como Inactivo y pone su stock en 0.
+    Si es el último lote activo del producto, también da de baja el producto.
+    
+    Returns:
+        dict con:
+        - ok: True si se eliminó correctamente
+        - producto: nombre del producto afectado
+        - producto_desactivado: True si el producto también fue desactivado
+    """
+    # Obtener información del lote antes de desactivarlo
+    info = query(
+        "SELECT Producto FROM lotes WHERE ID_Lote = %s AND tenant_id = %s",
+        (id_lote, tenant_id)
+    )
+    if not info:
+        return {"ok": False, "mensaje": "Lote no encontrado"}
+
+    producto = info[0]["producto"]
+
+    # Marcar el lote como Inactivo y stock en 0
+    execute(
+        "UPDATE lotes SET Estado = 'Inactivo', Stock_Lote = 0 WHERE ID_Lote = %s AND tenant_id = %s",
+        (id_lote, tenant_id)
+    )
+
+    # Verificar si quedan lotes activos para este producto
+    # (descontando el lote que acabamos de desactivar)
+    activos_restantes = query(
+        "SELECT COUNT(*) as total FROM lotes WHERE Producto = %s AND Estado = 'Activo' AND tenant_id = %s",
+        (producto, tenant_id)
+    )
+    producto_desactivado = False
+
+    if activos_restantes and activos_restantes[0]["total"] == 0:
+        # No quedan lotes activos → desactivar el producto también
+        execute(
+            "UPDATE productos SET Estado = 'Inactivo' WHERE Producto = %s AND tenant_id = %s",
+            (producto, tenant_id)
+        )
+        producto_desactivado = True
+
+    return {
+        "ok": True,
+        "id_lote": id_lote,
+        "producto": producto,
+        "producto_desactivado": producto_desactivado
+    }
+
+
 def descontar_stock_peps(
     producto: str,
     cantidad_total: int,
