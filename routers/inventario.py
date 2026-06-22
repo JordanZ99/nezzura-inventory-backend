@@ -3,21 +3,11 @@
 # Endpoints de inventario, lotes y productos.
 # ==============================================================================
 
-from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Depends
+from fastapi import APIRouter, HTTPException, UploadFile, File, Depends
 from pydantic import BaseModel
 from typing import Optional
 from dependencies import get_tenant_id
-import os, uuid, re
-import cloudinary
-import cloudinary.uploader
-import cloudinary.api
-
-
-cloudinary.config(
-    cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
-    api_key=os.getenv("CLOUDINARY_API_KEY"),
-    api_secret=os.getenv("CLOUDINARY_API_SECRET")
-)
+import os, uuid
 
 from database.lotes import (
     get_lotes, get_productos_meta, get_inventario_consolidado,
@@ -30,6 +20,10 @@ from pydantic import Field
 from dependencies import validar_sesion
 
 router = APIRouter(prefix="/inventario", tags=["Inventario"])
+
+# Directorio donde se guardan las imágenes localmente
+UPLOADS_DIR = os.path.join(os.path.dirname(__file__), "..", "uploads")
+os.makedirs(UPLOADS_DIR, exist_ok=True)
 
 # --- Modelos Pydantic (validan los datos que llegan) ---
 
@@ -143,70 +137,45 @@ def restockear(data: Restock, tenant_id: str = Depends(get_tenant_id)):
 @router.post("/foto/{producto}")
 async def subir_foto(producto: str, foto: UploadFile = File(...), tenant_id: str = Depends(get_tenant_id)):
     """
-    Sube la foto de un producto a Cloudinary y devuelve la URL segura.
-
-    Validaciones de seguridad:
-    - El archivo no debe exceder 1 MB (1024 KB). Esto es una red de seguridad,
-      ya que el frontend ya comprime las imágenes a ~300 KB como máximo.
-    - Se pasa la opción quality=auto a Cloudinary para que optimice aún más
-      el peso del archivo sin pérdida de calidad visible.
+    Guarda la foto de un producto en el servidor local y devuelve la ruta.
+    El frontend ya comprime las imágenes a WebP antes de subirlas.
     """
     try:
-        # Leemos el contenido del archivo subido
         contents = await foto.read()
 
-        # Obtenemos el tamaño en kilobytes para validación
-        tamano_kb = len(contents) / 1024
+        # Generar nombre único: producto_uuid_hex8.webp
+        ext = "webp"
+        if "." in (foto.filename or ""):
+            ext_original = foto.filename.rsplit(".", 1)[1].lower()
+            if ext_original in ("jpg", "jpeg", "png", "gif", "webp"):
+                ext = ext_original
 
-        # Límite de seguridad: rechazamos archivos mayores a 1 MB
-        # (el frontend ya comprime a ~300 KB, pero validamos en backend
-        #  por si alguien llama la API directamente sin pasar por el frontend)
-        MAX_TAMANO_KB = 1024  # 1 MB
-        if tamano_kb > MAX_TAMANO_KB:
-            raise HTTPException(
-                status_code=413,
-                detail=f"La imagen es demasiado grande ({tamano_kb:.0f} KB). "
-                       f"El máximo permitido es {MAX_TAMANO_KB} KB. "
-                       "El frontend comprime automáticamente las imágenes "
-                       "antes de subirlas para evitar este error."
-            )
+        nombre_archivo = f"{producto}_{uuid.uuid4().hex[:8]}.{ext}"
+        ruta_completa = os.path.join(UPLOADS_DIR, nombre_archivo)
 
-        # Subimos a Cloudinary con optimización automática de calidad
-        resultado = cloudinary.uploader.upload(
-            contents,
-            folder="productos",
-            public_id=f"{producto}_{uuid.uuid4().hex[:8]}",
-            # quality="auto" permite que Cloudinary optimice el peso
-            # del archivo automáticamente, reduciendo el espacio en disco
-            quality="auto:best",
-            # fetch_format convierte automáticamente al formato más eficiente
-            fetch_format="auto"
-        )
-        return {"ruta": resultado.get("secure_url")}
-    except HTTPException:
-        # Re-lanzamos excepciones HTTP para que FastAPI las maneje
-        raise
+        with open(ruta_completa, "wb") as f:
+            f.write(contents)
+
+        return {"ruta": f"/uploads/{nombre_archivo}"}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error subiendo a Cloudinary: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error al guardar la imagen: {str(e)}")
 
 
 @router.patch("/{producto}")
 def editar_producto(producto: str, data: ActualizarProducto, tenant_id: str = Depends(get_tenant_id)):
     """Actualiza metadatos (descripción, imagen, estado) de un producto."""
+    # Intentar borrar la imagen anterior del disco si se reemplazó
     try:
         old_meta = query("SELECT Imagen as imagen FROM productos WHERE Producto=%s", (producto,))
         if old_meta:
             old_url = old_meta[0]["imagen"]
-            if old_url and old_url != data.imagen and "res.cloudinary.com" in old_url:
-                partes = old_url.split("/upload/")
-                if len(partes) > 1:
-                    ruta = partes[1]
-                    if re.match(r'^v\d+/', ruta):
-                        ruta = ruta.split("/", 1)[1]
-                    public_id = ruta.rsplit(".", 1)[0]
-                    cloudinary.uploader.destroy(public_id)
+            if old_url and old_url != data.imagen and old_url.startswith("/uploads/"):
+                nombre_viejo = old_url.replace("/uploads/", "")
+                ruta_vieja = os.path.join(UPLOADS_DIR, nombre_viejo)
+                if os.path.exists(ruta_vieja):
+                    os.remove(ruta_vieja)
     except Exception as e:
-        print(f"Error interno borrando foto antigua de Cloudinary: {e}")
+        print(f"Error borrando foto anterior: {e}")
 
     return actualizar_producto(
         producto, data.descripcion, data.imagen, data.estado, data.categoria,
@@ -255,4 +224,3 @@ def editar_categoria(categoria: str, data: RenombrarCategoria, tenant_id: str = 
 def borrar_categoria(categoria: str, tenant_id: str = Depends(get_tenant_id)):
     """Elimina una categoría de todos los productos del tenant."""
     return eliminar_categoria_de_productos(categoria, tenant_id)
-

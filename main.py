@@ -7,6 +7,7 @@
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from database.conexion import inicializar_db
 from routers import inventario, ventas, gastos
@@ -44,6 +45,12 @@ app.add_middleware(
 @app.on_event("startup")
 def startup():
     inicializar_db()
+
+# Servir archivos estáticos (imágenes subidas localmente)
+import os
+uploads_dir = os.path.join(os.path.dirname(__file__), "uploads")
+os.makedirs(uploads_dir, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=uploads_dir, check_dir=False), name="uploads")
 
 # Registrar todos los routers
 app.include_router(inventario.router)
