@@ -143,8 +143,12 @@ async def subir_foto(producto: str, foto: UploadFile = File(...), tenant_id: str
     try:
         contents = await foto.read()
 
-        # Generar nombre único: producto_uuid_hex8.webp
-        ext = "webp"
+        # Validar que el contenido no esté vacío
+        if not contents or len(contents) == 0:
+            raise HTTPException(status_code=400, detail="La imagen recibida está vacía (0 bytes)")
+
+        # Generar nombre único: producto_uuid_hex8.ext
+        ext = "jpg"
         if "." in (foto.filename or ""):
             ext_original = foto.filename.rsplit(".", 1)[1].lower()
             if ext_original in ("jpg", "jpeg", "png", "gif", "webp"):
