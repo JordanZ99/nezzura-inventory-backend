@@ -59,10 +59,10 @@ def descartar_gasto(gasto_id: int, tenant_id: str) -> dict:
     return {"ok": True, "id": gasto_id, "estado": "descartado"}
 
 
-def actualizar_gasto(gasto_id: int, monto: float, categoria: str, tenant_id: str) -> dict:
-    """Actualiza monto y categoría de un gasto existente."""
+def actualizar_gasto(gasto_id: int, monto: float, categoria: str, descripcion: str, tenant_id: str) -> dict:
+    """Actualiza monto, categoría y descripción de un gasto existente."""
     execute(
-        "UPDATE gastos SET Monto = %s, Categoria = %s WHERE id = %s AND Tenant_ID = %s",
-        (monto, categoria.strip(), gasto_id, tenant_id)
+        "UPDATE gastos SET Monto = %s, Categoria = %s, Descripcion = %s WHERE id = %s AND Tenant_ID = %s",
+        (monto, categoria.strip(), descripcion.strip(), gasto_id, tenant_id)
     )
-    return {"ok": True, "id": gasto_id, "monto": monto, "categoria": categoria.strip()}
+    return {"ok": True, "id": gasto_id, "monto": monto, "categoria": categoria.strip(), "descripcion": descripcion.strip()}

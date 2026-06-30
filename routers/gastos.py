@@ -67,6 +67,7 @@ def editar_gasto(gasto_id: int, data: NuevoGasto, tenant_id: str = Depends(get_t
         gasto_id=gasto_id,
         monto=data.monto,
         categoria=data.categoria,
+        descripcion=data.descripcion,
         tenant_id=tenant_id
     )
 
