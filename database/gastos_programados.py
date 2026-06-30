@@ -134,8 +134,7 @@ def verificar_y_generar_gastos_programados(tenant_id: str) -> dict:
                 intervalo = _intervalo_sql(frecuencia)
                 cur.execute(
                     "UPDATE gastos_programados "
-                    "SET proxima_fecha = (proxima_fecha::date + INTERVAL %s)::text, "
-                    "    ultima_ejecucion = CURRENT_TIMESTAMP "
+                    "SET proxima_fecha = (proxima_fecha::date + INTERVAL %s)::text "
                     "WHERE id = %s AND tenant_id = %s",
                     (intervalo, rid, tenant_id)
                 )

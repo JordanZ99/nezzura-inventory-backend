@@ -21,7 +21,6 @@ class GastoProgramadoOut(BaseModel):
     valor: float
     frecuencia: str           # "semanal" | "mensual" | "anual"
     proxima_fecha: str
-    ultima_ejecucion: Optional[str] = None
     created_at: Optional[str] = None
 
 
@@ -38,7 +37,7 @@ def listar_gastos_programados(tenant_id: str = Depends(get_tenant_id)):
     """Retorna todas las reglas de gastos programados del tenant."""
     resultado = query(
         "SELECT id, tenant_id, nombre, tipo, valor, frecuencia, "
-        "proxima_fecha, ultima_ejecucion, created_at "
+        "proxima_fecha, created_at "
         "FROM gastos_programados "
         "WHERE tenant_id = %s "
         "ORDER BY proxima_fecha ASC, created_at DESC",
