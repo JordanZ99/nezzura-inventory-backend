@@ -4,6 +4,7 @@
 # ==============================================================================
 
 from database.conexion import execute, get_conn, release_conn
+from psycopg2.extras import RealDictCursor
 from datetime import date, timedelta
 
 
@@ -65,7 +66,7 @@ def ejecutar_gasto_programado(regla_id: str, tenant_id: str) -> dict:
     """
     conn = get_conn()
     try:
-        with conn.cursor() as cur:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
             # Obtener la regla
             cur.execute(
                 "SELECT id, nombre, tipo, valor, frecuencia, "
@@ -78,12 +79,12 @@ def ejecutar_gasto_programado(regla_id: str, tenant_id: str) -> dict:
             if not regla:
                 return {"ok": False, "mensaje": "Regla no encontrada"}
 
-            rid = regla["id"]
+            rid = str(regla["id"])
             nombre = regla["nombre"]
             tipo = regla["tipo"]
             valor = float(regla["valor"])
             frecuencia = regla["frecuencia"]
-            proxima_fecha = str(regla["proxima_fecha"])
+            proxima_fecha = str(regla["proxima_fecha"]) if regla["proxima_fecha"] else ""
             ultima_ejecucion = regla.get("ultima_ejecucion")
 
             # ── Calcular monto ──
@@ -92,7 +93,6 @@ def ejecutar_gasto_programado(regla_id: str, tenant_id: str) -> dict:
             else:  # porcentaje
                 # Determinar fecha de inicio del período
                 if ultima_ejecucion:
-                    # Usar ultima_ejecucion como inicio
                     inicio = ultima_ejecucion.isoformat() if hasattr(ultima_ejecucion, 'isoformat') else str(ultima_ejecucion)[:19]
                 else:
                     # Buscar la venta más antigua registrada
@@ -100,20 +100,40 @@ def ejecutar_gasto_programado(regla_id: str, tenant_id: str) -> dict:
                         "SELECT MIN(fecha) FROM ventas WHERE tenant_id = %s",
                         (tenant_id,)
                     )
-                    min_fecha = cur.fetchone()[0]
+                    row = cur.fetchone()
+                    min_fecha = row["min"] if row and "min" in row else None
                     inicio = min_fecha.isoformat() if min_fecha else proxima_fecha
 
                 fin = date.today().isoformat()
 
                 # SUM de ventas en el rango
                 cur.execute(
-                    "SELECT COALESCE(SUM(total_venta), 0) FROM ventas "
+                    "SELECT COALESCE(SUM(total_venta), 0) AS total FROM ventas "
                     "WHERE tenant_id = %s AND fecha::date >= %s::date AND fecha::date <= %s::date",
                     (tenant_id, inicio, fin)
                 )
-                total_ventas = float(cur.fetchone()[0])
+                row = cur.fetchone()
+                total_ventas = float(row["total"]) if row and row["total"] is not None else 0.0
 
                 monto = (valor / 100.0) * total_ventas if total_ventas > 0 else 0.0
+
+            # ── Si el monto es 0, no insertar gasto basura ──
+            if monto <= 0:
+                intervalo = _intervalo_sql(frecuencia)
+                cur.execute(
+                    "UPDATE gastos_programados "
+                    "SET ultima_ejecucion = CURRENT_TIMESTAMP, "
+                    "    proxima_fecha = (proxima_fecha::date + INTERVAL %s)::text "
+                    "WHERE id = %s",
+                    (intervalo, rid)
+                )
+                conn.commit()
+                return {
+                    "ok": True,
+                    "monto": 0,
+                    "nombre": nombre,
+                    "mensaje": f"Sin ventas en el período para '{nombre}'. Se actualizó la próxima fecha sin generar gasto."
+                }
 
             # ── Insertar gasto (pagado directamente por ser ejecución manual) ──
             descripcion = f"Pago de regla: {nombre}"
@@ -162,7 +182,7 @@ def verificar_y_generar_gastos_programados(tenant_id: str) -> dict:
     """
     conn = get_conn()
     try:
-        with conn.cursor() as cur:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
             # ── Paso A: Reglas vencidas ──
             cur.execute(
                 "SELECT id, nombre, tipo, valor, frecuencia, proxima_fecha "
@@ -195,20 +215,22 @@ def verificar_y_generar_gastos_programados(tenant_id: str) -> dict:
 
                     # Total de ventas en el período
                     cur.execute(
-                        "SELECT COALESCE(SUM(total_venta), 0) FROM ventas "
+                        "SELECT COALESCE(SUM(total_venta), 0) AS total FROM ventas "
                         "WHERE tenant_id = %s AND fecha::date >= %s AND fecha::date < %s",
                         (tenant_id, inicio_periodo, fin_periodo)
                     )
-                    total_ventas = float(cur.fetchone()[0])
+                    row = cur.fetchone()
+                    total_ventas = float(row["total"]) if row and row["total"] is not None else 0.0
 
                     # Total de gastos pagados en el período
                     cur.execute(
-                        "SELECT COALESCE(SUM(monto), 0) FROM gastos "
+                        "SELECT COALESCE(SUM(monto), 0) AS total FROM gastos "
                         "WHERE tenant_id = %s AND fecha::date >= %s AND fecha::date < %s "
                         "AND estado = 'pagado'",
                         (tenant_id, inicio_periodo, fin_periodo)
                     )
-                    total_gastos = float(cur.fetchone()[0])
+                    row = cur.fetchone()
+                    total_gastos = float(row["total"]) if row and row["total"] is not None else 0.0
 
                     ganancia_neta = total_ventas - total_gastos
                     monto = (valor / 100.0) * ganancia_neta if ganancia_neta > 0 else 0.0
