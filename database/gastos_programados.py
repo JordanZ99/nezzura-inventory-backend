@@ -3,9 +3,10 @@
 # CRUD sobre la tabla gastos_programados + motor de verificación automática.
 # ==============================================================================
 
+import calendar
 from database.conexion import execute, get_conn, release_conn
 from psycopg2.extras import RealDictCursor
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 
 def crear_gasto_programado(
@@ -57,17 +58,57 @@ def _intervalo_sql(frecuencia: str) -> str:
     return mapping.get(frecuencia, "1 month")
 
 
+def _avanzar_fecha(fecha: date, frecuencia: str) -> date:
+    """
+    Calcula la próxima fecha sumando el intervalo según la frecuencia.
+    Usa timedelta para semanas y lógica manual para meses/años
+    evitando dependencias externas como dateutil.
+    """
+    if frecuencia == "semanal":
+        return fecha + timedelta(weeks=1)
+    elif frecuencia == "mensual":
+        mes = fecha.month + 1
+        anio = fecha.year + (mes - 1) // 12
+        mes = ((mes - 1) % 12) + 1
+        dia = min(fecha.day, calendar.monthrange(anio, mes)[1])
+        return date(anio, mes, dia)
+    elif frecuencia == "anual":
+        dia = min(fecha.day, calendar.monthrange(fecha.year + 1, fecha.month)[1])
+        return date(fecha.year + 1, fecha.month, dia)
+    else:
+        return fecha + timedelta(days=30)
+
+
+def _aplicar_formato_fecha(valor) -> str:
+    """
+    Convierte cualquier tipo de fecha a string ISO YYYY-MM-DD.
+    - datetime.date/date → .isoformat()
+    - datetime.datetime → .strftime('%Y-%m-%d')
+    - str → se usa directo (ya viene de columna TEXT)
+    - None → retorna string vacío
+    """
+    if valor is None:
+        return ""
+    if isinstance(valor, datetime):
+        return valor.strftime("%Y-%m-%d")
+    if isinstance(valor, date):
+        return valor.isoformat()
+    return str(valor)[:10]  # str directo, truncar por si trae hora
+
+
 def ejecutar_gasto_programado(regla_id: str, tenant_id: str) -> dict:
     """
     Ejecuta una regla de gasto programado de forma manual.
     - Calcula el monto según el tipo (fijo o porcentaje sobre ventas)
-    - Inserta un gasto con estado 'pendiente'
+    - Inserta un gasto con estado 'pagado'
     - Actualiza ultima_ejecucion y proxima_fecha de la regla
+    Usa saneamiento explícito de tipos de fecha en Python y casting
+    ::date explícito en SQL para evitar discrepancias entre TEXT/DATE.
     """
     conn = get_conn()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # Obtener la regla
+            # ── Obtener la regla ──
             cur.execute(
                 "SELECT id, nombre, tipo, valor, frecuencia, "
                 "       proxima_fecha, ultima_ejecucion "
@@ -84,32 +125,39 @@ def ejecutar_gasto_programado(regla_id: str, tenant_id: str) -> dict:
             tipo = regla["tipo"]
             valor = float(regla["valor"])
             frecuencia = regla["frecuencia"]
-            proxima_fecha = str(regla["proxima_fecha"]) if regla["proxima_fecha"] else ""
-            ultima_ejecucion = regla.get("ultima_ejecucion")
+
+            # ── Saneamiento de fechas ──
+            # proxima_fecha viene de columna DATE → datetime.date → ISO string
+            pf_raw = regla["proxima_fecha"]
+            proxima_fecha_str = _aplicar_formato_fecha(pf_raw)
+            # ultima_ejecucion viene de columna TIMESTAMP → datetime.datetime | None
+            ue_raw = regla.get("ultima_ejecucion")
+            ultima_ejecucion_str = _aplicar_formato_fecha(ue_raw) if ue_raw else None
 
             # ── Calcular monto ──
             if tipo == "fijo":
                 monto = valor
             else:  # porcentaje
-                # Determinar fecha de inicio del período
-                if ultima_ejecucion:
-                    inicio = ultima_ejecucion.isoformat() if hasattr(ultima_ejecucion, 'isoformat') else ultima_ejecucion
+                # Determinar fecha inicio del período (siempre string YYYY-MM-DD)
+                if ultima_ejecucion_str:
+                    inicio = ultima_ejecucion_str
                 else:
-                    # Buscar la venta más antigua registrada
                     cur.execute(
                         "SELECT MIN(fecha) FROM ventas WHERE tenant_id = %s",
                         (tenant_id,)
                     )
                     row = cur.fetchone()
                     min_fecha = row["min"] if row and "min" in row else None
-                    inicio = min_fecha if min_fecha else proxima_fecha
+                    # min_fecha viene de columna TEXT → ya es str
+                    inicio = min_fecha if min_fecha else proxima_fecha_str
 
                 fin = date.today().isoformat()
 
-                # SUM de ventas en el rango
+                # SUM de ventas en el rango (cast explícito ::date)
                 cur.execute(
                     "SELECT COALESCE(SUM(total_venta), 0) AS total FROM ventas "
-                    "WHERE tenant_id = %s AND fecha::date >= %s::date AND fecha::date <= %s::date",
+                    "WHERE tenant_id = %s "
+                    "AND fecha::date >= %s::date AND fecha::date <= %s::date",
                     (tenant_id, inicio, fin)
                 )
                 row = cur.fetchone()
@@ -117,15 +165,19 @@ def ejecutar_gasto_programado(regla_id: str, tenant_id: str) -> dict:
 
                 monto = (valor / 100.0) * total_ventas if total_ventas > 0 else 0.0
 
-            # ── Si el monto es 0, no insertar gasto basura ──
+            # ── Calcular próxima fecha (en Python con timedelta/lógica manual) ──
+            pf_date = date.fromisoformat(proxima_fecha_str) if proxima_fecha_str else date.today()
+            nueva_proxima_fecha = _avanzar_fecha(pf_date, frecuencia)
+            nueva_proxima_fecha_str = nueva_proxima_fecha.isoformat()
+
+            # ── Si monto <= 0, solo actualizar fechas sin insertar gasto ──
             if monto <= 0:
-                intervalo = _intervalo_sql(frecuencia)
                 cur.execute(
                     "UPDATE gastos_programados "
                     "SET ultima_ejecucion = CURRENT_TIMESTAMP, "
-                    "    proxima_fecha = (proxima_fecha::date + INTERVAL %s)::text "
+                    "    proxima_fecha = %s::date "
                     "WHERE id = %s",
-                    (intervalo, rid)
+                    (nueva_proxima_fecha_str, rid)
                 )
                 conn.commit()
                 return {
@@ -136,23 +188,22 @@ def ejecutar_gasto_programado(regla_id: str, tenant_id: str) -> dict:
                 }
 
             # ── Insertar gasto (pagado directamente por ser ejecución manual) ──
-            descripcion = f"Pago de regla: {nombre}"
             fecha_hoy = date.today().isoformat()
             cur.execute(
                 "INSERT INTO gastos "
                 "(Fecha, Categoria, Descripcion, Monto, Tenant_ID, Estado, Gasto_Programado_ID) "
                 "VALUES (%s, %s, %s, %s, %s, %s, %s)",
-                (fecha_hoy, "Otros", descripcion, monto, tenant_id, "pagado", rid)
+                (fecha_hoy, "Otros", f"Pago de regla: {nombre}",
+                 monto, tenant_id, "pagado", rid)
             )
 
             # ── Actualizar la regla ──
-            intervalo = _intervalo_sql(frecuencia)
             cur.execute(
                 "UPDATE gastos_programados "
                 "SET ultima_ejecucion = CURRENT_TIMESTAMP, "
-                "    proxima_fecha = (proxima_fecha::date + INTERVAL %s)::text "
+                "    proxima_fecha = %s::date "
                 "WHERE id = %s",
-                (intervalo, rid)
+                (nueva_proxima_fecha_str, rid)
             )
 
             conn.commit()
