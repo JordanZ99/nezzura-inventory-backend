@@ -93,7 +93,7 @@ def ejecutar_gasto_programado(regla_id: str, tenant_id: str) -> dict:
             else:  # porcentaje
                 # Determinar fecha de inicio del período
                 if ultima_ejecucion:
-                    inicio = ultima_ejecucion.isoformat() if hasattr(ultima_ejecucion, 'isoformat') else str(ultima_ejecucion)[:19]
+                    inicio = ultima_ejecucion.isoformat() if hasattr(ultima_ejecucion, 'isoformat') else ultima_ejecucion
                 else:
                     # Buscar la venta más antigua registrada
                     cur.execute(
@@ -102,7 +102,7 @@ def ejecutar_gasto_programado(regla_id: str, tenant_id: str) -> dict:
                     )
                     row = cur.fetchone()
                     min_fecha = row["min"] if row and "min" in row else None
-                    inicio = min_fecha.isoformat() if min_fecha else proxima_fecha
+                    inicio = min_fecha if min_fecha else proxima_fecha
 
                 fin = date.today().isoformat()
 
