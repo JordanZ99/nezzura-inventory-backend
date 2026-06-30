@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from database.conexion import inicializar_db
-from routers import inventario, ventas, gastos
+from routers import inventario, ventas, gastos, gastos_programados
 
 app = FastAPI(
     title="Goyangi Store API",
@@ -56,6 +56,7 @@ app.mount("/uploads", StaticFiles(directory=uploads_dir, check_dir=False), name=
 app.include_router(inventario.router)
 app.include_router(ventas.router)
 app.include_router(gastos.router)
+app.include_router(gastos_programados.router)
 
 @app.get("/")
 def root():
