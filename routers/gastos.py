@@ -3,7 +3,7 @@
 # Endpoints de gastos del negocio.
 # ==============================================================================
 
-from database.gastos import get_gastos, insertar_gasto, eliminar_gasto, confirmar_gasto, descartar_gasto
+from database.gastos import get_gastos, insertar_gasto, eliminar_gasto, confirmar_gasto, descartar_gasto, actualizar_gasto
 from database.gastos_programados import verificar_y_generar_gastos_programados
 from dependencies import get_tenant_id
 from fastapi import APIRouter, Depends
@@ -58,6 +58,17 @@ def confirmar_gasto_endpoint(gasto_id: int, tenant_id: str = Depends(get_tenant_
 def descartar_gasto_endpoint(gasto_id: int, tenant_id: str = Depends(get_tenant_id)):
     """Cambia el estado del gasto a 'descartado'."""
     return descartar_gasto(gasto_id, tenant_id)
+
+
+@router.put("/{gasto_id}")
+def editar_gasto(gasto_id: int, data: NuevoGasto, tenant_id: str = Depends(get_tenant_id)):
+    """Actualiza monto y categoría de un gasto existente."""
+    return actualizar_gasto(
+        gasto_id=gasto_id,
+        monto=data.monto,
+        categoria=data.categoria,
+        tenant_id=tenant_id
+    )
 
 
 @router.delete("/{gasto_id}")
