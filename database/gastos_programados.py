@@ -73,9 +73,8 @@ def verificar_y_generar_gastos_programados(tenant_id: str) -> dict:
             cur.execute(
                 "SELECT id, nombre, tipo, valor, frecuencia, proxima_fecha "
                 "FROM gastos_programados "
-                "WHERE tenant_id = %s "
-                "AND activo = true "
-                "AND proxima_fecha::date <= CURRENT_DATE",
+            "WHERE tenant_id = %s "
+            "AND proxima_fecha::date <= CURRENT_DATE",
                 (tenant_id,)
             )
             reglas = cur.fetchall()
