@@ -153,15 +153,15 @@ def ejecutar_gasto_programado(regla_id: str, tenant_id: str) -> dict:
 
                 fin = date.today().isoformat()
 
-                # SUM de ventas en el rango (cast explícito ::date)
+                # SUM de ganancia_bruta real (utilidad de cada venta: precio_real - costo)
                 cur.execute(
-                    "SELECT COALESCE(SUM(total_venta), 0) AS total FROM ventas "
+                    "SELECT COALESCE(SUM(ganancia_bruta), 0) AS total FROM ventas "
                     "WHERE tenant_id = %s "
                     "AND fecha::date >= %s::date AND fecha::date <= %s::date",
                     (tenant_id, inicio, fin)
                 )
                 row = cur.fetchone()
-                total_ventas = float(row["total"]) if row and row["total"] is not None else 0.0
+                ganancia_bruta = float(row["total"]) if row and row["total"] is not None else 0.0
 
                 # SUM de gastos pagados en el mismo período
                 cur.execute(
@@ -173,7 +173,7 @@ def ejecutar_gasto_programado(regla_id: str, tenant_id: str) -> dict:
                 row = cur.fetchone()
                 total_gastos = float(row["total"]) if row and row["total"] is not None else 0.0
 
-                ganancia_neta = total_ventas - total_gastos
+                ganancia_neta = ganancia_bruta - total_gastos
                 monto = (valor / 100.0) * ganancia_neta if ganancia_neta > 0 else 0.0
 
             # ── Calcular próxima fecha (en Python con timedelta/lógica manual) ──
@@ -275,14 +275,14 @@ def verificar_y_generar_gastos_programados(tenant_id: str) -> dict:
                 else:  # porcentaje
                     inicio_periodo, fin_periodo = _calcular_periodo(proxima_fecha, frecuencia)
 
-                    # Total de ventas en el período
+                    # Total de ganancia_bruta real en el período (utilidad de cada venta)
                     cur.execute(
-                        "SELECT COALESCE(SUM(total_venta), 0) AS total FROM ventas "
+                        "SELECT COALESCE(SUM(ganancia_bruta), 0) AS total FROM ventas "
                         "WHERE tenant_id = %s AND fecha::date >= %s AND fecha::date < %s",
                         (tenant_id, inicio_periodo, fin_periodo)
                     )
                     row = cur.fetchone()
-                    total_ventas = float(row["total"]) if row and row["total"] is not None else 0.0
+                    ganancia_bruta = float(row["total"]) if row and row["total"] is not None else 0.0
 
                     # Total de gastos pagados en el período
                     cur.execute(
@@ -294,7 +294,7 @@ def verificar_y_generar_gastos_programados(tenant_id: str) -> dict:
                     row = cur.fetchone()
                     total_gastos = float(row["total"]) if row and row["total"] is not None else 0.0
 
-                    ganancia_neta = total_ventas - total_gastos
+                    ganancia_neta = ganancia_bruta - total_gastos
                     monto = (valor / 100.0) * ganancia_neta if ganancia_neta > 0 else 0.0
 
                 # ── Paso C: Insertar gasto pendiente ──
