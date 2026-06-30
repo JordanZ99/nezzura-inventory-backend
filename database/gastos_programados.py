@@ -163,7 +163,18 @@ def ejecutar_gasto_programado(regla_id: str, tenant_id: str) -> dict:
                 row = cur.fetchone()
                 total_ventas = float(row["total"]) if row and row["total"] is not None else 0.0
 
-                monto = (valor / 100.0) * total_ventas if total_ventas > 0 else 0.0
+                # SUM de gastos pagados en el mismo período
+                cur.execute(
+                    "SELECT COALESCE(SUM(monto), 0) AS total FROM gastos "
+                    "WHERE tenant_id = %s AND estado = 'pagado' "
+                    "AND fecha::date >= %s::date AND fecha::date <= %s::date",
+                    (tenant_id, inicio, fin)
+                )
+                row = cur.fetchone()
+                total_gastos = float(row["total"]) if row and row["total"] is not None else 0.0
+
+                ganancia_neta = total_ventas - total_gastos
+                monto = (valor / 100.0) * ganancia_neta if ganancia_neta > 0 else 0.0
 
             # ── Calcular próxima fecha (en Python con timedelta/lógica manual) ──
             pf_date = date.fromisoformat(proxima_fecha_str) if proxima_fecha_str else date.today()
