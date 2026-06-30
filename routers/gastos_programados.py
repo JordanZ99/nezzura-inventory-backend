@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from dependencies import get_tenant_id
 from database.conexion import query
-from database.gastos_programados import crear_gasto_programado
+from database.gastos_programados import crear_gasto_programado, ejecutar_gasto_programado
 
 router = APIRouter(prefix="/gastos_programados", tags=["Gastos Programados"])
 
@@ -60,3 +60,16 @@ def crear_gasto_programado_endpoint(
         proxima_fecha=data.proxima_fecha,
         tenant_id=tenant_id,
     )
+
+
+@router.post("/{regla_id}/ejecutar")
+def ejecutar_regla_endpoint(
+    regla_id: str,
+    tenant_id: str = Depends(get_tenant_id)
+):
+    """
+    Ejecuta manualmente una regla de gasto programado.
+    Calcula el monto (fijo o porcentaje sobre ventas), inserta un gasto
+    y actualiza ultima_ejecucion + proxima_fecha de la regla.
+    """
+    return ejecutar_gasto_programado(regla_id, tenant_id)
