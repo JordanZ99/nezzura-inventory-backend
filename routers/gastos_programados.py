@@ -34,7 +34,7 @@ class NuevoGastoProgramado(BaseModel):
     proxima_fecha: str
 
 
-@router.get("/")
+@router.get("")
 def listar_gastos_programados(tenant_id: str = Depends(get_tenant_id)):
     """Retorna todas las reglas de gastos programados del tenant."""
     resultado = query(
@@ -48,7 +48,7 @@ def listar_gastos_programados(tenant_id: str = Depends(get_tenant_id)):
     return resultado
 
 
-@router.post("/")
+@router.post("")
 def crear_gasto_programado_endpoint(
     data: NuevoGastoProgramado,
     tenant_id: str = Depends(get_tenant_id)
