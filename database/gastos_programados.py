@@ -153,17 +153,17 @@ def ejecutar_gasto_programado(regla_id: str, tenant_id: str) -> dict:
 
                 fin = date.today().isoformat()
 
-                # SUM de ganancia_bruta real (utilidad de cada venta: precio_real - costo)
+                # ── 1. SUM(ganancia_bruta) de ventas activas en el período ──
                 cur.execute(
                     "SELECT COALESCE(SUM(ganancia_bruta), 0) AS total FROM ventas "
-                    "WHERE tenant_id = %s "
+                    "WHERE tenant_id = %s AND estado != 'Inactivo' "
                     "AND fecha::date >= %s::date AND fecha::date <= %s::date",
                     (tenant_id, inicio, fin)
                 )
                 row = cur.fetchone()
                 ganancia_bruta = float(row["total"]) if row and row["total"] is not None else 0.0
 
-                # SUM de gastos en el mismo período (todos, sin filtrar por estado)
+                # ── 2. SUM(gastos.monto) histórico del período (ANTES de este gasto) ──
                 cur.execute(
                     "SELECT COALESCE(SUM(monto), 0) AS total FROM gastos "
                     "WHERE tenant_id = %s "
@@ -173,8 +173,11 @@ def ejecutar_gasto_programado(regla_id: str, tenant_id: str) -> dict:
                 row = cur.fetchone()
                 total_gastos = float(row["total"]) if row and row["total"] is not None else 0.0
 
-                ganancia_neta = ganancia_bruta - total_gastos
-                monto = (valor / 100.0) * ganancia_neta if ganancia_neta > 0 else 0.0
+                # ── 3. Ganancia neta histórica (previa a este gasto) ──
+                ganancia_neta_previa = ganancia_bruta - total_gastos
+
+                # ── 4. Monto del nuevo gasto = % × ganancia_neta_previa ──
+                monto = (valor / 100.0) * ganancia_neta_previa if ganancia_neta_previa > 0 else 0.0
 
             # ── Calcular próxima fecha (en Python con timedelta/lógica manual) ──
             pf_date = date.fromisoformat(proxima_fecha_str) if proxima_fecha_str else date.today()
