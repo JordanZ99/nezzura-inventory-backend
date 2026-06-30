@@ -19,6 +19,7 @@ app = FastAPI(
 )
 
 import os
+import re
 
 URL_PRODUCCION = os.getenv("FRONTEND_URL", "https://goyangi-frontend.vercel.app")
 
@@ -27,15 +28,15 @@ origenes_permitidos = [
     "http://localhost:3001",
     "http://127.0.0.1:3000",
     "http://127.0.0.1:3001",
-    "https://goyangi-frontend-git-bugsmenores-jordanz99s-projects.vercel.app",
-    "https://goyangi-frontend-git-multitenant-jordanz99s-projects.vercel.app",
     URL_PRODUCCION
 ]
 
-# CORS seguro con orígenes explícitos
+# CORS: además de los orígenes fijos, aceptamos cualquier subdominio de Vercel
+# para cubrir preview deployments automáticos sin tener que listarlos uno a uno.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origenes_permitidos,
+    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
