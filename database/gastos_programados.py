@@ -163,10 +163,10 @@ def ejecutar_gasto_programado(regla_id: str, tenant_id: str) -> dict:
                 row = cur.fetchone()
                 ganancia_bruta = float(row["total"]) if row and row["total"] is not None else 0.0
 
-                # SUM de gastos pagados en el mismo período
+                # SUM de gastos en el mismo período (todos, sin filtrar por estado)
                 cur.execute(
                     "SELECT COALESCE(SUM(monto), 0) AS total FROM gastos "
-                    "WHERE tenant_id = %s AND estado = 'pagado' "
+                    "WHERE tenant_id = %s "
                     "AND fecha::date >= %s::date AND fecha::date <= %s::date",
                     (tenant_id, inicio, fin)
                 )
@@ -284,11 +284,10 @@ def verificar_y_generar_gastos_programados(tenant_id: str) -> dict:
                     row = cur.fetchone()
                     ganancia_bruta = float(row["total"]) if row and row["total"] is not None else 0.0
 
-                    # Total de gastos pagados en el período
+                    # Total de gastos en el período (todos, sin filtrar por estado)
                     cur.execute(
                         "SELECT COALESCE(SUM(monto), 0) AS total FROM gastos "
-                        "WHERE tenant_id = %s AND fecha::date >= %s AND fecha::date < %s "
-                        "AND estado = 'pagado'",
+                        "WHERE tenant_id = %s AND fecha::date >= %s AND fecha::date < %s",
                         (tenant_id, inicio_periodo, fin_periodo)
                     )
                     row = cur.fetchone()
