@@ -4,9 +4,19 @@
 # ==============================================================================
 
 import calendar
+from zoneinfo import ZoneInfo
 from database.conexion import execute, get_conn, release_conn
 from psycopg2.extras import RealDictCursor
 from datetime import date, datetime, timedelta
+
+
+# ── Zona horaria del negocio (Cancún, UTC-5) ──
+_TZ = ZoneInfo("America/Cancun")
+
+
+def _hoy() -> date:
+    """Retorna la fecha actual en la zona horaria de Cancún."""
+    return datetime.now(_TZ).date()
 
 
 def crear_gasto_programado(
@@ -142,7 +152,7 @@ def ejecutar_gasto_programado(regla_id: str, tenant_id: str) -> dict:
                 inicio = _calcular_inicio_periodo(
                     ue_raw, tenant_id, cur, proxima_fecha_str
                 )
-                fin = date.today().isoformat()
+                fin = _hoy().isoformat()
 
                 # ── 1. SUM(ganancia_bruta) de ventas activas en el período ──
                 cur.execute(
@@ -171,7 +181,7 @@ def ejecutar_gasto_programado(regla_id: str, tenant_id: str) -> dict:
                 monto = (valor / 100.0) * ganancia_neta_periodo if ganancia_neta_periodo > 0 else 0.0
 
             # ── Calcular próxima fecha (en Python con timedelta/lógica manual) ──
-            pf_date = date.fromisoformat(proxima_fecha_str) if proxima_fecha_str else date.today()
+            pf_date = date.fromisoformat(proxima_fecha_str) if proxima_fecha_str else _hoy()
             nueva_proxima_fecha = _avanzar_fecha(pf_date, frecuencia)
             nueva_proxima_fecha_str = nueva_proxima_fecha.isoformat()
 
@@ -193,7 +203,7 @@ def ejecutar_gasto_programado(regla_id: str, tenant_id: str) -> dict:
                 }
 
             # ── Insertar gasto (pagado directamente por ser ejecución manual) ──
-            fecha_hoy = date.today().isoformat()
+            fecha_hoy = _hoy().isoformat()
             cur.execute(
                 "INSERT INTO gastos "
                 "(Fecha, Categoria, Descripcion, Monto, Tenant_ID, Estado, Gasto_Programado_ID) "

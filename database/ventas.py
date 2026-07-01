@@ -1,7 +1,12 @@
 # Reemplaza todo backend/database/ventas.py por esto:
 
 import psycopg2.extras
+from zoneinfo import ZoneInfo
 from database.conexion import query, execute
+
+
+# ── Zona horaria del negocio (Cancún, UTC-5) ──
+_TZ = ZoneInfo("America/Cancun")
 
 def get_ventas(tenant_id: str, limit: int = 500) -> list[dict]:
     """Lee ventas del usuario ordenadas por fecha descendente."""
@@ -73,7 +78,7 @@ def actualizar_venta(venta_id: int, fecha: str, cantidad: int, precio_real: floa
                 else:
                     import uuid, datetime
                     id_l = str(uuid.uuid4())[:12]
-                    fe = str(datetime.datetime.now())
+                    fe = str(datetime.datetime.now(_TZ))
                     cur.execute("INSERT INTO lotes (ID_Lote, Producto, Costo, Precio_Venta, Stock_Lote, Fecha_Entrada, Estado, tenant_id) VALUES (%s, %s, %s, %s, %s, %s, 'Activo', %s)", (id_l, v["producto"], v["costo_unitario"], v["precio_lista"], restaurar, fe, tenant_id))
 
             # 3. Guardar cambios en la venta

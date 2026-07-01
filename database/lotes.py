@@ -6,6 +6,11 @@
 import uuid
 import datetime
 import re
+from zoneinfo import ZoneInfo
+
+
+# ── Zona horaria del negocio (Cancún, UTC-5) ──
+_TZ = ZoneInfo("America/Cancun")
 from database.conexion import query, execute
 
 # ==============================================================================
@@ -227,7 +232,7 @@ def agregar_lote(
         return {"accion": "stock_sumado", "producto": producto, "cantidad": stock}
     else:
         id_lote = str(uuid.uuid4())[:12]
-        fecha   = str(datetime.datetime.now())
+        fecha   = str(datetime.datetime.now(_TZ))
         execute("""
             INSERT INTO lotes (ID_Lote, Producto, Costo, Precio_Venta,
                                Stock_Lote, Fecha_Entrada, Estado, tenant_id)
@@ -577,7 +582,7 @@ def descontar_stock_peps(
         lote["stock_lote"] = nuevo_stock
 
         ventas_generadas.append({
-            "fecha"          : str(datetime.datetime.now()),
+            "fecha"          : str(datetime.datetime.now(_TZ)),
             "producto"       : producto,
             "cantidad"       : consumir,
             "precio_lista"   : float(lote["precio_venta"]),
@@ -602,7 +607,7 @@ def descontar_stock_peps(
             )
             
             ventas_generadas.append({
-                "fecha"          : str(datetime.datetime.now()),
+                "fecha"          : str(datetime.datetime.now(_TZ)),
                 "producto"       : producto,
                 "cantidad"       : restante,
                 "precio_lista"   : float(lote_destino["precio_venta"]),
@@ -615,7 +620,7 @@ def descontar_stock_peps(
         else:
             # No existe ningún lote para este producto — creamos uno virtual con stock negativo
             id_lote   = str(uuid.uuid4())[:12]
-            fecha     = str(datetime.datetime.now())
+            fecha     = str(datetime.datetime.now(_TZ))
             
             execute(
                 "INSERT INTO lotes (ID_Lote, Producto, Costo, Precio_Venta, Stock_Lote, Fecha_Entrada, Estado, tenant_id) VALUES (%s, %s, %s, %s, %s, %s, 'Activo', %s)",
