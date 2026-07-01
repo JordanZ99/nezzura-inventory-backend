@@ -27,27 +27,6 @@ def crear_gasto_programado(
     return {"ok": True}
 
 
-def _calcular_periodo(proxima_fecha: str, frecuencia: str) -> tuple[str, str]:
-    """
-    Calcula la ventana de tiempo (inicio, fin) para determinar
-    la ganancia neta según la frecuencia.
-    Retorna (fecha_inicio, fecha_fin) como strings ISO.
-    """
-    pf = date.fromisoformat(proxima_fecha[:10])
-
-    if frecuencia == "semanal":
-        inicio = pf - timedelta(days=7)
-    elif frecuencia == "mensual":
-        inicio = pf - timedelta(days=30)
-    elif frecuencia == "anual":
-        inicio = pf - timedelta(days=365)
-    else:
-        inicio = pf - timedelta(days=30)
-
-    fin = pf
-    return inicio.isoformat(), fin.isoformat()
-
-
 def _intervalo_sql(frecuencia: str) -> str:
     """Retorna el intervalo PostgreSQL correspondiente a la frecuencia."""
     mapping = {
@@ -96,14 +75,38 @@ def _aplicar_formato_fecha(valor) -> str:
     return str(valor)[:10]  # str directo, truncar por si trae hora
 
 
+def _calcular_inicio_periodo(ultima_ejecucion_raw, tenant_id, cur, fallback_str: str) -> str:
+    """
+    Calcula la fecha de inicio del período para el Corte de Caja.
+    - Si existe ultima_ejecucion: día siguiente (+1 día calendario, sin solapamiento).
+    - Si no existe: MIN(fecha) de ventas, o el fallback_str si no hay ventas.
+    """
+    if ultima_ejecucion_raw:
+        ue_str = _aplicar_formato_fecha(ultima_ejecucion_raw)
+        if ue_str:
+            ue_date = date.fromisoformat(ue_str)
+            return (ue_date + timedelta(days=1)).isoformat()
+
+    # Sin ejecución previa → desde la primera venta registrada
+    cur.execute(
+        "SELECT MIN(fecha) FROM ventas WHERE tenant_id = %s",
+        (tenant_id,)
+    )
+    row = cur.fetchone()
+    min_fecha = row["min"] if row and "min" in row else None
+    return min_fecha if min_fecha else fallback_str
+
+
 def ejecutar_gasto_programado(regla_id: str, tenant_id: str) -> dict:
     """
     Ejecuta una regla de gasto programado de forma manual.
-    - Calcula el monto según el tipo (fijo o porcentaje sobre ventas)
+    - Calcula el monto según el tipo (fijo o porcentaje sobre ganancia neta)
     - Inserta un gasto con estado 'pagado'
     - Actualiza ultima_ejecucion y proxima_fecha de la regla
-    Usa saneamiento explícito de tipos de fecha en Python y casting
-    ::date explícito en SQL para evitar discrepancias entre TEXT/DATE.
+
+    Corte de Caja: cada ejecución considera únicamente el período
+    comprendido entre el día después de la última ejecución y hoy,
+    sin solapamiento con períodos anteriores.
     """
     conn = get_conn()
     try:
@@ -127,30 +130,18 @@ def ejecutar_gasto_programado(regla_id: str, tenant_id: str) -> dict:
             frecuencia = regla["frecuencia"]
 
             # ── Saneamiento de fechas ──
-            # proxima_fecha viene de columna DATE → datetime.date → ISO string
             pf_raw = regla["proxima_fecha"]
             proxima_fecha_str = _aplicar_formato_fecha(pf_raw)
-            # ultima_ejecucion viene de columna TIMESTAMP → datetime.datetime | None
             ue_raw = regla.get("ultima_ejecucion")
-            ultima_ejecucion_str = _aplicar_formato_fecha(ue_raw) if ue_raw else None
 
             # ── Calcular monto ──
             if tipo == "fijo":
                 monto = valor
             else:  # porcentaje
-                # Determinar fecha inicio del período (siempre string YYYY-MM-DD)
-                if ultima_ejecucion_str:
-                    inicio = ultima_ejecucion_str
-                else:
-                    cur.execute(
-                        "SELECT MIN(fecha) FROM ventas WHERE tenant_id = %s",
-                        (tenant_id,)
-                    )
-                    row = cur.fetchone()
-                    min_fecha = row["min"] if row and "min" in row else None
-                    # min_fecha viene de columna TEXT → ya es str
-                    inicio = min_fecha if min_fecha else proxima_fecha_str
-
+                # ── Corte de Caja: inicio del período ──
+                inicio = _calcular_inicio_periodo(
+                    ue_raw, tenant_id, cur, proxima_fecha_str
+                )
                 fin = date.today().isoformat()
 
                 # ── 1. SUM(ganancia_bruta) de ventas activas en el período ──
@@ -173,11 +164,11 @@ def ejecutar_gasto_programado(regla_id: str, tenant_id: str) -> dict:
                 row = cur.fetchone()
                 total_gastos = float(row["total"]) if row and row["total"] is not None else 0.0
 
-                # ── 3. Ganancia neta histórica (previa a este gasto) ──
-                ganancia_neta_previa = ganancia_bruta - total_gastos
+                # ── 3. Ganancia neta del período (Corte de Caja limpio) ──
+                ganancia_neta_periodo = ganancia_bruta - total_gastos
 
-                # ── 4. Monto del nuevo gasto = % × ganancia_neta_previa ──
-                monto = (valor / 100.0) * ganancia_neta_previa if ganancia_neta_previa > 0 else 0.0
+                # ── 4. Monto del nuevo gasto = % × ganancia_neta_periodo ──
+                monto = (valor / 100.0) * ganancia_neta_periodo if ganancia_neta_periodo > 0 else 0.0
 
             # ── Calcular próxima fecha (en Python con timedelta/lógica manual) ──
             pf_date = date.fromisoformat(proxima_fecha_str) if proxima_fecha_str else date.today()
@@ -198,7 +189,7 @@ def ejecutar_gasto_programado(regla_id: str, tenant_id: str) -> dict:
                     "ok": True,
                     "monto": 0,
                     "nombre": nombre,
-                    "mensaje": f"Sin ventas en el período para '{nombre}'. Se actualizó la próxima fecha sin generar gasto."
+                    "mensaje": f"Sin ganancia neta positiva en el período para '{nombre}'. Se actualizó la próxima fecha sin generar gasto."
                 }
 
             # ── Insertar gasto (pagado directamente por ser ejecución manual) ──
@@ -237,10 +228,11 @@ def ejecutar_gasto_programado(regla_id: str, tenant_id: str) -> dict:
 
 def verificar_y_generar_gastos_programados(tenant_id: str) -> dict:
     """
-    Motor de verificación:
+    Motor de verificación automática:
     1. Busca reglas cuya proxima_fecha <= hoy
     2. Para cada regla vencida:
-       - Calcula el monto (fijo o porcentaje)
+       - Calcula el monto (fijo o porcentaje) usando el mismo Corte de Caja
+         que la ejecución manual
        - Inserta un gasto con estado 'pendiente'
        - Avanza la proxima_fecha según su frecuencia
     Todo dentro de una sola transacción.
@@ -250,10 +242,11 @@ def verificar_y_generar_gastos_programados(tenant_id: str) -> dict:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             # ── Paso A: Reglas vencidas ──
             cur.execute(
-                "SELECT id, nombre, tipo, valor, frecuencia, proxima_fecha "
+                "SELECT id, nombre, tipo, valor, frecuencia, "
+                "       proxima_fecha, ultima_ejecucion "
                 "FROM gastos_programados "
-            "WHERE tenant_id = %s "
-            "AND proxima_fecha::date <= CURRENT_DATE",
+                "WHERE tenant_id = %s "
+                "AND proxima_fecha::date <= CURRENT_DATE",
                 (tenant_id,)
             )
             reglas = cur.fetchall()
@@ -276,28 +269,38 @@ def verificar_y_generar_gastos_programados(tenant_id: str) -> dict:
                 if tipo == "fijo":
                     monto = valor
                 else:  # porcentaje
-                    inicio_periodo, fin_periodo = _calcular_periodo(proxima_fecha, frecuencia)
+                    # ── Corte de Caja: inicio del período ──
+                    ue_raw = regla.get("ultima_ejecucion")
+                    inicio_periodo = _calcular_inicio_periodo(
+                        ue_raw, tenant_id, cur, proxima_fecha
+                    )
+                    fin_periodo = proxima_fecha
 
-                    # Total de ganancia_bruta real en el período (utilidad de cada venta)
+                    # ── 1. SUM(ganancia_bruta) de ventas activas en el período ──
                     cur.execute(
                         "SELECT COALESCE(SUM(ganancia_bruta), 0) AS total FROM ventas "
-                        "WHERE tenant_id = %s AND fecha::date >= %s AND fecha::date < %s",
+                        "WHERE tenant_id = %s AND estado != 'Inactivo' "
+                        "AND fecha::date >= %s::date AND fecha::date <= %s::date",
                         (tenant_id, inicio_periodo, fin_periodo)
                     )
                     row = cur.fetchone()
                     ganancia_bruta = float(row["total"]) if row and row["total"] is not None else 0.0
 
-                    # Total de gastos en el período (todos, sin filtrar por estado)
+                    # ── 2. SUM(gastos.monto) histórico del período (ANTES de este gasto) ──
                     cur.execute(
                         "SELECT COALESCE(SUM(monto), 0) AS total FROM gastos "
-                        "WHERE tenant_id = %s AND fecha::date >= %s AND fecha::date < %s",
+                        "WHERE tenant_id = %s "
+                        "AND fecha::date >= %s::date AND fecha::date <= %s::date",
                         (tenant_id, inicio_periodo, fin_periodo)
                     )
                     row = cur.fetchone()
                     total_gastos = float(row["total"]) if row and row["total"] is not None else 0.0
 
-                    ganancia_neta = ganancia_bruta - total_gastos
-                    monto = (valor / 100.0) * ganancia_neta if ganancia_neta > 0 else 0.0
+                    # ── 3. Ganancia neta del período (Corte de Caja limpio) ──
+                    ganancia_neta_periodo = ganancia_bruta - total_gastos
+
+                    # ── 4. Monto del nuevo gasto = % × ganancia_neta_periodo ──
+                    monto = (valor / 100.0) * ganancia_neta_periodo if ganancia_neta_periodo > 0 else 0.0
 
                 # ── Paso C: Insertar gasto pendiente ──
                 descripcion_auto = f"{nombre} ({frecuencia.capitalize()} - Automático)"
@@ -310,11 +313,12 @@ def verificar_y_generar_gastos_programados(tenant_id: str) -> dict:
                      monto, tenant_id, "pendiente", rid)
                 )
 
-                # ── Paso D: Avanzar proxima_fecha ──
+                # ── Paso D: Avanzar proxima_fecha y marcar ultima_ejecucion ──
                 intervalo = _intervalo_sql(frecuencia)
                 cur.execute(
                     "UPDATE gastos_programados "
-                    "SET proxima_fecha = (proxima_fecha::date + INTERVAL %s)::text "
+                    "SET proxima_fecha = (proxima_fecha::date + INTERVAL %s)::text, "
+                    "    ultima_ejecucion = CURRENT_TIMESTAMP "
                     "WHERE id = %s AND tenant_id = %s",
                     (intervalo, rid, tenant_id)
                 )
