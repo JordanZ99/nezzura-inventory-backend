@@ -13,15 +13,18 @@ from database.conexion import inicializar_db
 from routers import inventario, ventas, gastos, gastos_programados
 
 app = FastAPI(
-    title="Goyangi Store API",
-    description="Backend para gestión de inventario, ventas PEPS y gastos.",
+    title="Nezzura Digital API",
+    description="Nezzura Digital — Backend para gestión de inventario, ventas PEPS y gastos.",
     version="1.0.0"
 )
 
 import os
 import re
 
-URL_PRODUCCION = os.getenv("FRONTEND_URL", "https://goyangi-frontend.vercel.app")
+# URL por defecto del frontend desplegado en Vercel.
+# En producción (Render) se sobreescribe con la variable de entorno FRONTEND_URL
+# para apuntar a la URL real del deployment de Nezzura Digital.
+URL_PRODUCCION = os.getenv("FRONTEND_URL", "https://nezzura-digital.vercel.app")
 
 origenes_permitidos = [
     "http://localhost:3000",
@@ -69,7 +72,7 @@ def root():
         stats["ventas"] = query("SELECT COUNT(*) as c FROM ventas")[0]["c"]
         stats["gastos"] = query("SELECT COUNT(*) as c FROM gastos")[0]["c"]
         return {
-            "mensaje": "Goyangi Store API funcionando ✓",
+            "mensaje": "Nezzura Digital API funcionando ✓",
             "database_stats": stats,
             "nota": "Si los números son 0, el backend está conectado a una DB vacía."
         }
