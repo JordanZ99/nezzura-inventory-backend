@@ -34,7 +34,7 @@ from database.lotes import (
     eliminar_categoria_de_productos, listar_categorias, renombrar_categoria,
     crear_categoria, eliminar_lote
 )
-from database.conexion import query
+from database.conexion import query, execute
 from pydantic import Field
 from dependencies import validar_sesion
 
@@ -282,3 +282,188 @@ def editar_categoria(categoria: str, data: RenombrarCategoria, tenant_id: str = 
 def borrar_categoria(categoria: str, tenant_id: str = Depends(get_tenant_id)):
     """Elimina una categoría de todos los productos del tenant."""
     return eliminar_categoria_de_productos(categoria, tenant_id)
+
+
+# =============================================================================
+# ── GALERÍA DE IMÁGENES (Plan Plus) ──────────────────────────────────────────
+# Los tenants con plan "plus" pueden subir hasta 5 imágenes adicionales
+# por producto. La imagen principal sigue en productos.imagen (Cloudinary).
+# Las imágenes extra viven en la tabla producto_imagenes.
+# =============================================================================
+
+def _get_tenant_plan(tenant_id: str) -> str:
+    """
+    Helper interno: obtiene el plan del tenant desde la tabla tenants.
+    Devuelve 'basico' por defecto si el tenant no tiene plan asignado
+    o si ocurre algún error consultando la base de datos.
+    Esto nunca debe bloquear la app — si falla, se asume plan básico
+    (menos privilegios) por seguridad.
+    """
+    try:
+        resultado = query("SELECT plan FROM tenants WHERE id = %s", (tenant_id,))
+        if resultado and resultado[0].get("plan"):
+            return resultado[0]["plan"]
+    except Exception as e:
+        print(f"Error obteniendo plan del tenant: {e}")
+    return "basico"
+
+
+def _get_producto_id(producto_nombre: str, tenant_id: str) -> int:
+    """
+    Helper interno: obtiene el ID numérico de un producto por su nombre.
+    Las tablas lotes y ventas referencian productos por nombre (text),
+    pero producto_imagenes usa FK a productos.id (integer).
+    Este helper hace el puente entre ambos sistemas.
+    """
+    resultado = query(
+        "SELECT id FROM productos WHERE Producto = %s AND tenant_id = %s",
+        (producto_nombre, tenant_id)
+    )
+    if not resultado:
+        raise HTTPException(status_code=404, detail="Producto no encontrado")
+    return resultado[0]["id"]
+
+
+@router.get("/imagenes/{producto}")
+def listar_imagenes_producto(producto: str, tenant_id: str = Depends(get_tenant_id)):
+    """
+    Devuelve la galería de imágenes extra de un producto.
+    Disponible para todos los planes (incluso básico puede ver,
+    aunque solo plan plus puede subir). El frontend decide si mostrar
+    el carousel basándose en el plan del tenant.
+    """
+    producto_id = _get_producto_id(producto, tenant_id)
+    resultado = query(
+        "SELECT id, url, orden FROM producto_imagenes "
+        "WHERE producto_id = %s AND tenant_id = %s "
+        "ORDER BY orden ASC",
+        (producto_id, tenant_id)
+    )
+    return resultado
+
+
+@router.post("/imagenes/{producto}")
+async def subir_imagen_extra(
+    producto: str,
+    foto: UploadFile = File(...),
+    tenant_id: str = Depends(get_tenant_id)
+):
+    """
+    Sube una imagen adicional a la galería de un producto (Plan Plus).
+    Máximo 5 imágenes por producto. Si ya hay 5, devuelve error 403.
+    """
+    # 1. Validar que el tenant tiene plan plus
+    plan = _get_tenant_plan(tenant_id)
+    if plan != "plus":
+        raise HTTPException(
+            status_code=403,
+            detail="La galería de múltiples imágenes es exclusiva del plan Plus. "
+                   "Actualiza tu plan para subir más fotos por producto."
+        )
+
+    # 2. Obtener el ID del producto
+    producto_id = _get_producto_id(producto, tenant_id)
+
+    # 3. Validar que no se exceda el máximo de 5 imágenes
+    conteo = query(
+        "SELECT COUNT(*) as total FROM producto_imagenes "
+        "WHERE producto_id = %s AND tenant_id = %s",
+        (producto_id, tenant_id)
+    )
+    total_actual = conteo[0]["total"] if conteo else 0
+    if total_actual >= 5:
+        raise HTTPException(
+            status_code=403,
+            detail="Este producto ya tiene 5 imágenes. Elimina una antes de subir otra."
+        )
+
+    # 4. Leer y validar el archivo
+    contents = await foto.read()
+    if not contents or len(contents) == 0:
+        raise HTTPException(status_code=400, detail="La imagen recibida está vacía (0 bytes)")
+
+    tamano_kb = len(contents) / 1024
+    MAX_TAMANO_KB = 1024  # 1 MB
+    if tamano_kb > MAX_TAMANO_KB:
+        raise HTTPException(
+            status_code=413,
+            detail=f"La imagen es demasiado grande ({tamano_kb:.0f} KB). Máximo {MAX_TAMANO_KB} KB."
+        )
+
+    # 5. Calcular el orden de la nueva imagen (siguiente posición disponible)
+    ordenes = query(
+        "SELECT orden FROM producto_imagenes "
+        "WHERE producto_id = %s AND tenant_id = %s ORDER BY orden",
+        (producto_id, tenant_id)
+    )
+    ordenes_usadas = {r["orden"] for r in ordenes}
+    nueva_orden = 1
+    for i in range(1, 6):
+        if i not in ordenes_usadas:
+            nueva_orden = i
+            break
+
+    # 6. Subir a Cloudinary en la carpeta "productos/galeria"
+    resultado = cloudinary.uploader.upload(
+        contents,
+        folder="productos/galeria",
+        public_id=f"{producto}_{uuid.uuid4().hex[:8]}_extra{nueva_orden}",
+        quality="auto:best",
+        fetch_format="auto"
+    )
+    url = resultado.get("secure_url")
+
+    # 7. Insertar en la base de datos
+    execute(
+        "INSERT INTO producto_imagenes (producto_id, tenant_id, url, orden) "
+        "VALUES (%s, %s, %s, %s)",
+        (producto_id, tenant_id, url, nueva_orden)
+    )
+
+    return {"ok": True, "url": url, "orden": nueva_orden}
+
+
+@router.delete("/imagenes/{imagen_id}")
+def eliminar_imagen_extra(imagen_id: int, tenant_id: str = Depends(get_tenant_id)):
+    """
+    Elimina una imagen de la galería de un producto (Plan Plus).
+    También la borra de Cloudinary para no acumular fotos huérfanas.
+    """
+    # 1. Validar plan plus
+    plan = _get_tenant_plan(tenant_id)
+    if plan != "plus":
+        raise HTTPException(
+            status_code=403,
+            detail="La gestión de galería es exclusiva del plan Plus."
+        )
+
+    # 2. Obtener la URL de Cloudinary antes de borrar el registro
+    resultado = query(
+        "SELECT url FROM producto_imagenes WHERE id = %s AND tenant_id = %s",
+        (imagen_id, tenant_id)
+    )
+    if not resultado:
+        raise HTTPException(status_code=404, detail="Imagen no encontrada")
+
+    url = resultado[0]["url"]
+
+    # 3. Borrar de Cloudinary si es URL de Cloudinary
+    if "res.cloudinary.com" in url:
+        try:
+            partes = url.split("/upload/")
+            if len(partes) > 1:
+                ruta = partes[1]
+                if re.match(r'^v\d+/', ruta):
+                    ruta = ruta.split("/", 1)[1]
+                public_id = ruta.rsplit(".", 1)[0]
+                cloudinary.uploader.destroy(public_id)
+        except Exception as e:
+            print(f"Error borrando imagen extra de Cloudinary: {e}")
+
+    # 4. Borrar de la base de datos
+    execute(
+        "DELETE FROM producto_imagenes WHERE id = %s AND tenant_id = %s",
+        (imagen_id, tenant_id)
+    )
+
+    return {"ok": True, "id": imagen_id}
