@@ -78,7 +78,7 @@ def listar_gastos_programados(tenant_id: str = Depends(get_tenant_id)):
         "SELECT gp.id, gp.tenant_id, gp.nombre, gp.tipo, gp.valor, gp.frecuencia, "
         "       gp.proxima_fecha, gp.created_at, "
         "       (SELECT monto FROM gastos "
-        "        WHERE gasto_programado_id = gp.id::text "
+        "        WHERE gasto_programado_id = gp.id "
         "          AND tenant_id = gp.tenant_id "
         "        ORDER BY id DESC LIMIT 1) as ultimo_monto "
         "FROM gastos_programados gp "
