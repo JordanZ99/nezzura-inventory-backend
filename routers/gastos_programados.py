@@ -69,13 +69,21 @@ class ActualizarGastoProgramado(BaseModel):
 
 @router.get("")
 def listar_gastos_programados(tenant_id: str = Depends(get_tenant_id)):
-    """Retorna todas las reglas de gastos programados del tenant."""
+    """
+    Retorna todas las reglas de gastos programados del tenant.
+    Incluye 'ultimo_monto': el monto del último gasto generado por cada regla,
+    para que el frontend pueda mostrar una estimación de cuánto se descontará.
+    """
     resultado = query(
-        "SELECT id, tenant_id, nombre, tipo, valor, frecuencia, "
-        "proxima_fecha, created_at "
-        "FROM gastos_programados "
-        "WHERE tenant_id = %s "
-        "ORDER BY proxima_fecha ASC, created_at DESC",
+        "SELECT gp.id, gp.tenant_id, gp.nombre, gp.tipo, gp.valor, gp.frecuencia, "
+        "       gp.proxima_fecha, gp.created_at, "
+        "       (SELECT monto FROM gastos "
+        "        WHERE gasto_programado_id = gp.id::text "
+        "          AND tenant_id = gp.tenant_id "
+        "        ORDER BY id DESC LIMIT 1) as ultimo_monto "
+        "FROM gastos_programados gp "
+        "WHERE gp.tenant_id = %s "
+        "ORDER BY gp.proxima_fecha ASC, gp.created_at DESC",
         (tenant_id,)
     )
     return resultado
