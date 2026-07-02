@@ -15,7 +15,8 @@ from dependencies import get_tenant_id
 from database.conexion import query
 from database.gastos_programados import (
     crear_gasto_programado, ejecutar_gasto_programado,
-    eliminar_gasto_programado, actualizar_gasto_programado
+    eliminar_gasto_programado, actualizar_gasto_programado,
+    estimar_monto
 )
 
 router = APIRouter(prefix="/gastos_programados", tags=["Gastos Programados"])
@@ -115,9 +116,23 @@ def ejecutar_regla_endpoint(
     Calcula el monto (fijo o porcentaje sobre ganancia neta del período),
     inserta un gasto y actualiza ultima_ejecucion + proxima_fecha.
 
-    Idempotencia: rechaza la ejecución si proxima_fecha > hoy.
+    Se permite pagar anticipadamente (antes de proxima_fecha).
+    El frontend muestra un popup de confirmación cuando la fecha aún no ha llegado.
     """
     return ejecutar_gasto_programado(regla_id, tenant_id)
+
+
+@router.get("/{regla_id}/estimacion")
+def estimar_monto_endpoint(
+    regla_id: str,
+    tenant_id: str = Depends(get_tenant_id)
+):
+    """
+    Calcula el monto estimado que se descontará al ejecutar una regla,
+    sin insertar ningún gasto ni modificar fechas. Es una simulación read-only.
+    El frontend la usa para mostrar el monto en la tabla antes de pagar.
+    """
+    return estimar_monto(regla_id, tenant_id)
 
 
 @router.put("/{regla_id}")

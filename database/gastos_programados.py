@@ -170,8 +170,9 @@ def ejecutar_gasto_programado(regla_id: str, tenant_id: str) -> dict:
     - Inserta un gasto con estado 'pagado'
     - Actualiza ultima_ejecucion y proxima_fecha de la regla
 
-    Idempotencia: si proxima_fecha > hoy, la regla no está vencida
-    y no se puede ejecutar manualmente (ya se pagó adelantado).
+    Se permite pagar anticipadamente (antes de proxima_fecha).
+    El frontend se encarga de mostrar un popup de confirmación cuando
+    la fecha aún no ha llegado.
     """
     conn = get_conn()
     try:
@@ -192,16 +193,6 @@ def ejecutar_gasto_programado(regla_id: str, tenant_id: str) -> dict:
             nombre = regla["nombre"]
             tipo = regla["tipo"]
 
-            # ── Idempotencia: no ejecutar si la regla no está vencida ──
-            pf_str = _aplicar_formato_fecha(regla["proxima_fecha"])
-            if pf_str:
-                pf_date = date.fromisoformat(pf_str)
-                if pf_date > _hoy():
-                    return {
-                        "ok": False,
-                        "mensaje": f"La regla '{nombre}' vence el {pf_str}. Aún no es la fecha de pago."
-                    }
-
             # ── Calcular monto ──
             if tipo == "fijo":
                 monto = float(regla["valor"])
@@ -209,6 +200,7 @@ def ejecutar_gasto_programado(regla_id: str, tenant_id: str) -> dict:
                 monto = _calcular_monto_porcentaje(tenant_id, regla, cur)
 
             # ── Calcular próxima fecha (en Python, zona Cancún) ──
+            pf_str = _aplicar_formato_fecha(regla["proxima_fecha"])
             pf_date = date.fromisoformat(pf_str) if pf_str else _hoy()
             nueva_proxima = _avanzar_fecha(pf_date, regla["frecuencia"])
             nueva_proxima_str = nueva_proxima.isoformat()
@@ -424,3 +416,93 @@ def actualizar_gasto_programado(
         tuple(valores)
     )
     return {"ok": True, "mensaje": "Regla actualizada"}
+
+
+def estimar_monto(regla_id: str, tenant_id: str) -> dict:
+    """
+    Calcula el monto estimado que se descontará al ejecutar una regla,
+    SIN insertar ningún gasto ni modificar fechas. Es una simulación read-only.
+
+    Retorna:
+      - monto: el monto calculado (0 si no hay ganancia neta positiva)
+      - tipo: "fijo" o "porcentaje"
+      - nombre: nombre de la regla
+      - proxima_fecha: fecha programada
+      - ganancia_bruta: ganancia bruta del período (para contexto)
+      - ganancia_neta: ganancia neta del período (para contexto)
+      - total_gastos: gastos del período (para contexto)
+    """
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "SELECT id, nombre, tipo, valor, frecuencia, "
+                "       proxima_fecha, ultima_ejecucion "
+                "FROM gastos_programados "
+                "WHERE id = %s AND tenant_id = %s",
+                (regla_id, tenant_id)
+            )
+            regla = cur.fetchone()
+            if not regla:
+                return {"ok": False, "mensaje": "Regla no encontrada"}
+
+            nombre = regla["nombre"]
+            tipo = regla["tipo"]
+
+            if tipo == "fijo":
+                monto = float(regla["valor"])
+                return {
+                    "ok": True,
+                    "monto": round(monto, 2),
+                    "tipo": tipo,
+                    "nombre": nombre,
+                    "proxima_fecha": _aplicar_formato_fecha(regla["proxima_fecha"]),
+                    "ganancia_bruta": 0,
+                    "ganancia_neta": 0,
+                    "total_gastos": 0,
+                }
+
+            # Porcentaje: calcular Corte de Caja sin insertar nada
+            ue_raw = regla.get("ultima_ejecucion")
+            inicio = _calcular_inicio_periodo(
+                ue_raw, tenant_id, cur, _aplicar_formato_fecha(regla["proxima_fecha"])
+            )
+            fin = _hoy().isoformat()
+
+            cur.execute(
+                "SELECT COALESCE(SUM(ganancia_bruta), 0) AS total FROM ventas "
+                "WHERE tenant_id = %s AND estado != 'Inactivo' "
+                "AND fecha::date >= %s::date AND fecha::date <= %s::date",
+                (tenant_id, inicio, fin)
+            )
+            row = cur.fetchone()
+            ganancia_bruta = float(row["total"]) if row and row["total"] is not None else 0.0
+
+            cur.execute(
+                "SELECT COALESCE(SUM(monto), 0) AS total FROM gastos "
+                "WHERE tenant_id = %s "
+                "AND fecha::date >= %s::date AND fecha::date <= %s::date",
+                (tenant_id, inicio, fin)
+            )
+            row = cur.fetchone()
+            total_gastos = float(row["total"]) if row and row["total"] is not None else 0.0
+
+            ganancia_neta = ganancia_bruta - total_gastos
+            valor = float(regla["valor"])
+            monto = (valor / 100.0) * ganancia_neta if ganancia_neta > 0 else 0.0
+
+            return {
+                "ok": True,
+                "monto": round(monto, 2),
+                "tipo": tipo,
+                "nombre": nombre,
+                "proxima_fecha": _aplicar_formato_fecha(regla["proxima_fecha"]),
+                "ganancia_bruta": round(ganancia_bruta, 2),
+                "ganancia_neta": round(ganancia_neta, 2),
+                "total_gastos": round(total_gastos, 2),
+            }
+
+    except Exception as e:
+        return {"ok": False, "mensaje": f"Error: {str(e)}"}
+    finally:
+        release_conn(conn)
