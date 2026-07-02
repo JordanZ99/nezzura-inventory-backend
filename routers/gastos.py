@@ -22,6 +22,19 @@ class NuevoGasto(BaseModel):
     gasto_programado_id : Optional[str] = None
 
 
+class ActualizarGasto(BaseModel):
+    """
+    Modelo dedicado para la edición de gastos.
+    A diferencia de NuevoGasto, no exige 'fecha' ni 'estado' porque la lógica
+    de actualizar_gasto solo modifica monto, categoría y descripción.
+    Esto elimina el workaround del frontend que enviaba fecha="" para engañar
+    la validación de NuevoGasto reutilizado.
+    """
+    monto      : float
+    categoria  : str
+    descripcion: str
+
+
 @router.get("/")
 def listar_gastos(tenant_id: str = Depends(get_tenant_id)):
     """
@@ -61,8 +74,12 @@ def descartar_gasto_endpoint(gasto_id: int, tenant_id: str = Depends(get_tenant_
 
 
 @router.put("/{gasto_id}")
-def editar_gasto(gasto_id: int, data: NuevoGasto, tenant_id: str = Depends(get_tenant_id)):
-    """Actualiza monto y categoría de un gasto existente."""
+def editar_gasto(gasto_id: int, data: ActualizarGasto, tenant_id: str = Depends(get_tenant_id)):
+    """
+    Actualiza monto, categoría y descripción de un gasto existente.
+    Ahora usa el modelo ActualizarGasto dedicado en lugar de reutilizar
+    NuevoGasto, que exigía campos irrelevantes para la edición (fecha, estado).
+    """
     return actualizar_gasto(
         gasto_id=gasto_id,
         monto=data.monto,
