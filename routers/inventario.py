@@ -3,7 +3,7 @@
 # Endpoints de inventario, lotes y productos.
 # ==============================================================================
 
-from fastapi import APIRouter, HTTPException, UploadFile, File, Depends
+from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Depends
 from pydantic import BaseModel
 from typing import Optional
 from dependencies import get_tenant_id
@@ -327,10 +327,9 @@ def _get_producto_id(producto_nombre: str, tenant_id: str) -> int:
 @router.get("/imagenes/{producto}")
 def listar_imagenes_producto(producto: str, tenant_id: str = Depends(get_tenant_id)):
     """
-    Devuelve la galería de imágenes extra de un producto.
-    Disponible para todos los planes (incluso básico puede ver,
-    aunque solo plan plus puede subir). El frontend decide si mostrar
-    el carousel basándose en el plan del tenant.
+    Devuelve la galería completa de imágenes de un producto.
+    Para Plan Plus: hasta 5 imágenes unificadas (la orden 1 es la principal).
+    Para Plan básico: devuelve una lista vacía (el frontend usa ImagePicker simple).
     """
     producto_id = _get_producto_id(producto, tenant_id)
     resultado = query(
@@ -346,38 +345,28 @@ def listar_imagenes_producto(producto: str, tenant_id: str = Depends(get_tenant_
 async def subir_imagen_extra(
     producto: str,
     foto: UploadFile = File(...),
+    orden_target: Optional[int] = Form(None),
     tenant_id: str = Depends(get_tenant_id)
 ):
     """
-    Sube una imagen adicional a la galería de un producto (Plan Plus).
-    Máximo 5 imágenes por producto. Si ya hay 5, devuelve error 403.
+    Sube una imagen a la galería de un producto (Plan Plus).
+    - Si orden_target es None: añade una imagen nueva (siguiente slot disponible).
+    - Si orden_target es 1-5: reemplaza la imagen en esa posición (borra la anterior de Cloudinary).
+    Máximo 5 imágenes por producto.
+    La orden 1 se sincroniza automáticamente con productos.imagen.
     """
-    # 1. Validar que el tenant tiene plan plus
+    # 1. Validar plan plus
     plan = _get_tenant_plan(tenant_id)
     if plan != "plus":
         raise HTTPException(
             status_code=403,
-            detail="La galería de múltiples imágenes es exclusiva del plan Plus. "
-                   "Actualiza tu plan para subir más fotos por producto."
+            detail="La galería de imágenes es exclusiva del plan Plus."
         )
 
     # 2. Obtener el ID del producto
     producto_id = _get_producto_id(producto, tenant_id)
 
-    # 3. Validar que no se exceda el máximo de 5 imágenes
-    conteo = query(
-        "SELECT COUNT(*) as total FROM producto_imagenes "
-        "WHERE producto_id = %s AND tenant_id = %s",
-        (producto_id, tenant_id)
-    )
-    total_actual = conteo[0]["total"] if conteo else 0
-    if total_actual >= 5:
-        raise HTTPException(
-            status_code=403,
-            detail="Este producto ya tiene 5 imágenes. Elimina una antes de subir otra."
-        )
-
-    # 4. Leer y validar el archivo
+    # 3. Leer y validar el archivo
     contents = await foto.read()
     if not contents or len(contents) == 0:
         raise HTTPException(status_code=400, detail="La imagen recibida está vacía (0 bytes)")
@@ -390,35 +379,85 @@ async def subir_imagen_extra(
             detail=f"La imagen es demasiado grande ({tamano_kb:.0f} KB). Máximo {MAX_TAMANO_KB} KB."
         )
 
-    # 5. Calcular el orden de la nueva imagen (siguiente posición disponible)
-    ordenes = query(
-        "SELECT orden FROM producto_imagenes "
-        "WHERE producto_id = %s AND tenant_id = %s ORDER BY orden",
-        (producto_id, tenant_id)
-    )
-    ordenes_usadas = {r["orden"] for r in ordenes}
-    nueva_orden = 1
-    for i in range(1, 6):
-        if i not in ordenes_usadas:
-            nueva_orden = i
-            break
+    # 4. Determinar el orden y si es reemplazo o inserción nueva
+    if orden_target is not None:
+        # Reemplazo: validar que el orden esté en rango
+        if orden_target < 1 or orden_target > 5:
+            raise HTTPException(status_code=400, detail="orden_target debe estar entre 1 y 5")
+        nueva_orden = orden_target
 
-    # 6. Subir a Cloudinary en la carpeta "productos/galeria"
+        # Borrar la imagen existente en ese orden de Cloudinary + DB
+        existente = query(
+            "SELECT id, url FROM producto_imagenes "
+            "WHERE producto_id = %s AND tenant_id = %s AND orden = %s",
+            (producto_id, tenant_id, nueva_orden)
+        )
+        if existente:
+            old_url = existente[0]["url"]
+            if "res.cloudinary.com" in old_url:
+                try:
+                    partes = old_url.split("/upload/")
+                    if len(partes) > 1:
+                        ruta = partes[1]
+                        if re.match(r'^v\d+/', ruta):
+                            ruta = ruta.split("/", 1)[1]
+                        public_id = ruta.rsplit(".", 1)[0]
+                        cloudinary.uploader.destroy(public_id)
+                except Exception as e:
+                    print(f"Error borrando imagen anterior de Cloudinary: {e}")
+            execute(
+                "DELETE FROM producto_imagenes WHERE id = %s",
+                (existente[0]["id"],)
+            )
+    else:
+        # Inserción nueva: calcular siguiente slot disponible
+        conteo = query(
+            "SELECT COUNT(*) as total FROM producto_imagenes "
+            "WHERE producto_id = %s AND tenant_id = %s",
+            (producto_id, tenant_id)
+        )
+        total_actual = conteo[0]["total"] if conteo else 0
+        if total_actual >= 5:
+            raise HTTPException(
+                status_code=403,
+                detail="Este producto ya tiene 5 imágenes. Elimina una antes de subir otra."
+            )
+
+        ordenes = query(
+            "SELECT orden FROM producto_imagenes "
+            "WHERE producto_id = %s AND tenant_id = %s ORDER BY orden",
+            (producto_id, tenant_id)
+        )
+        ordenes_usadas = {r["orden"] for r in ordenes}
+        nueva_orden = 1
+        for i in range(1, 6):
+            if i not in ordenes_usadas:
+                nueva_orden = i
+                break
+
+    # 5. Subir a Cloudinary en la carpeta "productos/galeria"
     resultado = cloudinary.uploader.upload(
         contents,
         folder="productos/galeria",
-        public_id=f"{producto}_{uuid.uuid4().hex[:8]}_extra{nueva_orden}",
+        public_id=f"{producto}_{uuid.uuid4().hex[:8]}_img{nueva_orden}",
         quality="auto:best",
         fetch_format="auto"
     )
     url = resultado.get("secure_url")
 
-    # 7. Insertar en la base de datos
+    # 6. Insertar en la base de datos
     execute(
         "INSERT INTO producto_imagenes (producto_id, tenant_id, url, orden) "
         "VALUES (%s, %s, %s, %s)",
         (producto_id, tenant_id, url, nueva_orden)
     )
+
+    # 7. Sincronizar productos.imagen si la orden es 1 (la principal)
+    if nueva_orden == 1:
+        execute(
+            "UPDATE productos SET Imagen = %s WHERE id = %s AND tenant_id = %s",
+            (url, producto_id, tenant_id)
+        )
 
     return {"ok": True, "url": url, "orden": nueva_orden}
 
@@ -427,7 +466,10 @@ async def subir_imagen_extra(
 def eliminar_imagen_extra(imagen_id: int, tenant_id: str = Depends(get_tenant_id)):
     """
     Elimina una imagen de la galería de un producto (Plan Plus).
-    También la borra de Cloudinary para no acumular fotos huérfanas.
+    - Borra la imagen de Cloudinary.
+    - Si era la orden 1 (principal), promueve la siguiente imagen a principal
+      y sincroniza productos.imagen.
+    - Reordena las imágenes restantes para que no quien huecos.
     """
     # 1. Validar plan plus
     plan = _get_tenant_plan(tenant_id)
@@ -437,17 +479,21 @@ def eliminar_imagen_extra(imagen_id: int, tenant_id: str = Depends(get_tenant_id
             detail="La gestión de galería es exclusiva del plan Plus."
         )
 
-    # 2. Obtener la URL de Cloudinary antes de borrar el registro
+    # 2. Obtener la imagen antes de borrar
     resultado = query(
-        "SELECT url FROM producto_imagenes WHERE id = %s AND tenant_id = %s",
+        "SELECT id, producto_id, url, orden FROM producto_imagenes "
+        "WHERE id = %s AND tenant_id = %s",
         (imagen_id, tenant_id)
     )
     if not resultado:
         raise HTTPException(status_code=404, detail="Imagen no encontrada")
 
-    url = resultado[0]["url"]
+    img = resultado[0]
+    url = img["url"]
+    orden_eliminada = img["orden"]
+    producto_id = img["producto_id"]
 
-    # 3. Borrar de Cloudinary si es URL de Cloudinary
+    # 3. Borrar de Cloudinary
     if "res.cloudinary.com" in url:
         try:
             partes = url.split("/upload/")
@@ -465,5 +511,47 @@ def eliminar_imagen_extra(imagen_id: int, tenant_id: str = Depends(get_tenant_id
         "DELETE FROM producto_imagenes WHERE id = %s AND tenant_id = %s",
         (imagen_id, tenant_id)
     )
+
+    # 5. Si era la principal (orden 1), promover la siguiente y reordenar
+    if orden_eliminada == 1:
+        # Buscar la siguiente imagen disponible (menor orden)
+        siguiente = query(
+            "SELECT id, url FROM producto_imagenes "
+            "WHERE producto_id = %s AND tenant_id = %s "
+            "ORDER BY orden ASC LIMIT 1",
+            (producto_id, tenant_id)
+        )
+        if siguiente:
+            # La siguiente asciende a orden 1
+            execute(
+                "UPDATE producto_imagenes SET orden = 1 WHERE id = %s",
+                (siguiente[0]["id"],)
+            )
+            # Sincronizar productos.imagen con la nueva principal
+            execute(
+                "UPDATE productos SET Imagen = %s WHERE id = %s AND tenant_id = %s",
+                (siguiente[0]["url"], producto_id, tenant_id)
+            )
+        else:
+            # No quedan imágenes: resetear productos.imagen
+            execute(
+                "UPDATE productos SET Imagen = 'No hay foto' WHERE id = %s AND tenant_id = %s",
+                (producto_id, tenant_id)
+            )
+    else:
+        # No era la principal, pero reordenamos para compactar slots
+        # Mover las imágenes con orden > orden_eliminada un paso atrás
+        posteriores = query(
+            "SELECT id, orden FROM producto_imagenes "
+            "WHERE producto_id = %s AND tenant_id = %s AND orden > %s "
+            "ORDER BY orden ASC",
+            (producto_id, tenant_id, orden_eliminada)
+        )
+        for p in posteriores:
+            nuevo_orden = p["orden"] - 1
+            execute(
+                "UPDATE producto_imagenes SET orden = %s WHERE id = %s",
+                (nuevo_orden, p["id"])
+            )
 
     return {"ok": True, "id": imagen_id}
