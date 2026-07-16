@@ -36,7 +36,7 @@ def insertar_venta(venta: dict, tenant_id: str) -> None:
         tenant_id
     ))
 
-def actualizar_venta(venta_id: int, fecha: str, cantidad: int, precio_real: float, total_venta: float, ganancia_bruta: float, tenant_id: str) -> dict:
+def actualizar_venta(venta_id: int, fecha: str, cantidad: int, precio_real: float, costo_unitario: float, total_venta: float, ganancia_bruta: float, tenant_id: str) -> dict:
     """Modifica una venta asegurando pertenencia del tenant y re-calculando stocks."""
     from database.conexion import get_conn, release_conn
     conn = get_conn()
@@ -84,9 +84,9 @@ def actualizar_venta(venta_id: int, fecha: str, cantidad: int, precio_real: floa
             # 3. Guardar cambios en la venta
             cur.execute("""
                 UPDATE ventas
-                SET Fecha=%s, Cantidad=%s, Precio_Real=%s, Total_Venta=%s, Ganancia_Bruta=%s
+                SET Fecha=%s, Cantidad=%s, Precio_Real=%s, Costo_Unitario=%s, Total_Venta=%s, Ganancia_Bruta=%s
                 WHERE id=%s AND tenant_id=%s
-            """, (fecha, cantidad, precio_real, total_venta, ganancia_bruta, venta_id, tenant_id))
+            """, (fecha, cantidad, precio_real, costo_unitario, total_venta, ganancia_bruta, venta_id, tenant_id))
             conn.commit()
             return {"ok": True, "id": venta_id}
     except Exception as e:
