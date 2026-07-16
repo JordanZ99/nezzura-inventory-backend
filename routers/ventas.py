@@ -26,6 +26,7 @@ class ActualizarVenta(BaseModel):
     fecha         : Optional[str]   = None
     cantidad      : Optional[int]   = None
     precio_real   : Optional[float] = None
+    costo_unitario: Optional[float] = None
     total_venta   : Optional[float] = None
     ganancia_bruta: Optional[float] = None
 
@@ -70,7 +71,7 @@ def corregir_venta(venta_id: int, data: ActualizarVenta, tenant_id: str = Depend
     #    Filtramos por tenant_id para garantizar que el usuario solo pueda
     #    modificar ventas de su propio tenant (aislamiento multitenant).
     fila = query(
-        "SELECT fecha, cantidad, precio_real, total_venta, ganancia_bruta "
+        "SELECT fecha, cantidad, precio_real, costo_unitario, total_venta, ganancia_bruta "
         "FROM ventas WHERE id = %s AND tenant_id = %s",
         (venta_id, tenant_id)
     )
@@ -83,13 +84,14 @@ def corregir_venta(venta_id: int, data: ActualizarVenta, tenant_id: str = Depend
     fecha          = data.fecha          if data.fecha          is not None else v["fecha"]
     cantidad       = data.cantidad       if data.cantidad       is not None else int(v["cantidad"])
     precio_real    = data.precio_real    if data.precio_real    is not None else float(v["precio_real"])
+    costo_unitario = data.costo_unitario if data.costo_unitario is not None else float(v["costo_unitario"])
     total_venta    = data.total_venta    if data.total_venta    is not None else float(v["total_venta"])
     ganancia_bruta = data.ganancia_bruta if data.ganancia_bruta is not None else float(v["ganancia_bruta"])
 
     # 3. Delegar a la lógica de negocio con valores completos.
     #    actualizar_venta recalcula el stock según la diferencia de cantidad,
     #    por lo que siempre necesita los valores finales, no parciales.
-    resultado = actualizar_venta(venta_id, fecha, cantidad, precio_real, total_venta, ganancia_bruta, tenant_id)
+    resultado = actualizar_venta(venta_id, fecha, cantidad, precio_real, costo_unitario, total_venta, ganancia_bruta, tenant_id)
     if not resultado.get("ok"):
         raise HTTPException(status_code=400, detail=resultado.get("mensaje"))
     return resultado
