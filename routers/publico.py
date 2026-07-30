@@ -14,6 +14,7 @@
 
 from fastapi import APIRouter, HTTPException, Response
 from database.conexion import query
+from database.lotes import _obtener_categorias_subquery
 
 router = APIRouter(prefix="/public", tags=["Catálogo Público"])
 
@@ -59,13 +60,24 @@ def obtener_catalogo_publico(slug: str, response: Response):
     # 2. Productos activos: solo campos públicos
     #    Se incluye stock_total para que el cliente sepa si hay disponibilidad,
     #    pero NO se incluye costo, ganancia_bruta, codigo_interno ni tenant_id.
-    productos = query(
-        "SELECT producto, descripcion, imagen, precio_venta, "
-        "       stock_total, categoria "
-        "FROM productos WHERE tenant_id = %s AND estado = 'Activo' "
-        "ORDER BY producto ASC",
-        (tenant_id,)
-    )
+    #
+    #    NOTA: precio_venta y stock_total viven en la tabla `lotes`, no en `productos`.
+    #    Esta query sigue el mismo patrón que get_inventario_consolidado() en lotes.py.
+    cat_subquery = _obtener_categorias_subquery("p")
+    productos = query(f"""
+        SELECT
+            l.Producto                    AS producto,
+            p.Descripcion                 AS descripcion,
+            p.Imagen                      AS imagen,
+            MAX(l.Precio_Venta)           AS precio_venta,
+            SUM(l.Stock_Lote)             AS stock_total,
+            {cat_subquery}
+        FROM lotes l
+        LEFT JOIN productos p ON l.Producto = p.Producto AND l.tenant_id = p.tenant_id
+        WHERE l.Estado = 'Activo' AND p.Estado = 'Activo' AND l.tenant_id = %s
+        GROUP BY l.Producto, p.Descripcion, p.Imagen, p.id
+        ORDER BY l.Producto ASC
+    """, (tenant_id,))
 
     return {
         "config": {
