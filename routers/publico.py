@@ -41,12 +41,16 @@ def obtener_catalogo_publico(slug: str, response: Response):
     # Cache-Control: prohibir caché para garantizar datos frescos
     response.headers["Cache-Control"] = "no-store"
 
-    # 1. Una sola query: obtiene config Y tenant_id al mismo tiempo.
+    # 1. Una sola query: obtiene config + tenant_id + logo al mismo tiempo.
     #    Solo retorna resultado si activo = true (catálogo habilitado).
+    #    LEFT JOIN con tenants para obtener el logo personalizado del negocio.
     config_rows = query(
-        "SELECT tenant_id, tema, template, titulo, subtitulo, "
-        "       mostrar_precios, mostrar_stock, mostrar_categorias "
-        "FROM catalogo_config WHERE slug = %s AND activo = true",
+        "SELECT cc.tenant_id, cc.tema, cc.template, cc.titulo, cc.subtitulo, "
+        "       cc.mostrar_precios, cc.mostrar_stock, cc.mostrar_categorias, "
+        "       t.logo "
+        "FROM catalogo_config cc "
+        "LEFT JOIN tenants t ON cc.tenant_id = t.id "
+        "WHERE cc.slug = %s AND cc.activo = true",
         (slug,)
     )
     if not config_rows:
@@ -88,6 +92,7 @@ def obtener_catalogo_publico(slug: str, response: Response):
             "mostrar_precios": cfg["mostrar_precios"],
             "mostrar_stock": cfg["mostrar_stock"],
             "mostrar_categorias": cfg["mostrar_categorias"],
+            "logo": cfg.get("logo") or "",
         },
         "productos": productos
     }
