@@ -67,7 +67,8 @@ def obtener_catalogo_publico(slug: str, response: Response):
     #
     #    NOTA: precio_venta y stock_total viven en la tabla `lotes`, no en `productos`.
     #    Esta query sigue el mismo patrón que get_inventario_consolidado() en lotes.py.
-    cat_subquery = _obtener_categorias_subquery("p")
+    # Solo categorías marcadas como visibles en el catálogo
+    cat_subquery = _obtener_categorias_subquery("p", visible_only=True)
     productos = query(f"""
         SELECT
             l.Producto                    AS producto,
