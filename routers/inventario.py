@@ -32,7 +32,7 @@ from database.lotes import (
     get_lotes, get_productos_meta, get_inventario_consolidado,
     get_detalle_lotes, agregar_lote, actualizar_producto, actualizar_lote,
     eliminar_categoria_de_productos, listar_categorias, renombrar_categoria,
-    crear_categoria, eliminar_lote
+    crear_categoria, eliminar_lote, toggle_visibilidad_categoria
 )
 from database.conexion import query, execute
 from pydantic import Field
@@ -282,6 +282,15 @@ def editar_categoria(categoria: str, data: RenombrarCategoria, tenant_id: str = 
 def borrar_categoria(categoria: str, tenant_id: str = Depends(get_tenant_id)):
     """Elimina una categoría de todos los productos del tenant."""
     return eliminar_categoria_de_productos(categoria, tenant_id)
+
+
+@router.patch("/categoria/{categoria}/visibilidad")
+def alternar_visibilidad_catalogo(categoria: str, tenant_id: str = Depends(get_tenant_id)):
+    """
+    Alterna la visibilidad de una categoría en el catálogo público.
+    Si estaba visible, se oculta; si estaba oculta, se muestra.
+    """
+    return toggle_visibilidad_categoria(categoria, tenant_id)
 
 
 # =============================================================================

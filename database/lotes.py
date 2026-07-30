@@ -77,7 +77,7 @@ def _sincronizar_categorias(producto_id: int, categorias: list[str], tenant_id: 
         )
 
 
-def _obtener_categorias_subquery(alias: str) -> str:
+def _obtener_categorias_subquery(alias: str, visible_only: bool = False) -> str:
     """
     Genera una subquery SQL correlacionada para obtener las categorías
     de un producto como un array de nombres.
@@ -87,12 +87,14 @@ def _obtener_categorias_subquery(alias: str) -> str:
     
     Args:
         alias: Alias de la tabla productos (e.g. 'p')
+        visible_only: Si True, solo incluye categorías con visible_en_catalogo = true
     """
+    filtro_visible = "AND c.visible_en_catalogo = true" if visible_only else ""
     return f"""COALESCE(
         (SELECT array_agg(c.nombre ORDER BY c.nombre)
          FROM producto_categorias pc
          JOIN categorias c ON pc.categoria_id = c.id
-         WHERE pc.producto_id = {alias}.id),
+         WHERE pc.producto_id = {alias}.id {filtro_visible}),
         ARRAY['General']
     ) AS categoria"""
 
@@ -348,11 +350,12 @@ def listar_categorias(tenant_id: str) -> list[dict]:
             c.id,
             c.nombre,
             c.slug,
+            c.visible_en_catalogo,
             COUNT(pc.producto_id) AS total_productos
         FROM categorias c
         LEFT JOIN producto_categorias pc ON pc.categoria_id = c.id
         WHERE c.tenant_id = %s
-        GROUP BY c.id, c.nombre, c.slug
+        GROUP BY c.id, c.nombre, c.slug, c.visible_en_catalogo
         ORDER BY c.nombre ASC
     """, (tenant_id,))
 
@@ -479,6 +482,35 @@ def actualizar_lote(id_lote: str, costo: float, precio_venta: float, stock: int,
     return {"ok": True, "id_lote": id_lote}
 
 
+def toggle_visibilidad_categoria(categoria: str, tenant_id: str) -> dict:
+    """
+    Alterna la visibilidad de una categoría en el catálogo público.
+    Si estaba visible, la oculta y viceversa.
+    """
+    categoria = categoria.strip()
+
+    # Obtener estado actual
+    actual = query(
+        "SELECT visible_en_catalogo FROM categorias WHERE nombre = %s AND tenant_id = %s",
+        (categoria, tenant_id)
+    )
+    if not actual:
+        return {"ok": False, "mensaje": f"Categoría '{categoria}' no encontrada"}
+
+    nuevo_valor = not actual[0]["visible_en_catalogo"]
+    execute(
+        "UPDATE categorias SET visible_en_catalogo = %s WHERE nombre = %s AND tenant_id = %s",
+        (nuevo_valor, categoria, tenant_id)
+    )
+
+    return {
+        "ok": True,
+        "categoria": categoria,
+        "visible_en_catalogo": nuevo_valor,
+        "mensaje": f"Categoría '{categoria}' {'visible' if nuevo_valor else 'oculta'} en el catálogo"
+    }
+
+
 def eliminar_lote(id_lote: str, tenant_id: str) -> dict:
     """
     Da de baja un lote específico: lo marca como Inactivo y pone su stock en 0.
@@ -534,11 +566,16 @@ def descontar_stock_peps(
     producto: str,
     cantidad_total: int,
     precio_real: float,
-    tenant_id: str
+    tenant_id: str,
+    id_lote: str | None = None
 ) -> list[dict]:
     producto = producto.strip()
     """
     Algoritmo PEPS: descuenta del lote más antiguo primero.
+    
+    Si se proporciona id_lote, descuenta exclusivamente de ese lote específico
+    en lugar de seguir el orden PEPS. Si el lote no tiene suficiente stock,
+    se permite stock negativo (consistente con el comportamiento general).
     
     A diferencia de la versión anterior, ahora PERMITE stock negativo.
     Si no hay suficiente stock físico, se consume todo lo disponible
@@ -549,6 +586,55 @@ def descontar_stock_peps(
     
     Retorna siempre una lista de registros de venta (nunca None).
     """
+    # ── Si se especificó un lote concreto, descontar solo de ese lote ──
+    if id_lote is not None:
+        lotes = query("""
+            SELECT * FROM lotes
+            WHERE ID_Lote=%s AND Producto=%s AND Estado='Activo' AND tenant_id = %s
+        """, (id_lote, producto, tenant_id))
+
+        if not lotes:
+            # Si no existe el lote, crear uno virtual con stock negativo
+            # (comportamiento consistente con el PEPS normal)
+            nuevo_id = str(uuid.uuid4())[:12]
+            fecha = str(datetime.datetime.now(_TZ))
+            execute(
+                "INSERT INTO lotes (ID_Lote, Producto, Costo, Precio_Venta, Stock_Lote, Fecha_Entrada, Estado, tenant_id) "
+                "VALUES (%s, %s, %s, %s, %s, %s, 'Activo', %s)",
+                (nuevo_id, producto, 0, precio_real, -cantidad_total, fecha, tenant_id)
+            )
+            return [{
+                "fecha"          : fecha,
+                "producto"       : producto,
+                "cantidad"       : cantidad_total,
+                "precio_lista"   : precio_real,
+                "precio_real"    : precio_real,
+                "costo_unitario" : 0,
+                "total_venta"    : precio_real * cantidad_total,
+                "ganancia_bruta" : precio_real * cantidad_total,
+                "id_lote"        : nuevo_id
+            }]
+
+        lote = lotes[0]
+        nuevo_stock = int(lote["stock_lote"]) - cantidad_total
+        execute(
+            "UPDATE lotes SET Stock_Lote=%s WHERE ID_Lote=%s AND tenant_id = %s",
+            (nuevo_stock, id_lote, tenant_id)
+        )
+
+        return [{
+            "fecha"          : str(datetime.datetime.now(_TZ)),
+            "producto"       : producto,
+            "cantidad"       : cantidad_total,
+            "precio_lista"   : float(lote["precio_venta"]),
+            "precio_real"    : precio_real,
+            "costo_unitario" : float(lote["costo"]),
+            "total_venta"    : precio_real * cantidad_total,
+            "ganancia_bruta" : (precio_real - float(lote["costo"])) * cantidad_total,
+            "id_lote"        : lote["id_lote"]
+        }]
+
+    # ── PEPS normal (sin lote específico) ──
     # Obtenemos TODOS los lotes activos, incluso con stock 0 o negativo
     # para poder seguir el orden PEPS correctamente
     lotes = query("""
@@ -619,12 +705,12 @@ def descontar_stock_peps(
             })
         else:
             # No existe ningún lote para este producto — creamos uno virtual con stock negativo
-            id_lote   = str(uuid.uuid4())[:12]
-            fecha     = str(datetime.datetime.now(_TZ))
+            nuevo_id_l = str(uuid.uuid4())[:12]
+            fecha      = str(datetime.datetime.now(_TZ))
             
             execute(
                 "INSERT INTO lotes (ID_Lote, Producto, Costo, Precio_Venta, Stock_Lote, Fecha_Entrada, Estado, tenant_id) VALUES (%s, %s, %s, %s, %s, %s, 'Activo', %s)",
-                (id_lote, producto, 0, precio_real, -restante, fecha, tenant_id)
+                (nuevo_id_l, producto, 0, precio_real, -restante, fecha, tenant_id)
             )
             
             ventas_generadas.append({
@@ -636,7 +722,7 @@ def descontar_stock_peps(
                 "costo_unitario" : 0,
                 "total_venta"    : precio_real * restante,
                 "ganancia_bruta" : precio_real * restante,
-                "id_lote"        : id_lote
+                "id_lote"        : nuevo_id_l
             })
 
     return ventas_generadas
