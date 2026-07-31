@@ -47,6 +47,7 @@ def obtener_catalogo_publico(slug: str, response: Response):
     config_rows = query(
         "SELECT cc.tenant_id, cc.tema, cc.template, cc.titulo, cc.subtitulo, "
         "       cc.mostrar_precios, cc.mostrar_stock, cc.mostrar_categorias, "
+        "       cc.banner_url, cc.hero_estilo, cc.anuncio_texto, "
         "       t.logo "
         "FROM catalogo_config cc "
         "LEFT JOIN tenants t ON cc.tenant_id = t.id "
@@ -94,6 +95,9 @@ def obtener_catalogo_publico(slug: str, response: Response):
             "mostrar_precios": cfg["mostrar_precios"],
             "mostrar_stock": cfg["mostrar_stock"],
             "mostrar_categorias": cfg["mostrar_categorias"],
+            "banner_url": cfg.get("banner_url") or "",
+            "hero_estilo": cfg.get("hero_estilo") or "gradiente",
+            "anuncio_texto": cfg.get("anuncio_texto") or "",
             "logo": cfg.get("logo") or "",
         },
         "productos": productos

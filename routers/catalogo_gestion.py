@@ -42,6 +42,10 @@ class ActualizarCatalogo(BaseModel):
     mostrar_precios: Optional[bool] = None
     mostrar_stock: Optional[bool] = None
     mostrar_categorias: Optional[bool] = None
+    # Hero + Anuncios (006_catalogo_hero_anuncios.sql)
+    banner_url: Optional[str] = None      # URL de la imagen de banner/hero (Cloudinary)
+    hero_estilo: Optional[str] = None     # 'gradiente' | 'imagen'
+    anuncio_texto: Optional[str] = None   # texto de la barra de anuncios (vacío = oculta)
 
 
 @router.get("")
@@ -52,7 +56,8 @@ def obtener_config_catalogo(tenant_id: str = Depends(get_tenant_id)):
     """
     resultado = query(
         "SELECT id, slug, activo, tema, template, titulo, subtitulo, "
-        "       mostrar_precios, mostrar_stock, mostrar_categorias, created_at "
+        "       mostrar_precios, mostrar_stock, mostrar_categorias, "
+        "       banner_url, hero_estilo, anuncio_texto, created_at "
         "FROM catalogo_config WHERE tenant_id = %s",
         (tenant_id,)
     )
@@ -64,7 +69,8 @@ def obtener_config_catalogo(tenant_id: str = Depends(get_tenant_id)):
         )
         resultado = query(
             "SELECT id, slug, activo, tema, template, titulo, subtitulo, "
-            "       mostrar_precios, mostrar_stock, mostrar_categorias, created_at "
+            "       mostrar_precios, mostrar_stock, mostrar_categorias, "
+            "       banner_url, hero_estilo, anuncio_texto, created_at "
             "FROM catalogo_config WHERE tenant_id = %s",
             (tenant_id,)
         )
@@ -118,6 +124,15 @@ def actualizar_config_catalogo(
     if data.mostrar_categorias is not None:
         campos.append("mostrar_categorias = %s")
         valores.append(data.mostrar_categorias)
+    if data.banner_url is not None:
+        campos.append("banner_url = %s")
+        valores.append(data.banner_url)
+    if data.hero_estilo is not None:
+        campos.append("hero_estilo = %s")
+        valores.append(data.hero_estilo)
+    if data.anuncio_texto is not None:
+        campos.append("anuncio_texto = %s")
+        valores.append(data.anuncio_texto)
 
     if not campos:
         return {"ok": True, "mensaje": "Nada que actualizar"}

@@ -181,6 +181,15 @@ def inicializar_db():
             except Exception:
                 pass
 
+            # Migración: hero + anuncios del catálogo público
+            # (mismas columnas que 006_catalogo_hero_anuncios.sql — idempotente)
+            try:
+                cur.execute("ALTER TABLE catalogo_config ADD COLUMN IF NOT EXISTS banner_url text DEFAULT ''")
+                cur.execute("ALTER TABLE catalogo_config ADD COLUMN IF NOT EXISTS hero_estilo text DEFAULT 'gradiente'")
+                cur.execute("ALTER TABLE catalogo_config ADD COLUMN IF NOT EXISTS anuncio_texto text DEFAULT ''")
+            except Exception:
+                pass
+
         conn.commit()
     finally:
         release_conn(conn)
