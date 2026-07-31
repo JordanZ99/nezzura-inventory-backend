@@ -14,6 +14,7 @@ class ItemCarrito(BaseModel):
     producto   : str
     cantidad   : int
     precio_real: float
+    id_lote    : Optional[str] = None
 
 class Carrito(BaseModel):
     items: list[ItemCarrito]
@@ -49,7 +50,7 @@ def cobrar_carrito(carrito: Carrito, tenant_id: str = Depends(get_tenant_id)):
     for item in carrito.items:
         # descontar_stock_peps ahora siempre devuelve una lista (nunca None)
         # porque permite stock negativo
-        resultado = descontar_stock_peps(item.producto, item.cantidad, item.precio_real, tenant_id)
+        resultado = descontar_stock_peps(item.producto, item.cantidad, item.precio_real, tenant_id, id_lote=item.id_lote)
         ventas_a_guardar.extend(resultado)
 
     for venta in ventas_a_guardar:
