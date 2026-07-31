@@ -61,16 +61,17 @@ class Restock(BaseModel):
     stock       : int
 
 class ActualizarProducto(BaseModel):
-    descripcion    : str
-    imagen         : str
-    estado         : str
-    categoria      : list[str]
-    costo          : Optional[float] = None
-    precio_venta   : Optional[float] = None
-    producto       : Optional[str] = None
-    codigo_interno : Optional[str] = None
-    codigo_barras  : Optional[str] = None
-    ubicacion      : Optional[str] = None
+    descripcion         : str
+    imagen              : str
+    estado              : str
+    categoria           : list[str]
+    costo               : Optional[float] = None
+    precio_venta        : Optional[float] = None
+    producto            : Optional[str] = None
+    codigo_interno      : Optional[str] = None
+    codigo_barras       : Optional[str] = None
+    ubicacion           : Optional[str] = None
+    visible_en_catalogo : Optional[bool] = None
 
 class ActualizarLote(BaseModel):
     costo       : float
@@ -241,7 +242,8 @@ def editar_producto(producto: str, data: ActualizarProducto, tenant_id: str = De
         nuevo_producto=data.producto,
         codigo_interno=data.codigo_interno,
         codigo_barras=data.codigo_barras,
-        ubicacion=data.ubicacion
+        ubicacion=data.ubicacion,
+        visible_en_catalogo=data.visible_en_catalogo
     )
 
 

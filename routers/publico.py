@@ -80,6 +80,7 @@ def obtener_catalogo_publico(slug: str, response: Response):
         FROM lotes l
         LEFT JOIN productos p ON l.Producto = p.Producto AND l.tenant_id = p.tenant_id
         WHERE l.Estado = 'Activo' AND p.Estado = 'Activo' AND l.tenant_id = %s
+        AND p.visible_en_catalogo = true
         GROUP BY l.Producto, p.Descripcion, p.Imagen, p.id
         ORDER BY l.Producto ASC
     """, (tenant_id,))
