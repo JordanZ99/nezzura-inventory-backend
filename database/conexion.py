@@ -8,7 +8,7 @@ import os
 import psycopg2
 from psycopg2 import pool
 from psycopg2.extras import RealDictCursor
-from psycopg2.errors import UndefinedTable
+from psycopg2.errors import UndefinedTable, UndefinedColumn
 from dotenv import load_dotenv
 from pathlib import Path
 
@@ -40,7 +40,9 @@ def query(sql: str, params: tuple = None) -> list[dict]:
             result = [dict(row) for row in cur.fetchall()]
         conn.commit()
         return result
-    except UndefinedTable:
+    except (UndefinedTable, UndefinedColumn):
+        # Si falta una tabla o columna (ej: migración nueva aún no aplicada),
+        # re-ejecutamos inicializar_db() para crear/alterar y reintentamos.
         conn.rollback()
         inicializar_db()
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -62,7 +64,8 @@ def execute(sql: str, params: tuple = None) -> None:
         with conn.cursor() as cur:
             cur.execute(sql, params or ())
         conn.commit()
-    except UndefinedTable:
+    except (UndefinedTable, UndefinedColumn):
+        # Igual que en query(): si falta tabla/columna, migrar automáticamente y reintentar.
         conn.rollback()
         inicializar_db()
         with conn.cursor() as cur:
@@ -170,7 +173,14 @@ def inicializar_db():
                     cur.execute(f"ALTER TABLE {tbl} ADD COLUMN IF NOT EXISTS tenant_id UUID")
                 except Exception:
                     pass
-                
+
+            # Migración: visibilidad de producto en catálogo público
+            # (misma columna que 005_producto_visible_catalogo.sql — idempotente)
+            try:
+                cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS visible_en_catalogo boolean DEFAULT true")
+            except Exception:
+                pass
+
         conn.commit()
     finally:
         release_conn(conn)
