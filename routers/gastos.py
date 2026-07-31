@@ -3,12 +3,17 @@
 # Endpoints de gastos del negocio.
 # ==============================================================================
 
-from database.gastos import get_gastos, insertar_gasto, eliminar_gasto, confirmar_gasto, descartar_gasto, actualizar_gasto
+from database.gastos import (
+    get_gastos, insertar_gasto, eliminar_gasto, confirmar_gasto,
+    descartar_gasto, actualizar_gasto,
+    listar_categorias_gasto, crear_categoria_gasto,
+    renombrar_categoria_gasto, eliminar_categoria_gasto
+)
 from database.gastos_programados import verificar_y_generar_gastos_programados
 from dependencies import get_tenant_id
 from fastapi import APIRouter, Depends
 from typing import Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 router = APIRouter(prefix="/gastos", tags=["Gastos"])
 
@@ -93,3 +98,40 @@ def editar_gasto(gasto_id: int, data: ActualizarGasto, tenant_id: str = Depends(
 def borrar_gasto(gasto_id: int, tenant_id: str = Depends(get_tenant_id)):
     """Elimina un gasto por id."""
     return eliminar_gasto(gasto_id, tenant_id)
+
+
+# =============================================================================
+# Endpoints para categorías de gasto editables
+# =============================================================================
+
+
+class CrearCategoriaGasto(BaseModel):
+    nombre: str = Field(..., min_length=1, description="Nombre de la categoría")
+
+
+class RenombrarCategoriaGasto(BaseModel):
+    nuevo_nombre: str = Field(..., min_length=1, description="Nuevo nombre para la categoría")
+
+
+@router.get("/categorias")
+def obtener_categorias_gasto(tenant_id: str = Depends(get_tenant_id)):
+    """Devuelve la lista de categorías de gasto del tenant."""
+    return listar_categorias_gasto(tenant_id)
+
+
+@router.post("/categorias")
+def crear_categoria_gasto_endpoint(data: CrearCategoriaGasto, tenant_id: str = Depends(get_tenant_id)):
+    """Crea una categoría de gasto nueva."""
+    return crear_categoria_gasto(data.nombre, tenant_id)
+
+
+@router.put("/categorias/{categoria}")
+def editar_categoria_gasto_endpoint(categoria: str, data: RenombrarCategoriaGasto, tenant_id: str = Depends(get_tenant_id)):
+    """Renombra una categoría de gasto."""
+    return renombrar_categoria_gasto(categoria, data.nuevo_nombre, tenant_id)
+
+
+@router.delete("/categorias/{categoria}")
+def borrar_categoria_gasto_endpoint(categoria: str, tenant_id: str = Depends(get_tenant_id)):
+    """Elimina una categoría de gasto. Los gastos que la usaban se reasignan a 'Otros'."""
+    return eliminar_categoria_gasto(categoria, tenant_id)

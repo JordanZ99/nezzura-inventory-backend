@@ -154,6 +154,16 @@ def inicializar_db():
             except Exception:
                 pass
 
+            # Tabla de categorías de gasto (editables por el usuario)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS gastos_categorias (
+                    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    tenant_id   UUID NOT NULL,
+                    nombre      TEXT NOT NULL,
+                    UNIQUE(tenant_id, nombre)
+                )
+            """)
+
             # Migración: asegurar tenant_id en tablas que lo necesitan
             for tbl in ['productos', 'lotes', 'ventas', 'gastos']:
                 try:

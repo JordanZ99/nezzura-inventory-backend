@@ -564,3 +564,67 @@ def eliminar_imagen_extra(imagen_id: int, tenant_id: str = Depends(get_tenant_id
             )
 
     return {"ok": True, "id": imagen_id}
+
+
+class ReordenarImagenes(BaseModel):
+    """Modelo para reordenar imágenes de la galería de un producto.
+    Recibe un array de IDs en el nuevo orden deseado (primero = orden 1 = principal)."""
+    ids: list[int] = Field(..., description="Array de IDs de imágenes en el nuevo orden")
+
+
+@router.patch("/imagenes/{producto}/reordenar")
+def reordenar_imagenes(producto: str, data: ReordenarImagenes, tenant_id: str = Depends(get_tenant_id)):
+    """
+    Reordena las imágenes de la galería de un producto (Plan Plus).
+    Recibe un array de IDs en el nuevo orden (posición 0 = orden 1 = principal).
+    El backend asigna orden 1, 2, 3... secuencialmente según el orden del array.
+    Si el ID en orden 1 es diferente al anterior, actualiza productos.imagen
+    automáticamente con la URL de la nueva imagen principal.
+    """
+    # 1. Validar plan plus
+    plan = _get_tenant_plan(tenant_id)
+    if plan != "plus":
+        raise HTTPException(
+            status_code=403,
+            detail="La gestión de galería es exclusiva del plan Plus."
+        )
+
+    if not data.ids:
+        raise HTTPException(status_code=400, detail="El array de IDs no puede estar vacío")
+
+    producto_id = _get_producto_id(producto, tenant_id)
+
+    # 2. Verificar que todos los IDs pertenecen a este producto y tenant
+    existentes = query(
+        "SELECT id, url, orden FROM producto_imagenes "
+        "WHERE producto_id = %s AND tenant_id = %s AND id = ANY(%s)",
+        (producto_id, tenant_id, data.ids)
+    )
+    ids_validos = {r["id"] for r in existentes}
+    ids_enviados = set(data.ids)
+    if ids_enviados - ids_validos:
+        raise HTTPException(
+            status_code=400,
+            detail="Algunos IDs no pertenecen a este producto o no existen."
+        )
+
+    # 3. Actualizar orden secuencialmente según la posición en el array
+    for idx, img_id in enumerate(data.ids):
+        nuevo_orden = idx + 1
+        execute(
+            "UPDATE producto_imagenes SET orden = %s WHERE id = %s AND tenant_id = %s",
+            (nuevo_orden, img_id, tenant_id)
+        )
+
+    # 4. Sincronizar productos.imagen con la nueva orden 1
+    primera = query(
+        "SELECT url FROM producto_imagenes WHERE id = %s AND tenant_id = %s",
+        (data.ids[0], tenant_id)
+    )
+    if primera:
+        execute(
+            "UPDATE productos SET Imagen = %s WHERE id = %s AND tenant_id = %s",
+            (primera[0]["url"], producto_id, tenant_id)
+        )
+
+    return {"ok": True, "mensaje": "Imágenes reordenadas correctamente"}
