@@ -226,6 +226,12 @@ def inicializar_db():
             except Exception:
                 pass
 
+            # Migración: mostrar el logo sobre el banner (013 — idempotente)
+            try:
+                cur.execute("ALTER TABLE catalogo_config ADD COLUMN IF NOT EXISTS banner_mostrar_logo boolean DEFAULT true")
+            except Exception:
+                pass
+
         conn.commit()
     finally:
         release_conn(conn)
