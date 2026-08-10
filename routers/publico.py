@@ -35,7 +35,8 @@ def obtener_catalogo_publico(slug: str, response: Response):
     Respuesta (sin tenant_id, sin costos, sin datos sensibles):
     {
       "config": { "titulo", "subtitulo", "tema", "template", "mostrar_precios", ... },
-      "productos": [{ "producto", "descripcion", "imagen", "precio_venta", "stock_total", "categoria" }]
+      "productos": [{ "producto", "descripcion", "imagen", "imagenes", "precio_venta", "stock_total", "categoria" }]
+        donde "imagenes" es la galería completa (principal + extras de producto_imagenes)
     }
     """
     # Cache-Control: prohibir caché para garantizar datos frescos
@@ -85,6 +86,31 @@ def obtener_catalogo_publico(slug: str, response: Response):
         GROUP BY l.Producto, p.Descripcion, p.Imagen, p.id
         ORDER BY l.Producto ASC
     """, (tenant_id,))
+
+    # 3. Galería completa por producto: foto principal + extras (producto_imagenes).
+    #    producto_imagenes solo existe para tenants Plus; si no hay filas, la
+    #    galería queda solo con la foto principal (o vacía si no tiene foto).
+    extras = query(
+        "SELECT p.Producto AS producto, pi.url AS url "
+        "FROM producto_imagenes pi "
+        "JOIN productos p ON pi.producto_id = p.id "
+        "WHERE p.tenant_id = %s "
+        "ORDER BY p.Producto ASC, pi.orden ASC",
+        (tenant_id,)
+    )
+    extras_por_producto: dict = {}
+    for fila in extras:
+        extras_por_producto.setdefault(fila["producto"], []).append(fila["url"])
+
+    # Armar el campo imagenes (sin duplicados y sin "No hay foto")
+    for p in productos:
+        galeria: list[str] = []
+        if p.get("imagen") and p["imagen"] != "No hay foto":
+            galeria.append(p["imagen"])
+        for url in extras_por_producto.get(p["producto"], []):
+            if url and url not in galeria:
+                galeria.append(url)
+        p["imagenes"] = galeria
 
     return {
         "config": {
