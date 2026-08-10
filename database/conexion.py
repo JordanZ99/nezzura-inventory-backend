@@ -194,6 +194,7 @@ def inicializar_db():
             # (misma columna que 007_catalogo_agrupar_paginar.sql — idempotente)
             try:
                 cur.execute("ALTER TABLE catalogo_config ADD COLUMN IF NOT EXISTS agrupar_por_categoria boolean")
+                cur.execute("ALTER TABLE catalogo_config ADD COLUMN IF NOT EXISTS columnas_movil integer DEFAULT 2")
             except Exception:
                 pass
 

@@ -16,7 +16,7 @@
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, Literal
 from enum import Enum
 from dependencies import get_tenant_id
 from database.conexion import query, execute
@@ -43,6 +43,7 @@ class ActualizarCatalogo(BaseModel):
     mostrar_stock: Optional[bool] = None
     mostrar_categorias: Optional[bool] = None
     agrupar_por_categoria: Optional[bool] = None  # Separar productos por secciones de categoría
+    columnas_movil: Optional[Literal[1, 2]] = None  # 1 o 2 productos por fila en móvil (422 si es inválido)
     # Hero + Anuncios (006_catalogo_hero_anuncios.sql)
     banner_url: Optional[str] = None      # URL de la imagen de banner/hero (Cloudinary)
     hero_estilo: Optional[str] = None     # 'gradiente' | 'imagen'
@@ -57,7 +58,7 @@ def obtener_config_catalogo(tenant_id: str = Depends(get_tenant_id)):
     """
     resultado = query(
         "SELECT id, slug, activo, tema, template, titulo, subtitulo, "
-        "       mostrar_precios, mostrar_stock, mostrar_categorias, agrupar_por_categoria, "
+        "       mostrar_precios, mostrar_stock, mostrar_categorias, agrupar_por_categoria, columnas_movil, "
         "       banner_url, hero_estilo, anuncio_texto, created_at "
         "FROM catalogo_config WHERE tenant_id = %s",
         (tenant_id,)
@@ -70,7 +71,7 @@ def obtener_config_catalogo(tenant_id: str = Depends(get_tenant_id)):
         )
         resultado = query(
             "SELECT id, slug, activo, tema, template, titulo, subtitulo, "
-            "       mostrar_precios, mostrar_stock, mostrar_categorias, agrupar_por_categoria, "
+            "       mostrar_precios, mostrar_stock, mostrar_categorias, agrupar_por_categoria, columnas_movil, "
             "       banner_url, hero_estilo, anuncio_texto, created_at "
             "FROM catalogo_config WHERE tenant_id = %s",
             (tenant_id,)
@@ -128,6 +129,9 @@ def actualizar_config_catalogo(
     if data.agrupar_por_categoria is not None:
         campos.append("agrupar_por_categoria = %s")
         valores.append(data.agrupar_por_categoria)
+    if data.columnas_movil is not None:
+        campos.append("columnas_movil = %s")
+        valores.append(data.columnas_movil)
     if data.banner_url is not None:
         campos.append("banner_url = %s")
         valores.append(data.banner_url)
