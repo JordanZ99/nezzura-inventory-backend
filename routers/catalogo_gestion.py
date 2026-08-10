@@ -52,6 +52,7 @@ class ActualizarCatalogo(BaseModel):
     hero_estilo: Optional[str] = None     # 'gradiente' | 'imagen'
     banner_texto_color: Optional[str] = None  # Color del título/subtítulo sobre el banner en modo imagen (hex)
     banner_mostrar_texto: Optional[bool] = None  # Mostrar título/subtítulo sobre el banner en modo imagen
+    banner_mostrar_logo: Optional[bool] = None  # Mostrar el logo del negocio sobre el banner (hero)
     anuncio_texto: Optional[str] = None   # texto de la barra de anuncios (vacío = oculta)
 
 
@@ -64,7 +65,7 @@ def obtener_config_catalogo(tenant_id: str = Depends(get_tenant_id)):
     resultado = query(
         "SELECT id, slug, activo, tema, template, titulo, subtitulo, "
         "       mostrar_precios, mostrar_stock, mostrar_categorias, agrupar_por_categoria, columnas_movil, permitir_descarga, ocultar_agotados, "
-        "       banner_url, banner_url_movil, hero_estilo, banner_texto_color, banner_mostrar_texto, anuncio_texto, created_at "
+        "       banner_url, banner_url_movil, hero_estilo, banner_texto_color, banner_mostrar_texto, banner_mostrar_logo, anuncio_texto, created_at "
         "FROM catalogo_config WHERE tenant_id = %s",
         (tenant_id,)
     )
@@ -77,7 +78,7 @@ def obtener_config_catalogo(tenant_id: str = Depends(get_tenant_id)):
         resultado = query(
             "SELECT id, slug, activo, tema, template, titulo, subtitulo, "
             "       mostrar_precios, mostrar_stock, mostrar_categorias, agrupar_por_categoria, columnas_movil, ocultar_agotados, "
-            "       banner_url, banner_url_movil, hero_estilo, banner_texto_color, banner_mostrar_texto, anuncio_texto, created_at "
+            "       banner_url, banner_url_movil, hero_estilo, banner_texto_color, banner_mostrar_texto, banner_mostrar_logo, anuncio_texto, created_at "
             "FROM catalogo_config WHERE tenant_id = %s",
             (tenant_id,)
         )
@@ -158,6 +159,9 @@ def actualizar_config_catalogo(
     if data.banner_mostrar_texto is not None:
         campos.append("banner_mostrar_texto = %s")
         valores.append(data.banner_mostrar_texto)
+    if data.banner_mostrar_logo is not None:
+        campos.append("banner_mostrar_logo = %s")
+        valores.append(data.banner_mostrar_logo)
     if data.anuncio_texto is not None:
         campos.append("anuncio_texto = %s")
         valores.append(data.anuncio_texto)
