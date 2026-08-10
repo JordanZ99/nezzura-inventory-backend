@@ -213,6 +213,13 @@ def inicializar_db():
             except Exception:
                 pass
 
+            # Migración: texto del banner en modo imagen (011 — idempotente)
+            try:
+                cur.execute("ALTER TABLE catalogo_config ADD COLUMN IF NOT EXISTS banner_texto_color text DEFAULT '#ffffff'")
+                cur.execute("ALTER TABLE catalogo_config ADD COLUMN IF NOT EXISTS banner_mostrar_texto boolean DEFAULT true")
+            except Exception:
+                pass
+
         conn.commit()
     finally:
         release_conn(conn)
