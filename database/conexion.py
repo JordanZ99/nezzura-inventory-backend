@@ -198,6 +198,12 @@ def inicializar_db():
             except Exception:
                 pass
 
+            # Migración: permitir descargar fotos del catálogo (009 — idempotente)
+            try:
+                cur.execute("ALTER TABLE catalogo_config ADD COLUMN IF NOT EXISTS permitir_descarga boolean DEFAULT false")
+            except Exception:
+                pass
+
         conn.commit()
     finally:
         release_conn(conn)
