@@ -47,7 +47,7 @@ def obtener_catalogo_publico(slug: str, response: Response):
     #    LEFT JOIN con tenants para obtener el logo personalizado del negocio.
     config_rows = query(
         "SELECT cc.tenant_id, cc.tema, cc.template, cc.titulo, cc.subtitulo, "
-        "       cc.mostrar_precios, cc.mostrar_stock, cc.mostrar_categorias, cc.agrupar_por_categoria, cc.columnas_movil, cc.permitir_descarga, "
+        "       cc.mostrar_precios, cc.mostrar_stock, cc.mostrar_categorias, cc.agrupar_por_categoria, cc.columnas_movil, cc.permitir_descarga, cc.ocultar_agotados, "
         "       cc.banner_url, cc.hero_estilo, cc.anuncio_texto, "
         "       t.logo "
         "FROM catalogo_config cc "
@@ -112,6 +112,11 @@ def obtener_catalogo_publico(slug: str, response: Response):
                 galeria.append(url)
         p["imagenes"] = galeria
 
+    # Si el tenant oculta los productos agotados, excluirlos de la respuesta
+    # (el filtro aquí evita descargar datos que el cliente no debe ver).
+    if bool(cfg.get("ocultar_agotados")):
+        productos = [p for p in productos if (p.get("stock_total") or 0) > 0]
+
     return {
         "config": {
             "tema": cfg["tema"],
@@ -119,11 +124,13 @@ def obtener_catalogo_publico(slug: str, response: Response):
             "titulo": cfg["titulo"],
             "subtitulo": cfg.get("subtitulo", ""),
             "mostrar_precios": cfg["mostrar_precios"],
-            "mostrar_stock": cfg["mostrar_stock"],
+            # El stock se muestra por defecto: null/true → true
+            "mostrar_stock": cfg["mostrar_stock"] is not False,
             "mostrar_categorias": cfg["mostrar_categorias"],
             "agrupar_por_categoria": cfg.get("agrupar_por_categoria"),
             "columnas_movil": cfg.get("columnas_movil") or 2,
             "permitir_descarga": bool(cfg.get("permitir_descarga")),
+            "ocultar_agotados": bool(cfg.get("ocultar_agotados")),
             "banner_url": cfg.get("banner_url") or "",
             "hero_estilo": cfg.get("hero_estilo") or "gradiente",
             "anuncio_texto": cfg.get("anuncio_texto") or "",
