@@ -48,6 +48,7 @@ class ActualizarCatalogo(BaseModel):
     ocultar_agotados: Optional[bool] = None  # Ocultar los productos sin stock del catálogo público
     # Hero + Anuncios (006_catalogo_hero_anuncios.sql)
     banner_url: Optional[str] = None      # URL de la imagen de banner/hero (Cloudinary)
+    banner_url_movil: Optional[str] = None  # URL del banner específico para móviles (Cloudinary)
     hero_estilo: Optional[str] = None     # 'gradiente' | 'imagen'
     banner_texto_color: Optional[str] = None  # Color del título/subtítulo sobre el banner en modo imagen (hex)
     banner_mostrar_texto: Optional[bool] = None  # Mostrar título/subtítulo sobre el banner en modo imagen
@@ -63,7 +64,7 @@ def obtener_config_catalogo(tenant_id: str = Depends(get_tenant_id)):
     resultado = query(
         "SELECT id, slug, activo, tema, template, titulo, subtitulo, "
         "       mostrar_precios, mostrar_stock, mostrar_categorias, agrupar_por_categoria, columnas_movil, permitir_descarga, ocultar_agotados, "
-        "       banner_url, hero_estilo, banner_texto_color, banner_mostrar_texto, anuncio_texto, created_at "
+        "       banner_url, banner_url_movil, hero_estilo, banner_texto_color, banner_mostrar_texto, anuncio_texto, created_at "
         "FROM catalogo_config WHERE tenant_id = %s",
         (tenant_id,)
     )
@@ -76,7 +77,7 @@ def obtener_config_catalogo(tenant_id: str = Depends(get_tenant_id)):
         resultado = query(
             "SELECT id, slug, activo, tema, template, titulo, subtitulo, "
             "       mostrar_precios, mostrar_stock, mostrar_categorias, agrupar_por_categoria, columnas_movil, ocultar_agotados, "
-            "       banner_url, hero_estilo, banner_texto_color, banner_mostrar_texto, anuncio_texto, created_at "
+            "       banner_url, banner_url_movil, hero_estilo, banner_texto_color, banner_mostrar_texto, anuncio_texto, created_at "
             "FROM catalogo_config WHERE tenant_id = %s",
             (tenant_id,)
         )
@@ -145,6 +146,9 @@ def actualizar_config_catalogo(
     if data.banner_url is not None:
         campos.append("banner_url = %s")
         valores.append(data.banner_url)
+    if data.banner_url_movil is not None:
+        campos.append("banner_url_movil = %s")
+        valores.append(data.banner_url_movil)
     if data.hero_estilo is not None:
         campos.append("hero_estilo = %s")
         valores.append(data.hero_estilo)
