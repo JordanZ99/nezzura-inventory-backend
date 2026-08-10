@@ -190,6 +190,13 @@ def inicializar_db():
             except Exception:
                 pass
 
+            # Migración: agrupación por categoría configurable en el catálogo público
+            # (misma columna que 007_catalogo_agrupar_paginar.sql — idempotente)
+            try:
+                cur.execute("ALTER TABLE catalogo_config ADD COLUMN IF NOT EXISTS agrupar_por_categoria boolean")
+            except Exception:
+                pass
+
         conn.commit()
     finally:
         release_conn(conn)
