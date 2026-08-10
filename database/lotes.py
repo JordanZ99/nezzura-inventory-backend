@@ -12,6 +12,31 @@ from zoneinfo import ZoneInfo
 # ── Zona horaria del negocio (Cancún, UTC-5) ──
 _TZ = ZoneInfo("America/Cancun")
 from database.conexion import query, execute
+from psycopg2.extras import RealDictCursor
+
+
+def _q(conn, sql: str, params: tuple = ()) -> list[dict]:
+    """
+    Ejecuta un SELECT sobre la conexión `conn` si se provee (para usarse dentro
+    de una transacción atómica) o sobre la conexión del pool global si no.
+    """
+    if conn is None:
+        return query(sql, params)
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(sql, params)
+        return [dict(row) for row in cur.fetchall()]
+
+
+def _e(conn, sql: str, params: tuple = ()) -> None:
+    """
+    Ejecuta un INSERT/UPDATE/DELETE sobre la conexión `conn` si se provee
+    (para usarse dentro de una transacción atómica) o el pool global si no.
+    """
+    if conn is None:
+        execute(sql, params)
+        return
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
 
 # ==============================================================================
 # Funciones auxiliares para el manejo de categorías (Many-to-Many)
@@ -575,7 +600,8 @@ def descontar_stock_peps(
     cantidad_total: int,
     precio_real: float,
     tenant_id: str,
-    id_lote: str | None = None
+    id_lote: str | None = None,
+    conn=None
 ) -> list[dict]:
     producto = producto.strip()
     """
@@ -593,12 +619,17 @@ def descontar_stock_peps(
     cobrar aunque falte inventario, con la advertencia correspondiente.
     
     Retorna siempre una lista de registros de venta (nunca None).
+
+    Si se pasa `conn`, todas las operaciones se ejecutan sobre esa conexión
+    (para poder usarse dentro de una transacción atómica junto con el INSERT
+    de las ventas). Si no se pasa, usa las conexiones del pool global.
     """
     # ── Si se especificó un lote concreto, descontar solo de ese lote ──
     if id_lote is not None:
-        lotes = query("""
+        lotes = _q(conn, """
             SELECT * FROM lotes
             WHERE ID_Lote=%s AND Producto=%s AND Estado='Activo' AND tenant_id = %s
+            FOR UPDATE
         """, (id_lote, producto, tenant_id))
 
         if not lotes:
@@ -606,7 +637,7 @@ def descontar_stock_peps(
             # (comportamiento consistente con el PEPS normal)
             nuevo_id = str(uuid.uuid4())[:12]
             fecha = str(datetime.datetime.now(_TZ))
-            execute(
+            _e(conn,
                 "INSERT INTO lotes (ID_Lote, Producto, Costo, Precio_Venta, Stock_Lote, Fecha_Entrada, Estado, tenant_id) "
                 "VALUES (%s, %s, %s, %s, %s, %s, 'Activo', %s)",
                 (nuevo_id, producto, 0, precio_real, -cantidad_total, fecha, tenant_id)
@@ -625,7 +656,7 @@ def descontar_stock_peps(
 
         lote = lotes[0]
         nuevo_stock = int(lote["stock_lote"]) - cantidad_total
-        execute(
+        _e(conn,
             "UPDATE lotes SET Stock_Lote=%s WHERE ID_Lote=%s AND tenant_id = %s",
             (nuevo_stock, id_lote, tenant_id)
         )
@@ -645,10 +676,11 @@ def descontar_stock_peps(
     # ── PEPS normal (sin lote específico) ──
     # Obtenemos TODOS los lotes activos, incluso con stock 0 o negativo
     # para poder seguir el orden PEPS correctamente
-    lotes = query("""
+    lotes = _q(conn, """
         SELECT * FROM lotes
         WHERE Producto=%s AND Estado='Activo' AND tenant_id = %s
         ORDER BY Fecha_Entrada ASC
+        FOR UPDATE
     """, (producto, tenant_id))
 
     ventas_generadas = []
@@ -666,7 +698,7 @@ def descontar_stock_peps(
         consumir    = min(restante, int(lote["stock_lote"]))
         nuevo_stock = int(lote["stock_lote"]) - consumir
 
-        execute(
+        _e(conn,
             "UPDATE lotes SET Stock_Lote=%s WHERE ID_Lote=%s AND tenant_id = %s",
             (nuevo_stock, lote["id_lote"], tenant_id)
         )
@@ -695,7 +727,7 @@ def descontar_stock_peps(
             lote_destino = lotes[-1]
             nuevo_stock = int(lote_destino["stock_lote"]) - restante
             
-            execute(
+            _e(conn,
                 "UPDATE lotes SET Stock_Lote=%s WHERE ID_Lote=%s AND tenant_id = %s",
                 (nuevo_stock, lote_destino["id_lote"], tenant_id)
             )
@@ -716,7 +748,7 @@ def descontar_stock_peps(
             nuevo_id_l = str(uuid.uuid4())[:12]
             fecha      = str(datetime.datetime.now(_TZ))
             
-            execute(
+            _e(conn,
                 "INSERT INTO lotes (ID_Lote, Producto, Costo, Precio_Venta, Stock_Lote, Fecha_Entrada, Estado, tenant_id) VALUES (%s, %s, %s, %s, %s, %s, 'Activo', %s)",
                 (nuevo_id_l, producto, 0, precio_real, -restante, fecha, tenant_id)
             )

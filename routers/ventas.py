@@ -1,7 +1,11 @@
 # Reemplaza todo backend/routers/ventas.py por esto:
 
-from database.lotes  import descontar_stock_peps
-from database.ventas import get_ventas, insertar_venta, actualizar_venta, eliminar_venta
+from database.ventas import (
+    get_ventas,
+    actualizar_venta,
+    eliminar_venta,
+    cobrar_carrito as cobrar_carrito_atomico,
+)
 from database.conexion import query          # Necesario para leer la venta actual al procesar un PATCH parcial
 from dependencies import get_tenant_id  # <--- Importación segura
 from fastapi import APIRouter, HTTPException, Depends
@@ -39,25 +43,32 @@ def listar_ventas(limit: int = 500, tenant_id: str = Depends(get_tenant_id)):
 @router.post("/cobrar")
 def cobrar_carrito(carrito: Carrito, tenant_id: str = Depends(get_tenant_id)):
     """
-    Cobra los items del carrito.
-    
+    Cobra los items del carrito en UNA SOLA transacción atómica:
+    el stock se descuenta (PEPS) y las ventas se registran juntas.
+    Si algo falla a mitad del proceso, todo se revierte (rollback) y no queda
+    ni stock descontado sin venta, ni venta sin stock descontado.
+
     NOTA: Ya NO se valida stock insuficiente. Si no hay suficiente inventario,
     el stock se manejará en negativo para permitir la venta.
     La advertencia al usuario se maneja desde el frontend.
     """
-    ventas_a_guardar = []
+    items = [
+        {
+            "producto": item.producto,
+            "cantidad": item.cantidad,
+            "precio_real": item.precio_real,
+            "id_lote": item.id_lote,
+        }
+        for item in carrito.items
+    ]
 
-    for item in carrito.items:
-        # descontar_stock_peps ahora siempre devuelve una lista (nunca None)
-        # porque permite stock negativo
-        resultado = descontar_stock_peps(item.producto, item.cantidad, item.precio_real, tenant_id, id_lote=item.id_lote)
-        ventas_a_guardar.extend(resultado)
-
-    for venta in ventas_a_guardar:
-        insertar_venta(venta, tenant_id)
-
-    total = sum(v["total_venta"] for v in ventas_a_guardar)
-    return {"ok": True, "ventas": len(ventas_a_guardar), "total_cobrado": total}
+    resultado = cobrar_carrito_atomico(items, tenant_id)
+    if not resultado.get("ok"):
+        raise HTTPException(
+            status_code=500,
+            detail=resultado.get("mensaje", "Error al cobrar el carrito"),
+        )
+    return resultado
 
 @router.patch("/{venta_id}")
 def corregir_venta(venta_id: int, data: ActualizarVenta, tenant_id: str = Depends(get_tenant_id)):
