@@ -220,6 +220,12 @@ def inicializar_db():
             except Exception:
                 pass
 
+            # Migración: banner específico para móvil (012 — idempotente)
+            try:
+                cur.execute("ALTER TABLE catalogo_config ADD COLUMN IF NOT EXISTS banner_url_movil text DEFAULT ''")
+            except Exception:
+                pass
+
         conn.commit()
     finally:
         release_conn(conn)
