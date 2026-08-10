@@ -45,6 +45,7 @@ class ActualizarCatalogo(BaseModel):
     agrupar_por_categoria: Optional[bool] = None  # Separar productos por secciones de categoría
     columnas_movil: Optional[Literal[1, 2]] = None  # 1 o 2 productos por fila en móvil (422 si es inválido)
     permitir_descarga: Optional[bool] = None  # Permitir a los clientes descargar las fotos del catálogo
+    ocultar_agotados: Optional[bool] = None  # Ocultar los productos sin stock del catálogo público
     # Hero + Anuncios (006_catalogo_hero_anuncios.sql)
     banner_url: Optional[str] = None      # URL de la imagen de banner/hero (Cloudinary)
     hero_estilo: Optional[str] = None     # 'gradiente' | 'imagen'
@@ -59,7 +60,7 @@ def obtener_config_catalogo(tenant_id: str = Depends(get_tenant_id)):
     """
     resultado = query(
         "SELECT id, slug, activo, tema, template, titulo, subtitulo, "
-        "       mostrar_precios, mostrar_stock, mostrar_categorias, agrupar_por_categoria, columnas_movil, permitir_descarga, "
+        "       mostrar_precios, mostrar_stock, mostrar_categorias, agrupar_por_categoria, columnas_movil, permitir_descarga, ocultar_agotados, "
         "       banner_url, hero_estilo, anuncio_texto, created_at "
         "FROM catalogo_config WHERE tenant_id = %s",
         (tenant_id,)
@@ -72,7 +73,7 @@ def obtener_config_catalogo(tenant_id: str = Depends(get_tenant_id)):
         )
         resultado = query(
             "SELECT id, slug, activo, tema, template, titulo, subtitulo, "
-            "       mostrar_precios, mostrar_stock, mostrar_categorias, agrupar_por_categoria, columnas_movil, "
+            "       mostrar_precios, mostrar_stock, mostrar_categorias, agrupar_por_categoria, columnas_movil, ocultar_agotados, "
             "       banner_url, hero_estilo, anuncio_texto, created_at "
             "FROM catalogo_config WHERE tenant_id = %s",
             (tenant_id,)
@@ -136,6 +137,9 @@ def actualizar_config_catalogo(
     if data.permitir_descarga is not None:
         campos.append("permitir_descarga = %s")
         valores.append(data.permitir_descarga)
+    if data.ocultar_agotados is not None:
+        campos.append("ocultar_agotados = %s")
+        valores.append(data.ocultar_agotados)
     if data.banner_url is not None:
         campos.append("banner_url = %s")
         valores.append(data.banner_url)

@@ -204,6 +204,15 @@ def inicializar_db():
             except Exception:
                 pass
 
+            # Migración: visibilidad del catálogo (010 — idempotente)
+            try:
+                cur.execute("ALTER TABLE catalogo_config ADD COLUMN IF NOT EXISTS ocultar_agotados boolean DEFAULT false")
+                # El stock se muestra por defecto: normalizar NULLs y fijar default true
+                cur.execute("UPDATE catalogo_config SET mostrar_stock = true WHERE mostrar_stock IS NULL")
+                cur.execute("ALTER TABLE catalogo_config ALTER COLUMN mostrar_stock SET DEFAULT true")
+            except Exception:
+                pass
+
         conn.commit()
     finally:
         release_conn(conn)
