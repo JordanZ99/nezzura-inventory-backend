@@ -238,6 +238,12 @@ def inicializar_db():
             except Exception:
                 pass
 
+            # Migración: modo de precio sugerido del POS (015 — idempotente)
+            try:
+                cur.execute("ALTER TABLE tenants ADD COLUMN IF NOT EXISTS modo_precio_sugerido text DEFAULT 'antiguo'")
+            except Exception:
+                pass
+
         conn.commit()
     finally:
         release_conn(conn)

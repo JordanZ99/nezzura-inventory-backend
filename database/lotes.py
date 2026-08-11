@@ -173,9 +173,24 @@ def get_inventario_consolidado(tenant_id: str) -> list[dict]:
     """
     Devuelve una fila por producto con stock total,
     precio del lote más reciente, costo promedio ponderado y categorías.
+
+    El precio sugerido (precio_sugerido) se calcula según el modo configurado
+    del tenant (tenants.modo_precio_sugerido):
+      'antiguo'  → lote más antiguo con stock (coincide con PEPS)
+      'maximo'   → máximo precio entre los lotes con stock
+      'reciente' → lote más reciente con stock
     """
+    # Leer el modo del tenant (fallback: 'antiguo')
+    modo = "antiguo"
+    try:
+        fila_modo = query("SELECT modo_precio_sugerido FROM tenants WHERE id = %s", (tenant_id,))
+        if fila_modo and fila_modo[0].get("modo_precio_sugerido"):
+            modo = fila_modo[0]["modo_precio_sugerido"]
+    except Exception:
+        pass
+
     cat_subquery = _obtener_categorias_subquery("p")
-    return query(f"""
+    filas = query(f"""
         SELECT
             l.Producto                                               AS producto,
             p.Descripcion                                            AS descripcion,
@@ -190,10 +205,10 @@ def get_inventario_consolidado(tenant_id: str) -> list[dict]:
             MAX(l.Precio_Venta)                                      AS precio_venta,
             -- Precio del lote MÁS ANTIGUO con stock > 0 (el que PEPS va a vender).
             -- Si ningún lote tiene stock, cae al precio máximo (fallback).
-            COALESCE(
-                (array_agg(l.Precio_Venta ORDER BY l.Fecha_Entrada ASC) FILTER (WHERE l.Stock_Lote > 0))[1],
-                MAX(l.Precio_Venta)
-            )                                                         AS precio_sugerido,
+            -- Las 3 variantes del precio sugerido; el backend elige según el modo del tenant
+            COALESCE((array_agg(l.Precio_Venta ORDER BY l.Fecha_Entrada ASC) FILTER (WHERE l.Stock_Lote > 0))[1], MAX(l.Precio_Venta)) AS precio_sug_antiguo,
+            COALESCE((array_agg(l.Precio_Venta ORDER BY l.Fecha_Entrada DESC) FILTER (WHERE l.Stock_Lote > 0))[1], MAX(l.Precio_Venta)) AS precio_sug_reciente,
+            COALESCE(MAX(CASE WHEN l.Stock_Lote > 0 THEN l.Precio_Venta END), MAX(l.Precio_Venta)) AS precio_sug_maximo,
             -- Rango de precios de los lotes CON stock (para la tarjeta del POS)
             COALESCE(MIN(CASE WHEN l.Stock_Lote > 0 THEN l.Precio_Venta END), MAX(l.Precio_Venta)) AS precio_min,
             COALESCE(MAX(CASE WHEN l.Stock_Lote > 0 THEN l.Precio_Venta END), MAX(l.Precio_Venta)) AS precio_max,
@@ -204,6 +219,19 @@ def get_inventario_consolidado(tenant_id: str) -> list[dict]:
         GROUP BY l.Producto, p.Descripcion, p.Imagen, p.Estado, p.id, p.codigo_interno, p.codigo_barras, p.ubicacion, p.visible_en_catalogo
         ORDER BY l.Producto ASC
     """, (tenant_id,))
+
+    # Elegir el precio sugerido según el modo del tenant y limpiar las variantes
+    for f in filas:
+        if modo == "maximo":
+            f["precio_sugerido"] = f["precio_sug_maximo"]
+        elif modo == "reciente":
+            f["precio_sugerido"] = f["precio_sug_reciente"]
+        else:
+            f["precio_sugerido"] = f["precio_sug_antiguo"]
+        f.pop("precio_sug_antiguo", None)
+        f.pop("precio_sug_reciente", None)
+        f.pop("precio_sug_maximo", None)
+    return filas
 
 
 def get_detalle_lotes(producto: str, tenant_id: str) -> list[dict]:
