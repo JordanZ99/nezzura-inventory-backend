@@ -187,6 +187,12 @@ def get_inventario_consolidado(tenant_id: str) -> list[dict]:
             {cat_subquery},
             SUM(l.Stock_Lote)                                        AS stock_total,
             MAX(l.Precio_Venta)                                      AS precio_venta,
+            -- Precio del lote MÁS ANTIGUO con stock > 0 (el que PEPS va a vender).
+            -- Si ningún lote tiene stock, cae al precio máximo (fallback).
+            COALESCE(
+                (array_agg(l.Precio_Venta ORDER BY l.Fecha_Entrada ASC) FILTER (WHERE l.Stock_Lote > 0))[1],
+                MAX(l.Precio_Venta)
+            )                                                         AS precio_sugerido,
             SUM(l.Costo * l.Stock_Lote) / NULLIF(SUM(l.Stock_Lote), 0) AS costo_promedio
         FROM lotes l
         LEFT JOIN productos p ON l.Producto = p.Producto AND l.Tenant_ID = p.Tenant_ID
