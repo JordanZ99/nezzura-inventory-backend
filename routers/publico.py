@@ -73,19 +73,22 @@ def obtener_catalogo_publico(slug: str, response: Response):
     cat_subquery = _obtener_categorias_subquery("p", visible_only=True)
     productos = query(f"""
         SELECT
-            l.Producto                    AS producto,
+            p.Producto                    AS producto,
             p.Descripcion                 AS descripcion,
             p.Imagen                      AS imagen,
             p.sufijo_precio               AS sufijo_precio,
-            MAX(l.Precio_Venta)           AS precio_venta,
-            SUM(l.Stock_Lote)             AS stock_total,
+            p.tipo_producto               AS tipo_producto,
+            -- Servicios (sin lotes) usan su precio de servicio; productos normales el MAX de lotes
+            COALESCE(MAX(l.Precio_Venta), p.precio_servicio, 0) AS precio_venta,
+            CASE WHEN p.tipo_producto IN ('servicio', 'compuesto') THEN 0
+                 ELSE COALESCE(SUM(l.Stock_Lote), 0) END          AS stock_total,
             {cat_subquery}
-        FROM lotes l
-        LEFT JOIN productos p ON l.Producto = p.Producto AND l.tenant_id = p.tenant_id
-        WHERE l.Estado = 'Activo' AND p.Estado = 'Activo' AND l.tenant_id = %s
+        FROM productos p
+        LEFT JOIN lotes l ON l.Producto = p.Producto AND l.tenant_id = p.tenant_id AND l.Estado = 'Activo'
+        WHERE p.Estado = 'Activo' AND p.tenant_id = %s
         AND p.visible_en_catalogo = true
-        GROUP BY l.Producto, p.Descripcion, p.Imagen, p.sufijo_precio, p.id
-        ORDER BY l.Producto ASC
+        GROUP BY p.Producto, p.Descripcion, p.Imagen, p.sufijo_precio, p.tipo_producto, p.precio_servicio, p.id
+        ORDER BY p.Producto ASC
     """, (tenant_id,))
 
     # 3. Galería completa por producto: foto principal + extras (producto_imagenes).
@@ -103,6 +106,26 @@ def obtener_catalogo_publico(slug: str, response: Response):
     for fila in extras:
         extras_por_producto.setdefault(fila["producto"], []).append(fila["url"])
 
+    # 3b. Variaciones por producto (nombre + precio propio).
+    #     Si un producto tiene variaciones, el catálogo muestra "desde $X"
+    #     (precio mínimo) y el modal permite elegir la variación.
+    variaciones = query(
+        "SELECT p.Producto AS producto, v.id, v.nombre, v.precio, v.foto "
+        "FROM producto_variaciones v "
+        "JOIN productos p ON p.id = v.producto_id "
+        "WHERE p.tenant_id = %s "
+        "ORDER BY p.Producto ASC, v.nombre ASC",
+        (tenant_id,)
+    )
+    variaciones_por_producto: dict = {}
+    for v in variaciones:
+        variaciones_por_producto.setdefault(v["producto"], []).append({
+            "id": v["id"],
+            "nombre": v["nombre"],
+            "precio": float(v["precio"] or 0),
+            "foto": v.get("foto") or "",
+        })
+
     # Armar el campo imagenes (sin duplicados y sin "No hay foto")
     for p in productos:
         galeria: list[str] = []
@@ -112,11 +135,16 @@ def obtener_catalogo_publico(slug: str, response: Response):
             if url and url not in galeria:
                 galeria.append(url)
         p["imagenes"] = galeria
+        p["variaciones"] = variaciones_por_producto.get(p["producto"], [])
 
     # Si el tenant oculta los productos agotados, excluirlos de la respuesta
     # (el filtro aquí evita descargar datos que el cliente no debe ver).
+    # Los servicios y compuestos (stock 0 por diseño) SIEMPRE se muestran: no se agotan.
     if bool(cfg.get("ocultar_agotados")):
-        productos = [p for p in productos if (p.get("stock_total") or 0) > 0]
+        productos = [
+            p for p in productos
+            if p.get("tipo_producto") in ("servicio", "compuesto") or (p.get("stock_total") or 0) > 0
+        ]
 
     return {
         "config": {
