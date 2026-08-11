@@ -28,6 +28,60 @@ cloudinary.config(
     api_secret=os.getenv("CLOUDINARY_API_SECRET")
 )
 
+
+def _extraer_public_id(url: str) -> str | None:
+    """
+    Extrae el public_id de una URL de Cloudinary, manejando prefijos de
+    versión (v123/) y cadenas de transformación (w_600,f_auto,q_auto/).
+
+    Formato esperado:
+      .../image/upload/[transformaciones/][v{version}/]{folder}/{public_id}.{ext}
+
+    Devuelve None si la URL no es de Cloudinary o no se puede parsear.
+    """
+    try:
+        if "res.cloudinary.com" not in url:
+            return None
+        partes = url.split("/upload/")
+        if len(partes) < 2:
+            return None
+        ruta = partes[1]
+        # Quitar query string si existe
+        if "?" in ruta:
+            ruta = ruta.split("?", 1)[0]
+        segmentos = ruta.split("/")
+        # Saltar prefijos de transformación y de versión (v123/)
+        i = 0
+        while i < len(segmentos) - 1:
+            seg = segmentos[i]
+            if re.match(r"^v\d+$", seg) or "," in seg or re.match(
+                r"^(f_|q_|w_|c_|e_|t_|dpr_|g_|r_|o_|a_|x_|y_|fl_|l_|if_|b_)", seg
+            ):
+                i += 1
+            else:
+                break
+        public_id = "/".join(segmentos[i:]).rsplit(".", 1)[0]
+        return public_id or None
+    except Exception:
+        return None
+
+
+def borrar_imagen_cloudinary(url: str | None) -> None:
+    """
+    Borra una imagen de Cloudinary por su URL (best-effort).
+    Si la URL no es de Cloudinary o el borrado falla, no lanza excepción:
+    el flujo principal de la app nunca debe romperse por limpieza de fotos.
+    """
+    if not url or "res.cloudinary.com" not in url:
+        return
+    public_id = _extraer_public_id(url)
+    if not public_id:
+        return
+    try:
+        cloudinary.uploader.destroy(public_id)
+    except Exception as e:
+        print(f"Error borrando imagen de Cloudinary ({public_id}): {e}")
+
 from database.lotes import (
     get_lotes, get_productos_meta, get_inventario_consolidado,
     get_detalle_lotes, agregar_lote, actualizar_producto, actualizar_lote,
@@ -83,6 +137,9 @@ class CrearCategoria(BaseModel):
 
 class RenombrarCategoria(BaseModel):
     nuevo_nombre: str = Field(..., min_length=1, description="Nuevo nombre para la categoría")
+
+class BorrarImagen(BaseModel):
+    url: str = Field(..., description="URL de Cloudinary a borrar (imagen reemplazada o eliminada)")
 
 
 # --- Endpoints ---
@@ -210,6 +267,41 @@ async def subir_foto(producto: str, foto: UploadFile = File(...), tenant_id: str
         raise HTTPException(status_code=500, detail=f"Error subiendo a Cloudinary: {str(e)}")
 
 
+@router.post("/borrar_imagen")
+def borrar_imagen(data: BorrarImagen, tenant_id: str = Depends(get_tenant_id)):
+    """
+    Borra una imagen de Cloudinary tras ser reemplazada o eliminada por el
+    tenant (logo, banners de escritorio/móvil). Best-effort: si falla, no
+    rompe el flujo (la app ya no depende de la foto vieja).
+
+    Guardia de propiedad multitenant: solo borra si el public_id incluye el
+    prefijo del tenant (el logo/banner se suben con _logo_{id}/_banner_{id})
+    o si la URL está referenciada en las tablas del propio tenant.
+    """
+    url = (data.url or "").strip()
+    if not url or "res.cloudinary.com" not in url:
+        return {"ok": True, "mensaje": "Nada que borrar"}
+
+    public_id = _extraer_public_id(url) or ""
+    corto = tenant_id[:8]
+    # El logo/banner se suben con public_id _logo_{id}/_banner_{id}_{hex} → prefijo _{corto}_
+    pertenece = f"_{corto}_" in public_id
+    if not pertenece:
+        fila = query(
+            "SELECT 1 FROM productos WHERE Imagen=%s AND Tenant_ID=%s "
+            "UNION SELECT 1 FROM producto_imagenes WHERE url=%s AND tenant_id=%s "
+            "UNION SELECT 1 FROM tenants WHERE id=%s AND logo=%s "
+            "UNION SELECT 1 FROM catalogo_config WHERE tenant_id=%s AND (banner_url=%s OR banner_url_movil=%s) "
+            "LIMIT 1",
+            (url, tenant_id, url, tenant_id, tenant_id, url, tenant_id, url, url)
+        )
+        if not fila:
+            return {"ok": False, "mensaje": "La imagen no pertenece a este tenant"}
+
+    borrar_imagen_cloudinary(url)
+    return {"ok": True, "mensaje": "Imagen borrada de Cloudinary"}
+
+
 @router.patch("/{producto}")
 def editar_producto(producto: str, data: ActualizarProducto, tenant_id: str = Depends(get_tenant_id)):
     """Actualiza metadatos (descripción, imagen, estado) de un producto."""
@@ -219,20 +311,9 @@ def editar_producto(producto: str, data: ActualizarProducto, tenant_id: str = De
         old_meta = query("SELECT Imagen as imagen FROM productos WHERE Producto=%s", (producto,))
         if old_meta:
             old_url = old_meta[0]["imagen"]
-            # Solo intentamos borrar si la URL vieja era de Cloudinary y cambió
-            if old_url and old_url != data.imagen and "res.cloudinary.com" in old_url:
-                # Extraer el public_id de la URL de Cloudinary.
-                # Formato URL: https://res.cloudinary.com/{cloud}/image/upload/v{version}/{folder}/{public_id}.{ext}
-                # Necesitamos quedarnos solo con: {folder}/{public_id} (sin la extensión)
-                partes = old_url.split("/upload/")
-                if len(partes) > 1:
-                    ruta = partes[1]
-                    # Eliminar el prefijo de versión (v1234567890/)
-                    if re.match(r'^v\d+/', ruta):
-                        ruta = ruta.split("/", 1)[1]
-                    # Eliminar la extensión del archivo (.jpg, .png, etc.)
-                    public_id = ruta.rsplit(".", 1)[0]
-                    cloudinary.uploader.destroy(public_id)
+            # Solo intentamos borrar si la URL vieja era de Cloudinary y cambió.
+            if old_url and old_url != data.imagen:
+                borrar_imagen_cloudinary(old_url)
     except Exception as e:
         print(f"Error interno borrando foto antigua de Cloudinary: {e}")
 
@@ -405,17 +486,7 @@ async def subir_imagen_extra(
         )
         if existente:
             old_url = existente[0]["url"]
-            if "res.cloudinary.com" in old_url:
-                try:
-                    partes = old_url.split("/upload/")
-                    if len(partes) > 1:
-                        ruta = partes[1]
-                        if re.match(r'^v\d+/', ruta):
-                            ruta = ruta.split("/", 1)[1]
-                        public_id = ruta.rsplit(".", 1)[0]
-                        cloudinary.uploader.destroy(public_id)
-                except Exception as e:
-                    print(f"Error borrando imagen anterior de Cloudinary: {e}")
+            borrar_imagen_cloudinary(old_url)
             execute(
                 "DELETE FROM producto_imagenes WHERE id = %s",
                 (existente[0]["id"],)
@@ -505,17 +576,7 @@ def eliminar_imagen_extra(imagen_id: int, tenant_id: str = Depends(get_tenant_id
     producto_id = img["producto_id"]
 
     # 3. Borrar de Cloudinary
-    if "res.cloudinary.com" in url:
-        try:
-            partes = url.split("/upload/")
-            if len(partes) > 1:
-                ruta = partes[1]
-                if re.match(r'^v\d+/', ruta):
-                    ruta = ruta.split("/", 1)[1]
-                public_id = ruta.rsplit(".", 1)[0]
-                cloudinary.uploader.destroy(public_id)
-        except Exception as e:
-            print(f"Error borrando imagen extra de Cloudinary: {e}")
+    borrar_imagen_cloudinary(url)
 
     # 4. Borrar de la base de datos
     execute(
