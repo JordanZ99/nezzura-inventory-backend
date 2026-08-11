@@ -84,7 +84,8 @@ def borrar_imagen_cloudinary(url: str | None) -> None:
 
 from database.lotes import (
     get_lotes, get_productos_meta, get_inventario_consolidado,
-    get_detalle_lotes, agregar_lote, actualizar_producto, actualizar_lote,
+    get_detalle_lotes, agregar_lote, crear_producto_completo, actualizar_producto,
+    actualizar_lote,
     eliminar_categoria_de_productos, listar_categorias, renombrar_categoria,
     crear_categoria, eliminar_lote, toggle_visibilidad_categoria,
     listar_variaciones_producto, crear_variacion, actualizar_variacion,
@@ -100,6 +101,16 @@ router = APIRouter(prefix="/inventario", tags=["Inventario"])
 
 # --- Modelos Pydantic (validan los datos que llegan) ---
 
+class VariacionAlta(BaseModel):
+    """Variación a crear en el ALTA de un producto (nombre + precio propio)."""
+    nombre: str = Field(..., description="Nombre de la variación (ej. 'Doble', 'S')")
+    precio: float = Field(0, description="Precio propio de la variación")
+
+class RecetaAlta(BaseModel):
+    """Material de la receta a crear en el ALTA de un compuesto."""
+    material: str = Field(..., description="Nombre del material (producto de stock ya existente)")
+    cantidad: float = Field(1, description="Cantidad por unidad (permite 0.5, 150, etc.)")
+
 class NuevoProducto(BaseModel):
     producto       : str
     descripcion    : str  = ""
@@ -113,9 +124,12 @@ class NuevoProducto(BaseModel):
     ubicacion      : Optional[str] = None
     etiqueta       : Optional[str] = None  # Presentación del lote inicial (ej. "20cm", "Premium")
     sufijo_precio  : Optional[str] = None  # Sufijo del precio en el catálogo ("c/u", "por kilo", libre)
-    tipo_producto  : str = "stock"        # 'stock' (normal) | 'servicio' (sin inventario)
+    tipo_producto  : str = "stock"        # 'stock' (normal) | 'servicio' | 'compuesto'
     costo_servicio : Optional[float] = None
     precio_servicio: Optional[float] = None
+    visible_en_catalogo : Optional[bool] = None  # Solo aplica si el producto es NUEVO
+    variaciones   : Optional[list[VariacionAlta]] = None  # Se crean en la misma transacción
+    recetas       : Optional[list[RecetaAlta]] = None     # Solo para compuestos
 
 class Restock(BaseModel):
     producto    : str
@@ -254,8 +268,17 @@ def listar_productos(tenant_id: str = Depends(get_tenant_id)):
 
 @router.post("/")
 def crear_producto(data: NuevoProducto, tenant_id: str = Depends(get_tenant_id)):
-    """Registra un producto nuevo con su primer lote."""
-    return agregar_lote(
+    """
+    Registra un producto nuevo con su primer lote, VARIACIONES y RECETA
+    (si vienen) en UNA sola transacción atómica.
+
+    - visible_en_catalogo: solo aplica si el producto es nuevo (si ya existía,
+      se conserva la visibilidad actual).
+    - variaciones: [{nombre, precio}] — se crean junto al producto.
+    - recetas: [{material, cantidad}] — solo para compuestos; los materiales
+      deben ser productos de stock ya existentes.
+    """
+    resultado = crear_producto_completo(
         data.producto, data.descripcion,
         data.costo, data.precio_venta,
         data.stock, data.imagen, data.categoria,
@@ -267,8 +290,17 @@ def crear_producto(data: NuevoProducto, tenant_id: str = Depends(get_tenant_id))
         sufijo_precio=data.sufijo_precio,
         tipo_producto=data.tipo_producto,
         costo_servicio=data.costo_servicio,
-        precio_servicio=data.precio_servicio
+        precio_servicio=data.precio_servicio,
+        visible_en_catalogo=data.visible_en_catalogo,
+        variaciones=[v.model_dump() for v in (data.variaciones or [])],
+        recetas=[r.model_dump() for r in (data.recetas or [])],
     )
+    if not resultado.get("ok"):
+        raise HTTPException(
+            status_code=422 if resultado.get("tipo") == "validacion" else 500,
+            detail=resultado.get("mensaje", "Error al crear el producto"),
+        )
+    return resultado
 
 
 @router.post("/restock")
