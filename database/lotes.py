@@ -141,12 +141,15 @@ def get_lotes(tenant_id: str) -> list[dict]:
             l.fecha_entrada as fecha_entrada,
             l.estado as estado,
             l.etiqueta as etiqueta,
+            l.variacion_id as variacion_id,
+            v.nombre as variacion,
             p.Imagen as imagen, 
             p.Descripcion as descripcion,
             p.visible_en_catalogo as visible_en_catalogo,
             {cat_subquery}
         FROM lotes l
         LEFT JOIN productos p ON l.Producto = p.Producto AND l.tenant_id = p.tenant_id
+        LEFT JOIN producto_variaciones v ON v.id = l.variacion_id
         WHERE l.Estado = 'Activo' AND l.tenant_id = %s
         ORDER BY l.Producto, l.Fecha_Entrada ASC
     """, (tenant_id,))
@@ -170,6 +173,19 @@ def _adjuntar_variaciones(filas: list[dict], tenant_id: str) -> None:
         WHERE p.tenant_id = %s
         ORDER BY p.Producto ASC, v.nombre ASC
     """, (tenant_id,))
+    # Stock por variación (Fase 6): suma el stock de los lotes ligados a cada
+    # variación. Solo es relevante si el producto activó stock_por_variacion;
+    # si no, las variaciones comparten el stock del producto y esto queda 0.
+    stocks = query("""
+        SELECT l.Producto AS producto, l.variacion_id AS variacion_id,
+               SUM(l.Stock_Lote) AS stock
+        FROM lotes l
+        WHERE l.tenant_id = %s AND l.Estado = 'Activo' AND l.variacion_id IS NOT NULL
+        GROUP BY l.Producto, l.variacion_id
+    """, (tenant_id,))
+    stock_por_var: dict = {}
+    for s in stocks:
+        stock_por_var[(s["producto"], s["variacion_id"])] = float(s["stock"] or 0)
     por_producto: dict = {}
     for v in variaciones:
         por_producto.setdefault(v["producto"], []).append({
@@ -177,6 +193,7 @@ def _adjuntar_variaciones(filas: list[dict], tenant_id: str) -> None:
             "nombre": v["nombre"],
             "precio": float(v["precio"] or 0),
             "foto": v.get("foto") or "",
+            "stock": stock_por_var.get((v["producto"], v["id"]), 0),
         })
     for f in filas:
         f["variaciones"] = por_producto.get(f["producto"], [])
@@ -269,6 +286,7 @@ def get_productos_meta(tenant_id: str) -> list[dict]:
             tipo_producto,
             costo_servicio,
             precio_servicio,
+            stock_por_variacion,
             {cat_subquery}
         FROM productos 
         WHERE Tenant_ID = %s
@@ -316,6 +334,7 @@ def get_inventario_consolidado(tenant_id: str) -> list[dict]:
             p.tipo_producto                                          AS tipo_producto,
             p.costo_servicio                                         AS costo_servicio,
             p.precio_servicio                                        AS precio_servicio,
+            p.stock_por_variacion                                    AS stock_por_variacion,
             {cat_subquery},
             COALESCE(SUM(l.Stock_Lote), 0)                           AS stock_total,
             COALESCE(MAX(l.Precio_Venta), p.precio_servicio, 0)      AS precio_venta,
@@ -332,7 +351,7 @@ def get_inventario_consolidado(tenant_id: str) -> list[dict]:
         FROM productos p
         LEFT JOIN lotes l ON l.Producto = p.Producto AND l.Tenant_ID = p.Tenant_ID AND l.Estado = 'Activo'
         WHERE p.Tenant_ID = %s AND p.Estado = 'Activo'
-        GROUP BY p.Producto, p.Descripcion, p.Imagen, p.Estado, p.id, p.codigo_interno, p.codigo_barras, p.ubicacion, p.visible_en_catalogo, p.sufijo_precio, p.tipo_producto, p.costo_servicio, p.precio_servicio
+        GROUP BY p.Producto, p.Descripcion, p.Imagen, p.Estado, p.id, p.codigo_interno, p.codigo_barras, p.ubicacion, p.visible_en_catalogo, p.sufijo_precio, p.tipo_producto, p.costo_servicio, p.precio_servicio, p.stock_por_variacion
         ORDER BY p.Producto ASC
     """, (tenant_id,))
 
@@ -364,13 +383,17 @@ def get_inventario_consolidado(tenant_id: str) -> list[dict]:
 
 
 def get_detalle_lotes(producto: str, tenant_id: str) -> list[dict]:
-    """Devuelve los lotes activos de un producto específico."""
+    """Devuelve los lotes activos de un producto específico, con la variación
+    a la que pertenece cada lote (None = stock base del producto)."""
     return query("""
         SELECT 
-            id, id_lote, producto, costo, precio_venta, stock_lote, fecha_entrada, estado, etiqueta 
-        FROM lotes
-        WHERE Producto = %s AND Estado = 'Activo' AND tenant_id = %s
-        ORDER BY Fecha_Entrada DESC
+            l.id, l.id_lote, l.producto, l.costo, l.precio_venta, l.stock_lote,
+            l.fecha_entrada, l.estado, l.etiqueta,
+            l.variacion_id, v.nombre AS variacion
+        FROM lotes l
+        LEFT JOIN producto_variaciones v ON v.id = l.variacion_id
+        WHERE l.Producto = %s AND l.Estado = 'Activo' AND l.tenant_id = %s
+        ORDER BY l.Fecha_Entrada DESC
     """, (producto, tenant_id))
 
 
@@ -390,7 +413,8 @@ def agregar_lote(
     sufijo_precio: str = "",
     tipo_producto: str = "stock",
     costo_servicio: float | None = None,
-    precio_servicio: float | None = None
+    precio_servicio: float | None = None,
+    variacion: str = ""
 ) -> dict:
     """
     Crea producto si no existe, luego inserta un lote nuevo
@@ -449,7 +473,35 @@ def agregar_lote(
     if tipo == "compuesto":
         return {"accion": "compuesto_creado", "producto": producto}
 
-    # Buscar lote existente con mismo costo y precio.
+    # ── Stock por variación (Fase 6) ──
+    # Si el producto maneja stock por variación (flag ON), el lote DEBE
+    # pertenecer a una variación concreta. Si el flag está OFF, no se permite
+    # crear lotes ligados a una variación (evita stock huérfano).
+    vnombre = (variacion or "").strip()
+    variacion_id = None
+    flag_row = query(
+        "SELECT stock_por_variacion FROM productos WHERE Producto = %s AND tenant_id = %s",
+        (producto, tenant_id)
+    )
+    flag_on = bool(flag_row and flag_row[0].get("stock_por_variacion"))
+    if flag_on:
+        if not vnombre:
+            return {"ok": False, "tipo": "validacion",
+                    "mensaje": "Este producto maneja stock por variación: indica a cuál variación llegó el stock."}
+        var_row = query("""
+            SELECT v.id FROM producto_variaciones v
+            JOIN productos p ON p.id = v.producto_id
+            WHERE p.Producto = %s AND v.nombre = %s AND v.tenant_id = %s
+        """, (producto, vnombre, tenant_id))
+        if not var_row:
+            return {"ok": False, "tipo": "validacion",
+                    "mensaje": f"La variación '{vnombre}' no existe para este producto."}
+        variacion_id = var_row[0]["id"]
+    elif vnombre:
+        return {"ok": False, "tipo": "validacion",
+                "mensaje": "Este producto no maneja stock por variación. Actívalo en Editar producto para restockear por variación."}
+
+    # Buscar lote existente con mismo costo, precio y VARIACIÓN.
     # Si la etiqueta nueva está vacía, se fusiona con cualquiera (comportamiento
     # actual); si trae etiqueta, solo se fusiona con un lote de la MISMA
     # presentación — si no hay match, se crea un lote nuevo con su etiqueta
@@ -458,8 +510,9 @@ def agregar_lote(
         SELECT id_lote FROM lotes
         WHERE Producto=%s AND Costo=%s AND Precio_Venta=%s AND Estado='Activo' AND tenant_id = %s
           AND (%s = '' OR COALESCE(etiqueta, '') = %s)
+          AND variacion_id IS NOT DISTINCT FROM %s
         LIMIT 1
-    """, (producto, costo, precio_venta, tenant_id, etiqueta_limpia, etiqueta_limpia))
+    """, (producto, costo, precio_venta, tenant_id, etiqueta_limpia, etiqueta_limpia, variacion_id))
 
     if existente:
         execute(
@@ -472,9 +525,9 @@ def agregar_lote(
         fecha   = str(datetime.datetime.now(_TZ))
         execute("""
             INSERT INTO lotes (ID_Lote, Producto, Costo, Precio_Venta,
-                               Stock_Lote, Fecha_Entrada, Estado, tenant_id, etiqueta)
-            VALUES (%s, %s, %s, %s, %s, %s, 'Activo', %s, %s)
-        """, (id_lote, producto, costo, precio_venta, stock, fecha, tenant_id, etiqueta_limpia))
+                               Stock_Lote, Fecha_Entrada, Estado, tenant_id, etiqueta, variacion_id)
+            VALUES (%s, %s, %s, %s, %s, %s, 'Activo', %s, %s, %s)
+        """, (id_lote, producto, costo, precio_venta, stock, fecha, tenant_id, etiqueta_limpia, variacion_id))
         return {"accion": "lote_creado", "producto": producto, "id_lote": id_lote}
 
 
@@ -496,14 +549,16 @@ def crear_producto_completo(
     costo_servicio: float | None = None,
     precio_servicio: float | None = None,
     visible_en_catalogo: bool | None = None,
-    variaciones: list[dict] | None = None,   # [{nombre, precio}] — aplica a cualquier tipo
+    variaciones: list[dict] | None = None,   # [{nombre, precio, stock_inicial?, costo?}] — aplica a cualquier tipo
     recetas: list[dict] | None = None,       # [{material, cantidad}] — solo compuestos
 ) -> dict:
     """
     Crea un producto con TODO en una sola transacción (todo-o-nada):
       - el producto (con su visibilidad en catálogo, si se indica),
-      - su primer lote (solo tipo 'stock'),
-      - sus VARIACIONES ({nombre, precio}) si vienen,
+      - su primer lote (solo tipo 'stock', y solo si NINGUNA variación trae
+        stock inicial — si alguna variación trae stock, se crean lotes POR
+        VARIACIÓN y el producto queda con stock_por_variacion=true),
+      - sus VARIACIONES ({nombre, precio, stock_inicial?, costo?}) si vienen,
       - su RECETA ({material, cantidad}) si es compuesto.
 
     Si cualquier paso falla (variación duplicada, material inexistente, etc.)
@@ -560,9 +615,17 @@ def crear_producto_completo(
         # 2. Categorías (dentro de la misma transacción)
         _sincronizar_categorias(product_id, categoria or ["General"], tenant_id, conn=conn)
 
-        # 3. Lote inicial (solo tipo 'stock')
+        # ¿Alguna variación trae stock inicial? Si sí, el producto pasa a
+        # manejar stock por variación y NO se crea el lote base con `stock`.
+        variaciones_list = variaciones or []
+        con_stock_variacion = any(
+            float((v.get("stock_inicial") or 0)) > 0
+            for v in variaciones_list if (v.get("nombre") or "").strip()
+        )
+
+        # 3. Lote inicial (solo tipo 'stock' y sin stock por variación)
         accion = "lote_creado"
-        if tipo == "stock":
+        if tipo == "stock" and not con_stock_variacion:
             existente = _q(conn, """
                 SELECT id_lote FROM lotes
                 WHERE Producto=%s AND Costo=%s AND Precio_Venta=%s AND Estado='Activo' AND tenant_id = %s
@@ -584,24 +647,42 @@ def crear_producto_completo(
                 """, (id_lote, producto, costo, precio_venta, stock, fecha, tenant_id, etiqueta_limpia))
         elif tipo == "servicio":
             accion = "servicio_creado"
-        else:
+        elif tipo == "compuesto":
             accion = "compuesto_creado"
 
-        # 4. Variaciones (aplica a cualquier tipo)
-        for v in (variaciones or []):
+        # 4. Variaciones (aplica a cualquier tipo). Si traen stock_inicial y el
+        #    tipo es stock, se crea el LOTE de esa variación (costo propio
+        #    opcional, si no se usa el costo del producto) y se activa el flag
+        #    stock_por_variacion.
+        for v in variaciones_list:
             vnombre = (v.get("nombre") or "").strip()
             if not vnombre:
                 continue
             vprecio = float(v.get("precio") or 0)
             try:
-                _e(conn,
+                r_var = _q(conn,
                     "INSERT INTO producto_variaciones (producto_id, nombre, precio, tenant_id) "
-                    "VALUES (%s, %s, %s, %s)",
+                    "VALUES (%s, %s, %s, %s) RETURNING id",
                     (product_id, vnombre, vprecio, tenant_id))
             except UniqueViolation:
                 conn.rollback()
                 return {"ok": False, "tipo": "validacion",
                         "mensaje": f"Ya existe una variación llamada '{vnombre}'"}
+            vstock = v.get("stock_inicial")
+            if tipo == "stock" and float(vstock or 0) > 0:
+                vcosto = float(v.get("costo") or 0) or costo
+                vid = r_var[0]["id"]
+                vfecha = str(datetime.datetime.now(_TZ))
+                _e(conn, """
+                    INSERT INTO lotes (ID_Lote, Producto, Costo, Precio_Venta,
+                                       Stock_Lote, Fecha_Entrada, Estado, tenant_id, variacion_id)
+                    VALUES (%s, %s, %s, %s, %s, %s, 'Activo', %s, %s)
+                """, (str(uuid.uuid4())[:12], producto, vcosto, vprecio,
+                       float(vstock), vfecha, tenant_id, vid))
+        if con_stock_variacion:
+            _e(conn,
+                "UPDATE productos SET stock_por_variacion=true WHERE id=%s",
+                (product_id,))
 
         # 5. Receta (solo compuestos)
         if tipo == "compuesto":
@@ -668,7 +749,8 @@ def actualizar_producto(
     sufijo_precio: str | None = None,
     tipo_producto: str | None = None,
     costo_servicio: float | None = None,
-    precio_servicio: float | None = None
+    precio_servicio: float | None = None,
+    stock_por_variacion: bool | None = None
 ) -> dict:
     producto = producto.strip()
     descripcion = descripcion.strip()
@@ -769,6 +851,13 @@ def actualizar_producto(
         execute(
             "UPDATE lotes SET Estado='Inactivo' WHERE Producto=%s AND tenant_id = %s",
             (producto, tenant_id)
+        )
+
+    # Stock por variación (Fase 6): toggle por producto
+    if stock_por_variacion is not None:
+        execute(
+            "UPDATE productos SET stock_por_variacion=%s WHERE Producto=%s AND tenant_id=%s",
+            (bool(stock_por_variacion), producto, tenant_id)
         )
     return {"ok": True, "producto": producto, "estado": estado}
 
@@ -897,8 +986,41 @@ def eliminar_categoria_de_productos(categoria: str, tenant_id: str) -> dict:
     }
 
 
-def actualizar_lote(id_lote: str, costo: float, precio_venta: float, stock: float, tenant_id: str, etiqueta: str | None = None) -> dict:
-    """Actualiza costo, precio de venta, stock y etiqueta de un lote específico."""
+def actualizar_lote(id_lote: str, costo: float, precio_venta: float, stock: float, tenant_id: str, etiqueta: str | None = None, variacion: str | None = None) -> dict:
+    """
+    Actualiza costo, precio de venta, stock y etiqueta de un lote específico.
+
+    variacion: None = conservar la variación actual;
+               ''    = desvincular el lote de su variación (pasa a base);
+               'Nombre' = reasignar el lote a esa variación del mismo producto.
+    """
+    # 0. Reasignar/desvincular la variación del lote si se indica
+    if variacion is not None:
+        vn = (variacion or "").strip()
+        info = query(
+            "SELECT Producto FROM lotes WHERE ID_Lote=%s AND tenant_id=%s",
+            (id_lote, tenant_id)
+        )
+        if not info:
+            return {"ok": False, "mensaje": "Lote no encontrado"}
+        if vn:
+            pid = _resolver_producto_id(info[0]["producto"], tenant_id)
+            var = query(
+                "SELECT id FROM producto_variaciones WHERE producto_id=%s AND nombre=%s AND tenant_id=%s",
+                (pid, vn, tenant_id)
+            ) if pid else []
+            if not var:
+                return {"ok": False, "mensaje": f"La variación '{vn}' no existe para este producto"}
+            execute(
+                "UPDATE lotes SET variacion_id=%s WHERE ID_Lote=%s AND tenant_id=%s",
+                (var[0]["id"], id_lote, tenant_id)
+            )
+        else:
+            execute(
+                "UPDATE lotes SET variacion_id=NULL WHERE ID_Lote=%s AND tenant_id=%s",
+                (id_lote, tenant_id)
+            )
+
     # 1. Actualizar el lote (etiqueta: COALESCE mantiene la actual si no se envía)
     execute("""
         UPDATE lotes SET Costo=%s, Precio_Venta=%s, Stock_Lote=%s, etiqueta=COALESCE(%s, etiqueta) WHERE ID_Lote=%s AND tenant_id = %s
@@ -1001,6 +1123,7 @@ def descontar_stock_peps(
     precio_real: float,
     tenant_id: str,
     id_lote: str | None = None,
+    variacion_id: int | None = None,
     conn=None
 ) -> list[dict]:
     producto = producto.strip()
@@ -1010,6 +1133,11 @@ def descontar_stock_peps(
     Si se proporciona id_lote, descuenta exclusivamente de ese lote específico
     en lugar de seguir el orden PEPS. Si el lote no tiene suficiente stock,
     se permite stock negativo (consistente con el comportamiento general).
+    
+    Si se proporciona variacion_id, descuenta SOLO de los lotes de esa
+    variación (stock por variación, Fase 6). Si es None, descuenta solo de
+    los lotes base del producto (variacion_id IS NULL) — el comportamiento
+    estándar.
     
     A diferencia de la versión anterior, ahora PERMITE stock negativo.
     Si no hay suficiente stock físico, se consume todo lo disponible
@@ -1038,9 +1166,9 @@ def descontar_stock_peps(
             nuevo_id = str(uuid.uuid4())[:12]
             fecha = str(datetime.datetime.now(_TZ))
             _e(conn,
-                "INSERT INTO lotes (ID_Lote, Producto, Costo, Precio_Venta, Stock_Lote, Fecha_Entrada, Estado, tenant_id) "
-                "VALUES (%s, %s, %s, %s, %s, %s, 'Activo', %s)",
-                (nuevo_id, producto, 0, precio_real, -cantidad_total, fecha, tenant_id)
+                "INSERT INTO lotes (ID_Lote, Producto, Costo, Precio_Venta, Stock_Lote, Fecha_Entrada, Estado, tenant_id, variacion_id) "
+                "VALUES (%s, %s, %s, %s, %s, %s, 'Activo', %s, %s)",
+                (nuevo_id, producto, 0, precio_real, -cantidad_total, fecha, tenant_id, variacion_id)
             )
             return [{
                 "fecha"          : fecha,
@@ -1074,14 +1202,15 @@ def descontar_stock_peps(
         }]
 
     # ── PEPS normal (sin lote específico) ──
-    # Obtenemos TODOS los lotes activos, incluso con stock 0 o negativo
-    # para poder seguir el orden PEPS correctamente
+    # Obtenemos TODOS los lotes activos de esa variación (o base si no se
+    # indica), incluso con stock 0 o negativo para seguir el orden PEPS.
     lotes = _q(conn, """
         SELECT * FROM lotes
         WHERE Producto=%s AND Estado='Activo' AND tenant_id = %s
+          AND variacion_id IS NOT DISTINCT FROM %s
         ORDER BY Fecha_Entrada ASC
         FOR UPDATE
-    """, (producto, tenant_id))
+    """, (producto, tenant_id, variacion_id))
 
     ventas_generadas = []
     restante = cantidad_total
@@ -1149,8 +1278,8 @@ def descontar_stock_peps(
             fecha      = str(datetime.datetime.now(_TZ))
             
             _e(conn,
-                "INSERT INTO lotes (ID_Lote, Producto, Costo, Precio_Venta, Stock_Lote, Fecha_Entrada, Estado, tenant_id) VALUES (%s, %s, %s, %s, %s, %s, 'Activo', %s)",
-                (nuevo_id_l, producto, 0, precio_real, -restante, fecha, tenant_id)
+                "INSERT INTO lotes (ID_Lote, Producto, Costo, Precio_Venta, Stock_Lote, Fecha_Entrada, Estado, tenant_id, variacion_id) VALUES (%s, %s, %s, %s, %s, %s, 'Activo', %s, %s)",
+                (nuevo_id_l, producto, 0, precio_real, -restante, fecha, tenant_id, variacion_id)
             )
             
             ventas_generadas.append({
@@ -1192,10 +1321,13 @@ def listar_variaciones_producto(producto: str, tenant_id: str) -> list[dict]:
     if not pid:
         return []
     return query("""
-        SELECT id, nombre, precio, foto
-        FROM producto_variaciones
-        WHERE producto_id = %s AND tenant_id = %s
-        ORDER BY nombre ASC
+        SELECT v.id, v.nombre, v.precio, v.foto,
+               COALESCE((SELECT SUM(l.Stock_Lote) FROM lotes l
+                         WHERE l.variacion_id = v.id AND l.Estado='Activo'
+                           AND l.tenant_id = v.tenant_id), 0) AS stock
+        FROM producto_variaciones v
+        WHERE v.producto_id = %s AND v.tenant_id = %s
+        ORDER BY v.nombre ASC
     """, (pid, tenant_id))
 
 

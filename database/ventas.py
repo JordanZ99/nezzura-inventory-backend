@@ -115,6 +115,29 @@ def _resolver_receta_compuesto(cur, producto: str, variacion: str | None, tenant
     return [dict(row) for row in cur.fetchall()]
 
 
+def _resolver_variacion_venta(cur, v: dict, tenant_id: str) -> int | None:
+    """
+    Resuelve el id de variación de una venta de STOCK, SOLO si el producto
+    maneja stock por variación (flag stock_por_variacion ON).
+    None = stock compartido/base (comportamiento estándar).
+    """
+    variacion = str(v.get("variacion") or "").strip()
+    if not variacion:
+        return None
+    cur.execute(
+        "SELECT p.stock_por_variacion, vv.id AS vid "
+        "FROM productos p "
+        "LEFT JOIN producto_variaciones vv ON vv.producto_id = p.id "
+        "  AND vv.nombre = %s AND vv.tenant_id = p.tenant_id "
+        "WHERE p.Producto = %s AND p.tenant_id = %s",
+        (variacion, v["producto"], tenant_id)
+    )
+    fila = cur.fetchone()
+    if fila and fila.get("stock_por_variacion") and fila.get("vid"):
+        return fila["vid"]
+    return None
+
+
 def _revertir_consumo(cur, consumo: list[dict] | None, tenant_id: str) -> None:
     """
     Devuelve el stock a los lotes EXACTOS que una venta compuesta consumió.
@@ -261,7 +284,9 @@ def actualizar_venta(venta_id: int, fecha: str, cantidad: float, precio_real: fl
                 conn.commit()
                 return {"ok": True, "id": venta_id}
             elif dif > 0:
-                cur.execute("SELECT * FROM lotes WHERE Producto=%s AND Estado='Activo' AND tenant_id=%s ORDER BY Fecha_Entrada ASC FOR UPDATE", (v["producto"], tenant_id))
+                # Stock por variación: descuenta solo de los lotes de ESA variación
+                vid = _resolver_variacion_venta(cur, v, tenant_id)
+                cur.execute("SELECT * FROM lotes WHERE Producto=%s AND Estado='Activo' AND tenant_id=%s AND variacion_id IS NOT DISTINCT FROM %s ORDER BY Fecha_Entrada ASC FOR UPDATE", (v["producto"], tenant_id, vid))
                 lotes = [dict(row) for row in cur.fetchall()]
                 restante = dif
                 for lote in lotes:
@@ -277,14 +302,16 @@ def actualizar_venta(venta_id: int, fecha: str, cantidad: float, precio_real: fl
                     cur.execute("UPDATE lotes SET Stock_Lote = Stock_Lote - %s WHERE ID_Lote=%s AND tenant_id=%s", (restante, ultimo["id_lote"], tenant_id))
             elif dif < 0:
                 restaurar = abs(dif)
-                cur.execute("SELECT id_lote, stock_lote FROM lotes WHERE Producto=%s AND Costo=%s AND Precio_Venta=%s AND Estado='Activo' AND tenant_id=%s FOR UPDATE LIMIT 1", (v["producto"], v["costo_unitario"], v["precio_lista"], tenant_id))
+                # Stock por variación: restaurar al lote de ESA variación
+                vid = _resolver_variacion_venta(cur, v, tenant_id)
+                cur.execute("SELECT id_lote, stock_lote FROM lotes WHERE Producto=%s AND Costo=%s AND Precio_Venta=%s AND Estado='Activo' AND tenant_id=%s AND variacion_id IS NOT DISTINCT FROM %s FOR UPDATE LIMIT 1", (v["producto"], v["costo_unitario"], v["precio_lista"], tenant_id, vid))
                 lote_exist = cur.fetchone()
                 if lote_exist:
                     cur.execute("UPDATE lotes SET Stock_Lote = Stock_Lote + %s WHERE ID_Lote = %s AND tenant_id=%s", (restaurar, lote_exist["id_lote"], tenant_id))
                 else:
                     id_l = str(uuid.uuid4())[:12]
                     fe = str(datetime.datetime.now(_TZ))
-                    cur.execute("INSERT INTO lotes (ID_Lote, Producto, Costo, Precio_Venta, Stock_Lote, Fecha_Entrada, Estado, tenant_id) VALUES (%s, %s, %s, %s, %s, %s, 'Activo', %s)", (id_l, v["producto"], v["costo_unitario"], v["precio_lista"], restaurar, fe, tenant_id))
+                    cur.execute("INSERT INTO lotes (ID_Lote, Producto, Costo, Precio_Venta, Stock_Lote, Fecha_Entrada, Estado, tenant_id, variacion_id) VALUES (%s, %s, %s, %s, %s, %s, 'Activo', %s, %s)", (id_l, v["producto"], v["costo_unitario"], v["precio_lista"], restaurar, fe, tenant_id, vid))
 
             # 3. Guardar cambios en la venta
             cur.execute("""
@@ -541,12 +568,21 @@ def cobrar_carrito(items: list[dict], tenant_id: str) -> dict:
                 continue
 
             # ── Producto con stock: PEPS normal ──
+            # ¿Stock por variación? Si el producto activó el flag, el descuento
+            # va SOLO a los lotes de ESA variación (Fase 6).
+            variacion_id = None
+            if variacion:
+                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                    variacion_id = _resolver_variacion_venta(
+                        cur, {"producto": item["producto"], "variacion": variacion}, tenant_id
+                    )
             resultado = descontar_stock_peps(
                 item["producto"],
                 item["cantidad"],
                 item["precio_real"],
                 tenant_id,
                 id_lote=item.get("id_lote"),
+                variacion_id=variacion_id,
                 conn=conn,
             )
             for v in resultado:

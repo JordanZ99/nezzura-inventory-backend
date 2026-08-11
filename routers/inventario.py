@@ -102,9 +102,13 @@ router = APIRouter(prefix="/inventario", tags=["Inventario"])
 # --- Modelos Pydantic (validan los datos que llegan) ---
 
 class VariacionAlta(BaseModel):
-    """Variación a crear en el ALTA de un producto (nombre + precio propio)."""
+    """Variación a crear en el ALTA de un producto (nombre + precio propio).
+    stock_inicial/costo: opcionales — si se da stock, se crea el lote de ESA
+    variación y el producto pasa a manejar stock por variación (Fase 6)."""
     nombre: str = Field(..., description="Nombre de la variación (ej. 'Doble', 'S')")
     precio: float = Field(0, description="Precio propio de la variación")
+    stock_inicial: Optional[float] = Field(None, description="Stock inicial propio de esta variación (crea su lote)")
+    costo: Optional[float] = Field(None, description="Costo del lote inicial de esta variación (si se omite, usa el costo del producto)")
 
 class RecetaAlta(BaseModel):
     """Material de la receta a crear en el ALTA de un compuesto."""
@@ -137,6 +141,7 @@ class Restock(BaseModel):
     precio_venta: float
     stock       : float
     etiqueta    : Optional[str] = None  # Presentación del nuevo lote (ej. "20cm", "Premium")
+    variacion   : Optional[str] = None  # Variación a la que llega el stock (obligatoria si el producto maneja stock por variación)
 
 class ActualizarProducto(BaseModel):
     descripcion         : str
@@ -154,12 +159,14 @@ class ActualizarProducto(BaseModel):
     tipo_producto       : Optional[str] = None  # 'stock' | 'servicio'
     costo_servicio      : Optional[float] = None
     precio_servicio     : Optional[float] = None
+    stock_por_variacion : Optional[bool] = None  # Fase 6: si true, el stock vive en lotes por variación
 
 class ActualizarLote(BaseModel):
     costo       : float
     precio_venta: float
     stock       : float
     etiqueta    : Optional[str] = None  # Presentación del lote (opcional)
+    variacion   : Optional[str] = None  # Reasignar/desvincular la variación del lote ('' = base)
 
 class CrearCategoria(BaseModel):
     nombre: str = Field(..., min_length=1, description="Nombre de la categoría a crear")
@@ -305,16 +312,24 @@ def crear_producto(data: NuevoProducto, tenant_id: str = Depends(get_tenant_id))
 
 @router.post("/restock")
 def restockear(data: Restock, tenant_id: str = Depends(get_tenant_id)):
-    """Añade stock a un producto existente (nuevo lote o suma al existente)."""
-    return agregar_lote(
+    """Añade stock a un producto existente (nuevo lote o suma al existente).
+    Si el producto maneja stock por variación, `variacion` es obligatoria."""
+    resultado = agregar_lote(
         producto=data.producto,
         descripcion="",
         costo=data.costo,
         precio_venta=data.precio_venta,
         stock=data.stock,
         tenant_id=tenant_id,
-        etiqueta=data.etiqueta
+        etiqueta=data.etiqueta,
+        variacion=data.variacion or ""
     )
+    if not resultado.get("ok", True):
+        raise HTTPException(
+            status_code=422 if resultado.get("tipo") == "validacion" else 500,
+            detail=resultado.get("mensaje", "Error al restockear"),
+        )
+    return resultado
 
 
 @router.post("/foto/{producto}")
@@ -439,14 +454,15 @@ def editar_producto(producto: str, data: ActualizarProducto, tenant_id: str = De
         sufijo_precio=data.sufijo_precio,
         tipo_producto=data.tipo_producto,
         costo_servicio=data.costo_servicio,
-        precio_servicio=data.precio_servicio
+        precio_servicio=data.precio_servicio,
+        stock_por_variacion=data.stock_por_variacion
     )
 
 
 @router.patch("/lote/{id_lote}")
 def editar_lote(id_lote: str, data: ActualizarLote, tenant_id: str = Depends(get_tenant_id)):
     """Actualiza costo, precio de venta, stock y etiqueta de un lote específico."""
-    return actualizar_lote(id_lote, data.costo, data.precio_venta, data.stock, tenant_id, etiqueta=data.etiqueta)
+    return actualizar_lote(id_lote, data.costo, data.precio_venta, data.stock, tenant_id, etiqueta=data.etiqueta, variacion=data.variacion)
 
 
 @router.delete("/lote/{id_lote}")
@@ -516,8 +532,33 @@ def editar_variacion_endpoint(variacion_id: int, data: ActualizarVariacion, tena
 
 
 @router.delete("/variaciones/{variacion_id}")
-def borrar_variacion_endpoint(variacion_id: int, tenant_id: str = Depends(get_tenant_id)):
-    """Elimina una variación del producto (borra también su foto de Cloudinary)."""
+def borrar_variacion_endpoint(variacion_id: int, confirmar: bool = False, tenant_id: str = Depends(get_tenant_id)):
+    """
+    Elimina una variación del producto (borra también su foto de Cloudinary).
+
+    Si la variación tiene STOCK en sus lotes y no se pasa confirmar=true,
+    devuelve un aviso (requiere_confirmacion) para que el frontend muestre el
+    modal "mover/desvincular o eliminar de todos modos". Con confirmar=true
+    se elimina (sus lotes se borran en cascada: el stock desaparece a propósito).
+    """
+    # Si NO hay confirmación, primero advertir por el stock — aquí NO se borra
+    # nada (la foto de Cloudinary se borra solo si realmente se elimina).
+    if not confirmar:
+        stock_info = query("""
+            SELECT COALESCE(SUM(Stock_Lote), 0) AS unidades, COUNT(*) AS lotes
+            FROM lotes
+            WHERE variacion_id = %s AND tenant_id = %s AND Estado = 'Activo'
+        """, (variacion_id, tenant_id))
+        if stock_info and (float(stock_info[0]["unidades"] or 0) > 0 or int(stock_info[0]["lotes"] or 0) > 0):
+            return {
+                "ok": False,
+                "requiere_confirmacion": True,
+                "unidades": float(stock_info[0]["unidades"] or 0),
+                "lotes": int(stock_info[0]["lotes"] or 0),
+                "mensaje": "Esta variación tiene stock. Puedes moverlo a otra variación o desvincularlo antes de eliminar, o eliminar de todos modos (su stock desaparecerá del inventario).",
+            }
+
+    # Aquí sí se elimina: borrar la foto de Cloudinary y la variación
     try:
         fila = query("SELECT foto FROM producto_variaciones WHERE id=%s AND tenant_id=%s", (variacion_id, tenant_id))
         if fila and fila[0].get("foto"):
