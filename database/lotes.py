@@ -56,7 +56,7 @@ def _slugify(texto: str) -> str:
     return texto.strip('-')
 
 
-def _sincronizar_categorias(producto_id: int, categorias: list[str], tenant_id: str) -> None:
+def _sincronizar_categorias(producto_id: int, categorias: list[str], tenant_id: str, conn=None) -> None:
     """
     Sincroniza las categorías de un producto en la tabla pivote (producto_categorias).
     
@@ -69,6 +69,8 @@ def _sincronizar_categorias(producto_id: int, categorias: list[str], tenant_id: 
         producto_id: ID numérico del producto (productos.id)
         categorias: Lista de nombres de categorías a asignar
         tenant_id: UUID del tenant propietario
+        conn: si se provee, todo se ejecuta sobre esa conexión (para usarse
+              dentro de una transacción atómica, ej. crear_producto_completo).
     """
     # Normalizar: limpiar espacios y eliminar duplicados preservando orden
     categorias = list(dict.fromkeys([c.strip() for c in categorias if c.strip()]))
@@ -76,7 +78,7 @@ def _sincronizar_categorias(producto_id: int, categorias: list[str], tenant_id: 
         categorias = ["General"]
 
     # 1. Eliminar relaciones existentes para este producto
-    execute(
+    _e(conn,
         "DELETE FROM producto_categorias WHERE producto_id = %s",
         (producto_id,)
     )
@@ -86,7 +88,7 @@ def _sincronizar_categorias(producto_id: int, categorias: list[str], tenant_id: 
         slug = _slugify(nombre)
 
         # Upsert: si ya existe (tenant_id, nombre), devuelve el id existente
-        result = query("""
+        result = _q(conn, """
             INSERT INTO categorias (tenant_id, nombre, slug)
             VALUES (%s, %s, %s)
             ON CONFLICT (tenant_id, nombre) DO UPDATE SET
@@ -97,7 +99,7 @@ def _sincronizar_categorias(producto_id: int, categorias: list[str], tenant_id: 
         categoria_id = result[0]["id"]
 
         # Insertar en la tabla pivote (ignorar si ya existe por alguna razón)
-        execute(
+        _e(conn,
             "INSERT INTO producto_categorias (producto_id, categoria_id) VALUES (%s, %s) ON CONFLICT DO NOTHING",
             (producto_id, categoria_id)
         )
@@ -474,6 +476,179 @@ def agregar_lote(
             VALUES (%s, %s, %s, %s, %s, %s, 'Activo', %s, %s)
         """, (id_lote, producto, costo, precio_venta, stock, fecha, tenant_id, etiqueta_limpia))
         return {"accion": "lote_creado", "producto": producto, "id_lote": id_lote}
+
+
+def crear_producto_completo(
+    producto: str,
+    descripcion: str,
+    costo: float,
+    precio_venta: float,
+    stock: float,
+    imagen: str = "No hay foto",
+    categoria: list[str] | None = None,
+    tenant_id: str = "",
+    codigo_interno: str | None = None,
+    codigo_barras: str | None = None,
+    ubicacion: str | None = None,
+    etiqueta: str = "",
+    sufijo_precio: str = "",
+    tipo_producto: str = "stock",
+    costo_servicio: float | None = None,
+    precio_servicio: float | None = None,
+    visible_en_catalogo: bool | None = None,
+    variaciones: list[dict] | None = None,   # [{nombre, precio}] — aplica a cualquier tipo
+    recetas: list[dict] | None = None,       # [{material, cantidad}] — solo compuestos
+) -> dict:
+    """
+    Crea un producto con TODO en una sola transacción (todo-o-nada):
+      - el producto (con su visibilidad en catálogo, si se indica),
+      - su primer lote (solo tipo 'stock'),
+      - sus VARIACIONES ({nombre, precio}) si vienen,
+      - su RECETA ({material, cantidad}) si es compuesto.
+
+    Si cualquier paso falla (variación duplicada, material inexistente, etc.)
+    se hace rollback: no queda el producto a medias.
+
+    visible_en_catalogo:
+      True/False → aplica SOLO cuando el producto es NUEVO (INSERT). Si el
+      producto ya existía (ON CONFLICT, caso raro en el alta), se conserva la
+      visibilidad actual para no pisarla.
+    """
+    from database.conexion import get_conn, release_conn
+
+    producto = (producto or "").strip()
+    descripcion = (descripcion or "").strip()
+    etiqueta_limpia = (etiqueta or "").strip()
+    sufijo_limpio = (sufijo_precio or "").strip()
+    tipo = (tipo_producto or "stock").strip().lower()
+    if tipo not in ("stock", "servicio", "compuesto"):
+        tipo = "stock"
+    costo_srv = float(costo_servicio or 0)
+    precio_srv = float(precio_servicio or 0)
+    vis = bool(visible_en_catalogo) if visible_en_catalogo is not None else True
+
+    conn = get_conn()
+    try:
+        # 1. Upsert del producto. En conflicto (producto ya existente) se
+        #    conserva la visibilidad actual; el tipo nunca se pisa.
+        r = _q(conn, """
+            INSERT INTO productos (Producto, Descripcion, Imagen, Estado, tenant_id,
+                                   codigo_interno, codigo_barras, ubicacion, sufijo_precio,
+                                   tipo_producto, costo_servicio, precio_servicio, visible_en_catalogo)
+            VALUES (%s, %s, %s, 'Activo', %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT(Producto, tenant_id) DO UPDATE SET
+                Descripcion = EXCLUDED.Descripcion,
+                Imagen = CASE WHEN EXCLUDED.Imagen != 'No hay foto'
+                             THEN EXCLUDED.Imagen ELSE productos.Imagen END,
+                codigo_interno = COALESCE(EXCLUDED.codigo_interno, productos.codigo_interno),
+                codigo_barras = COALESCE(EXCLUDED.codigo_barras, productos.codigo_barras),
+                ubicacion = COALESCE(EXCLUDED.ubicacion, productos.ubicacion),
+                sufijo_precio = CASE WHEN EXCLUDED.sufijo_precio != ''
+                                     THEN EXCLUDED.sufijo_precio ELSE productos.sufijo_precio END,
+                tipo_producto = productos.tipo_producto,
+                costo_servicio = CASE WHEN EXCLUDED.costo_servicio > 0
+                                      THEN EXCLUDED.costo_servicio ELSE productos.costo_servicio END,
+                precio_servicio = CASE WHEN EXCLUDED.precio_servicio > 0
+                                       THEN EXCLUDED.precio_servicio ELSE productos.precio_servicio END,
+                -- La visibilidad NO se pisa en restock/conflictos: solo aplica en INSERT
+                visible_en_catalogo = productos.visible_en_catalogo
+            RETURNING id
+        """, (producto, descripcion, imagen, tenant_id, codigo_interno, codigo_barras, ubicacion,
+              sufijo_limpio, tipo, costo_srv, precio_srv, vis))
+        product_id = r[0]["id"]
+
+        # 2. Categorías (dentro de la misma transacción)
+        _sincronizar_categorias(product_id, categoria or ["General"], tenant_id, conn=conn)
+
+        # 3. Lote inicial (solo tipo 'stock')
+        accion = "lote_creado"
+        if tipo == "stock":
+            existente = _q(conn, """
+                SELECT id_lote FROM lotes
+                WHERE Producto=%s AND Costo=%s AND Precio_Venta=%s AND Estado='Activo' AND tenant_id = %s
+                  AND (%s = '' OR COALESCE(etiqueta, '') = %s)
+                LIMIT 1
+            """, (producto, costo, precio_venta, tenant_id, etiqueta_limpia, etiqueta_limpia))
+            if existente:
+                _e(conn,
+                    "UPDATE lotes SET Stock_Lote = Stock_Lote + %s WHERE ID_Lote = %s AND tenant_id = %s",
+                    (stock, existente[0]["id_lote"], tenant_id))
+                accion = "stock_sumado"
+            else:
+                id_lote = str(uuid.uuid4())[:12]
+                fecha = str(datetime.datetime.now(_TZ))
+                _e(conn, """
+                    INSERT INTO lotes (ID_Lote, Producto, Costo, Precio_Venta,
+                                       Stock_Lote, Fecha_Entrada, Estado, tenant_id, etiqueta)
+                    VALUES (%s, %s, %s, %s, %s, %s, 'Activo', %s, %s)
+                """, (id_lote, producto, costo, precio_venta, stock, fecha, tenant_id, etiqueta_limpia))
+        elif tipo == "servicio":
+            accion = "servicio_creado"
+        else:
+            accion = "compuesto_creado"
+
+        # 4. Variaciones (aplica a cualquier tipo)
+        for v in (variaciones or []):
+            vnombre = (v.get("nombre") or "").strip()
+            if not vnombre:
+                continue
+            vprecio = float(v.get("precio") or 0)
+            try:
+                _e(conn,
+                    "INSERT INTO producto_variaciones (producto_id, nombre, precio, tenant_id) "
+                    "VALUES (%s, %s, %s, %s)",
+                    (product_id, vnombre, vprecio, tenant_id))
+            except UniqueViolation:
+                conn.rollback()
+                return {"ok": False, "tipo": "validacion",
+                        "mensaje": f"Ya existe una variación llamada '{vnombre}'"}
+
+        # 5. Receta (solo compuestos)
+        if tipo == "compuesto":
+            for r_mat in (recetas or []):
+                mnombre = (r_mat.get("material") or "").strip()
+                mcant = float(r_mat.get("cantidad") or 0)
+                if not mnombre or mcant <= 0:
+                    continue
+                fila_mat = _q(conn,
+                    "SELECT id FROM productos WHERE Producto = %s AND tenant_id = %s",
+                    (mnombre, tenant_id))
+                if not fila_mat:
+                    conn.rollback()
+                    return {"ok": False, "tipo": "validacion",
+                            "mensaje": f"El material '{mnombre}' no existe. Créalo primero como producto con stock."}
+                mid = fila_mat[0]["id"]
+                if mid == product_id:
+                    conn.rollback()
+                    return {"ok": False, "tipo": "validacion",
+                            "mensaje": f"'{mnombre}' no puede ser material de sí mismo."}
+                try:
+                    _e(conn,
+                        "INSERT INTO producto_recetas (producto_id, material_id, cantidad, tenant_id, variacion_id) "
+                        "VALUES (%s, %s, %s, %s, NULL)",
+                        (product_id, mid, mcant, tenant_id))
+                except UniqueViolation:
+                    # Ya existe en la receta base → actualizar la cantidad
+                    _e(conn,
+                        "UPDATE producto_recetas SET cantidad = %s "
+                        "WHERE producto_id = %s AND material_id = %s AND tenant_id = %s "
+                        "AND variacion_id IS NULL",
+                        (mcant, product_id, mid, tenant_id))
+
+        conn.commit()
+        return {
+            "ok": True,
+            "accion": accion,
+            "producto": producto,
+            "id": product_id,
+            "variaciones_creadas": len(variaciones or []),
+            "recetas_creadas": len(recetas or []) if tipo == "compuesto" else 0,
+        }
+    except Exception as e:
+        conn.rollback()
+        return {"ok": False, "tipo": "error", "mensaje": f"Error al crear el producto: {str(e)}"}
+    finally:
+        release_conn(conn)
 
 
 def actualizar_producto(
