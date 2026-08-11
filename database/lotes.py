@@ -137,6 +137,7 @@ def get_lotes(tenant_id: str) -> list[dict]:
             l.stock_lote as stock_lote,
             l.fecha_entrada as fecha_entrada,
             l.estado as estado,
+            l.etiqueta as etiqueta,
             p.Imagen as imagen, 
             p.Descripcion as descripcion,
             p.visible_en_catalogo as visible_en_catalogo,
@@ -193,6 +194,9 @@ def get_inventario_consolidado(tenant_id: str) -> list[dict]:
                 (array_agg(l.Precio_Venta ORDER BY l.Fecha_Entrada ASC) FILTER (WHERE l.Stock_Lote > 0))[1],
                 MAX(l.Precio_Venta)
             )                                                         AS precio_sugerido,
+            -- Rango de precios de los lotes CON stock (para la tarjeta del POS)
+            COALESCE(MIN(CASE WHEN l.Stock_Lote > 0 THEN l.Precio_Venta END), MAX(l.Precio_Venta)) AS precio_min,
+            COALESCE(MAX(CASE WHEN l.Stock_Lote > 0 THEN l.Precio_Venta END), MAX(l.Precio_Venta)) AS precio_max,
             SUM(l.Costo * l.Stock_Lote) / NULLIF(SUM(l.Stock_Lote), 0) AS costo_promedio
         FROM lotes l
         LEFT JOIN productos p ON l.Producto = p.Producto AND l.Tenant_ID = p.Tenant_ID
@@ -206,7 +210,7 @@ def get_detalle_lotes(producto: str, tenant_id: str) -> list[dict]:
     """Devuelve los lotes activos de un producto específico."""
     return query("""
         SELECT 
-            id, id_lote, producto, costo, precio_venta, stock_lote, fecha_entrada, estado 
+            id, id_lote, producto, costo, precio_venta, stock_lote, fecha_entrada, estado, etiqueta 
         FROM lotes
         WHERE Producto = %s AND Estado = 'Activo' AND tenant_id = %s
         ORDER BY Fecha_Entrada DESC
@@ -224,10 +228,12 @@ def agregar_lote(
     tenant_id: str = "",
     codigo_interno: str | None = None,
     codigo_barras: str | None = None,
-    ubicacion: str | None = None
+    ubicacion: str | None = None,
+    etiqueta: str = ""
 ) -> dict:
     producto = producto.strip()
     descripcion = descripcion.strip()
+    etiqueta_limpia = (etiqueta or "").strip()
     """
     Crea producto si no existe, luego inserta un lote nuevo
     o suma stock si ya existe uno con el mismo costo y precio.
@@ -253,12 +259,17 @@ def agregar_lote(
     # Sincronizar categorías en la tabla pivote (Many-to-Many)
     _sincronizar_categorias(product_id, categoria, tenant_id)
 
-    # Buscar lote existente con mismo costo y precio
+    # Buscar lote existente con mismo costo y precio.
+    # Si la etiqueta nueva está vacía, se fusiona con cualquiera (comportamiento
+    # actual); si trae etiqueta, solo se fusiona con un lote de la MISMA
+    # presentación — si no hay match, se crea un lote nuevo con su etiqueta
+    # (evita que la etiqueta se pierda al restockear al mismo precio).
     existente = query("""
         SELECT id_lote FROM lotes
         WHERE Producto=%s AND Costo=%s AND Precio_Venta=%s AND Estado='Activo' AND tenant_id = %s
+          AND (%s = '' OR COALESCE(etiqueta, '') = %s)
         LIMIT 1
-    """, (producto, costo, precio_venta, tenant_id))
+    """, (producto, costo, precio_venta, tenant_id, etiqueta_limpia, etiqueta_limpia))
 
     if existente:
         execute(
@@ -271,9 +282,9 @@ def agregar_lote(
         fecha   = str(datetime.datetime.now(_TZ))
         execute("""
             INSERT INTO lotes (ID_Lote, Producto, Costo, Precio_Venta,
-                               Stock_Lote, Fecha_Entrada, Estado, tenant_id)
-            VALUES (%s, %s, %s, %s, %s, %s, 'Activo', %s)
-        """, (id_lote, producto, costo, precio_venta, stock, fecha, tenant_id))
+                               Stock_Lote, Fecha_Entrada, Estado, tenant_id, etiqueta)
+            VALUES (%s, %s, %s, %s, %s, %s, 'Activo', %s, %s)
+        """, (id_lote, producto, costo, precio_venta, stock, fecha, tenant_id, etiqueta_limpia))
         return {"accion": "lote_creado", "producto": producto, "id_lote": id_lote}
 
 
@@ -503,12 +514,12 @@ def eliminar_categoria_de_productos(categoria: str, tenant_id: str) -> dict:
     }
 
 
-def actualizar_lote(id_lote: str, costo: float, precio_venta: float, stock: int, tenant_id: str) -> dict:
-    """Actualiza costo, precio de venta y stock de un lote específico."""
-    # 1. Actualizar el lote
+def actualizar_lote(id_lote: str, costo: float, precio_venta: float, stock: int, tenant_id: str, etiqueta: str | None = None) -> dict:
+    """Actualiza costo, precio de venta, stock y etiqueta de un lote específico."""
+    # 1. Actualizar el lote (etiqueta: COALESCE mantiene la actual si no se envía)
     execute("""
-        UPDATE lotes SET Costo=%s, Precio_Venta=%s, Stock_Lote=%s WHERE ID_Lote=%s AND tenant_id = %s
-    """, (costo, precio_venta, stock, id_lote, tenant_id))
+        UPDATE lotes SET Costo=%s, Precio_Venta=%s, Stock_Lote=%s, etiqueta=COALESCE(%s, etiqueta) WHERE ID_Lote=%s AND tenant_id = %s
+    """, (costo, precio_venta, stock, etiqueta, id_lote, tenant_id))
 
     # 2. Recalcular ganancias en ventas asociadas a este lote
     execute("""

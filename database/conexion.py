@@ -232,6 +232,12 @@ def inicializar_db():
             except Exception:
                 pass
 
+            # Migración: etiqueta/presentación por lote (014 — idempotente)
+            try:
+                cur.execute("ALTER TABLE lotes ADD COLUMN IF NOT EXISTS etiqueta text DEFAULT ''")
+            except Exception:
+                pass
+
         conn.commit()
     finally:
         release_conn(conn)

@@ -107,12 +107,14 @@ class NuevoProducto(BaseModel):
     codigo_interno : Optional[str] = None
     codigo_barras  : Optional[str] = None
     ubicacion      : Optional[str] = None
+    etiqueta       : Optional[str] = None  # Presentación del lote inicial (ej. "20cm", "Premium")
 
 class Restock(BaseModel):
     producto    : str
     costo       : float
     precio_venta: float
     stock       : int
+    etiqueta    : Optional[str] = None  # Presentación del nuevo lote (ej. "20cm", "Premium")
 
 class ActualizarProducto(BaseModel):
     descripcion         : str
@@ -131,6 +133,7 @@ class ActualizarLote(BaseModel):
     costo       : float
     precio_venta: float
     stock       : int
+    etiqueta    : Optional[str] = None  # Presentación del lote (opcional)
 
 class CrearCategoria(BaseModel):
     nombre: str = Field(..., min_length=1, description="Nombre de la categoría a crear")
@@ -190,7 +193,8 @@ def crear_producto(data: NuevoProducto, tenant_id: str = Depends(get_tenant_id))
         tenant_id,
         codigo_interno=data.codigo_interno,
         codigo_barras=data.codigo_barras,
-        ubicacion=data.ubicacion
+        ubicacion=data.ubicacion,
+        etiqueta=data.etiqueta
     )
 
 
@@ -203,7 +207,8 @@ def restockear(data: Restock, tenant_id: str = Depends(get_tenant_id)):
         costo=data.costo,
         precio_venta=data.precio_venta,
         stock=data.stock,
-        tenant_id=tenant_id
+        tenant_id=tenant_id,
+        etiqueta=data.etiqueta
     )
 
 
@@ -330,8 +335,8 @@ def editar_producto(producto: str, data: ActualizarProducto, tenant_id: str = De
 
 @router.patch("/lote/{id_lote}")
 def editar_lote(id_lote: str, data: ActualizarLote, tenant_id: str = Depends(get_tenant_id)):
-    """Actualiza costo, precio de venta y stock de un lote específico."""
-    return actualizar_lote(id_lote, data.costo, data.precio_venta, data.stock, tenant_id)
+    """Actualiza costo, precio de venta, stock y etiqueta de un lote específico."""
+    return actualizar_lote(id_lote, data.costo, data.precio_venta, data.stock, tenant_id, etiqueta=data.etiqueta)
 
 
 @router.delete("/lote/{id_lote}")
