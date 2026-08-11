@@ -76,6 +76,7 @@ def obtener_catalogo_publico(slug: str, response: Response):
             l.Producto                    AS producto,
             p.Descripcion                 AS descripcion,
             p.Imagen                      AS imagen,
+            p.sufijo_precio               AS sufijo_precio,
             MAX(l.Precio_Venta)           AS precio_venta,
             SUM(l.Stock_Lote)             AS stock_total,
             {cat_subquery}
@@ -83,7 +84,7 @@ def obtener_catalogo_publico(slug: str, response: Response):
         LEFT JOIN productos p ON l.Producto = p.Producto AND l.tenant_id = p.tenant_id
         WHERE l.Estado = 'Activo' AND p.Estado = 'Activo' AND l.tenant_id = %s
         AND p.visible_en_catalogo = true
-        GROUP BY l.Producto, p.Descripcion, p.Imagen, p.id
+        GROUP BY l.Producto, p.Descripcion, p.Imagen, p.sufijo_precio, p.id
         ORDER BY l.Producto ASC
     """, (tenant_id,))
 

@@ -244,6 +244,13 @@ def inicializar_db():
             except Exception:
                 pass
 
+            # Migración: sufijo del precio en el catálogo (016 — idempotente)
+            # '' = sin sufijo; 'c/u', 'por kilo' o texto libre (ej. 'por litro')
+            try:
+                cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS sufijo_precio text DEFAULT ''")
+            except Exception:
+                pass
+
         conn.commit()
     finally:
         release_conn(conn)

@@ -108,6 +108,7 @@ class NuevoProducto(BaseModel):
     codigo_barras  : Optional[str] = None
     ubicacion      : Optional[str] = None
     etiqueta       : Optional[str] = None  # Presentación del lote inicial (ej. "20cm", "Premium")
+    sufijo_precio  : Optional[str] = None  # Sufijo del precio en el catálogo ("c/u", "por kilo", libre)
 
 class Restock(BaseModel):
     producto    : str
@@ -128,6 +129,7 @@ class ActualizarProducto(BaseModel):
     codigo_barras       : Optional[str] = None
     ubicacion           : Optional[str] = None
     visible_en_catalogo : Optional[bool] = None
+    sufijo_precio       : Optional[str] = None  # Sufijo del precio en el catálogo ("c/u", "por kilo", libre)
 
 class ActualizarLote(BaseModel):
     costo       : float
@@ -231,7 +233,8 @@ def crear_producto(data: NuevoProducto, tenant_id: str = Depends(get_tenant_id))
         codigo_interno=data.codigo_interno,
         codigo_barras=data.codigo_barras,
         ubicacion=data.ubicacion,
-        etiqueta=data.etiqueta
+        etiqueta=data.etiqueta,
+        sufijo_precio=data.sufijo_precio
     )
 
 
@@ -366,7 +369,8 @@ def editar_producto(producto: str, data: ActualizarProducto, tenant_id: str = De
         codigo_interno=data.codigo_interno,
         codigo_barras=data.codigo_barras,
         ubicacion=data.ubicacion,
-        visible_en_catalogo=data.visible_en_catalogo
+        visible_en_catalogo=data.visible_en_catalogo,
+        sufijo_precio=data.sufijo_precio
     )
 
 
