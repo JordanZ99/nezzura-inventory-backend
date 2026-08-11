@@ -7,6 +7,7 @@ import uuid
 import datetime
 import re
 from zoneinfo import ZoneInfo
+from psycopg2.errors import UniqueViolation
 
 
 # ── Zona horaria del negocio (Cancún, UTC-5) ──
@@ -149,10 +150,110 @@ def get_lotes(tenant_id: str) -> list[dict]:
     """, (tenant_id,))
 
 
+def _adjuntar_variaciones(filas: list[dict], tenant_id: str) -> None:
+    """
+    Adjunta las variaciones de cada producto a una lista de filas que ya
+    contienen la llave `producto` (nombre). Muta las filas in-place añadiendo
+    el campo `variaciones` = [{id, nombre, precio}, ...].
+
+    Los productos sin variaciones quedan con lista vacía (el frontend lo trata
+    como "sin selector").
+    """
+    if not filas:
+        return
+    variaciones = query("""
+        SELECT p.Producto AS producto, v.id, v.nombre, v.precio, v.foto
+        FROM producto_variaciones v
+        JOIN productos p ON p.id = v.producto_id
+        WHERE p.tenant_id = %s
+        ORDER BY p.Producto ASC, v.nombre ASC
+    """, (tenant_id,))
+    por_producto: dict = {}
+    for v in variaciones:
+        por_producto.setdefault(v["producto"], []).append({
+            "id": v["id"],
+            "nombre": v["nombre"],
+            "precio": float(v["precio"] or 0),
+            "foto": v.get("foto") or "",
+        })
+    for f in filas:
+        f["variaciones"] = por_producto.get(f["producto"], [])
+
+
+def _calcular_disponibilidad_compuestos(filas: list[dict], tenant_id: str) -> None:
+    """
+    Añade `disponibilidad_estimada` (int o None) a cada producto compuesto:
+    cuántas unidades se pueden vender con el stock ACTUAL de sus materiales.
+
+    Se calcula POR RECETA (base y cada variación por separado) y se toma el
+    MÍNIMO entre ellas: es la cantidad que garantizas poder vender sin
+    importar qué presentación pida el cliente.
+
+    Ej: Hamburguesa = 1 pan + 150 carne + 2 queso. Con 4 panes, 600g carne
+    y 10 quesos → quedan min(4/1, 600/150, 10/2) = min(4, 4, 5) = 4.
+    None = el compuesto no tiene receta (no se puede estimar).
+    """
+    compuestos = [f for f in filas if f.get("tipo_producto") == "compuesto"]
+    if not compuestos:
+        return
+
+    # Recetas por compuesto, SIN mezclar: la base es una receta, y cada
+    # variación con receta propia es otra receta independiente.
+    recetas_por_compuesto: dict[str, list[dict[str, float]]] = {}
+    for f in compuestos:
+        recetas_por_compuesto[f["producto"]] = []
+        base = [r for r in (f.get("recetas") or []) if r.get("variacion_id") is None]
+        if base:
+            recetas_por_compuesto[f["producto"]].append(
+                {r["material"]: float(r["cantidad"] or 0) for r in base}
+            )
+        por_variacion: dict[int, list[dict]] = {}
+        for r in (f.get("recetas") or []):
+            if r.get("variacion_id") is not None:
+                por_variacion.setdefault(r["variacion_id"], []).append(r)
+        for var_recetas in por_variacion.values():
+            recetas_por_compuesto[f["producto"]].append(
+                {r["material"]: float(r["cantidad"] or 0) for r in var_recetas}
+            )
+
+    nombres = sorted({
+        m for recetas in recetas_por_compuesto.values() for receta in recetas for m in receta
+    })
+    if not nombres:
+        for f in compuestos:
+            f["disponibilidad_estimada"] = None
+        return
+
+    stocks = query(
+        "SELECT Producto AS producto, SUM(Stock_Lote) AS stock FROM lotes "
+        "WHERE tenant_id = %s AND Estado = 'Activo' AND Producto = ANY(%s) "
+        "GROUP BY Producto",
+        (tenant_id, nombres)
+    )
+    stock_map = {r["producto"]: float(r["stock"] or 0) for r in stocks}
+
+    for f in compuestos:
+        recetas = recetas_por_compuesto.get(f["producto"]) or []
+        if not recetas:
+            f["disponibilidad_estimada"] = None
+            continue
+        mejor: int | None = None
+        for receta in recetas:
+            disp_receta: int | None = None
+            for mat, cant in receta.items():
+                if cant <= 0:
+                    continue
+                n = int(stock_map.get(mat, 0) // cant)
+                disp_receta = n if disp_receta is None else min(disp_receta, n)
+            if disp_receta is not None:
+                mejor = disp_receta if mejor is None else min(mejor, disp_receta)
+        f["disponibilidad_estimada"] = max(mejor, 0) if mejor is not None else None
+
+
 def get_productos_meta(tenant_id: str) -> list[dict]:
     """Lee la tabla productos (metadatos) con sus categorías desde la relación Many-to-Many."""
     cat_subquery = _obtener_categorias_subquery("productos")
-    return query(f"""
+    filas = query(f"""
         SELECT 
             Producto as producto, 
             Descripcion as descripcion, 
@@ -163,11 +264,17 @@ def get_productos_meta(tenant_id: str) -> list[dict]:
             ubicacion,
             visible_en_catalogo,
             sufijo_precio,
+            tipo_producto,
+            costo_servicio,
+            precio_servicio,
             {cat_subquery}
         FROM productos 
         WHERE Tenant_ID = %s
         ORDER BY Producto ASC
     """,  (tenant_id,))
+    _adjuntar_variaciones(filas, tenant_id)
+    _adjuntar_recetas(filas, tenant_id)
+    return filas
 
 
 def get_inventario_consolidado(tenant_id: str) -> list[dict]:
@@ -191,9 +298,11 @@ def get_inventario_consolidado(tenant_id: str) -> list[dict]:
         pass
 
     cat_subquery = _obtener_categorias_subquery("p")
+    # Parte de `productos` (LEFT JOIN lotes) para que los SERVICIOS —que no
+    # tienen lotes— también aparezcan con stock 0 y su precio de servicio.
     filas = query(f"""
         SELECT
-            l.Producto                                               AS producto,
+            p.Producto                                               AS producto,
             p.Descripcion                                            AS descripcion,
             p.Imagen                                                 AS imagen,
             p.Estado                                                 AS estado,
@@ -202,29 +311,45 @@ def get_inventario_consolidado(tenant_id: str) -> list[dict]:
             p.ubicacion,
             p.visible_en_catalogo                                    AS visible_en_catalogo,
             p.sufijo_precio                                          AS sufijo_precio,
+            p.tipo_producto                                          AS tipo_producto,
+            p.costo_servicio                                         AS costo_servicio,
+            p.precio_servicio                                        AS precio_servicio,
             {cat_subquery},
-            SUM(l.Stock_Lote)                                        AS stock_total,
-            MAX(l.Precio_Venta)                                      AS precio_venta,
+            COALESCE(SUM(l.Stock_Lote), 0)                           AS stock_total,
+            COALESCE(MAX(l.Precio_Venta), p.precio_servicio, 0)      AS precio_venta,
             -- Precio del lote MÁS ANTIGUO con stock > 0 (el que PEPS va a vender).
             -- Si ningún lote tiene stock, cae al precio máximo (fallback).
             -- Las 3 variantes del precio sugerido; el backend elige según el modo del tenant
-            COALESCE((array_agg(l.Precio_Venta ORDER BY l.Fecha_Entrada ASC) FILTER (WHERE l.Stock_Lote > 0))[1], MAX(l.Precio_Venta)) AS precio_sug_antiguo,
-            COALESCE((array_agg(l.Precio_Venta ORDER BY l.Fecha_Entrada DESC) FILTER (WHERE l.Stock_Lote > 0))[1], MAX(l.Precio_Venta)) AS precio_sug_reciente,
-            COALESCE(MAX(CASE WHEN l.Stock_Lote > 0 THEN l.Precio_Venta END), MAX(l.Precio_Venta)) AS precio_sug_maximo,
+            COALESCE((array_agg(l.Precio_Venta ORDER BY l.Fecha_Entrada ASC) FILTER (WHERE l.Stock_Lote > 0))[1], MAX(l.Precio_Venta), p.precio_servicio, 0) AS precio_sug_antiguo,
+            COALESCE((array_agg(l.Precio_Venta ORDER BY l.Fecha_Entrada DESC) FILTER (WHERE l.Stock_Lote > 0))[1], MAX(l.Precio_Venta), p.precio_servicio, 0) AS precio_sug_reciente,
+            COALESCE(MAX(CASE WHEN l.Stock_Lote > 0 THEN l.Precio_Venta END), MAX(l.Precio_Venta), p.precio_servicio, 0) AS precio_sug_maximo,
             -- Rango de precios de los lotes CON stock (para la tarjeta del POS)
-            COALESCE(MIN(CASE WHEN l.Stock_Lote > 0 THEN l.Precio_Venta END), MAX(l.Precio_Venta)) AS precio_min,
-            COALESCE(MAX(CASE WHEN l.Stock_Lote > 0 THEN l.Precio_Venta END), MAX(l.Precio_Venta)) AS precio_max,
-            SUM(l.Costo * l.Stock_Lote) / NULLIF(SUM(l.Stock_Lote), 0) AS costo_promedio
-        FROM lotes l
-        LEFT JOIN productos p ON l.Producto = p.Producto AND l.Tenant_ID = p.Tenant_ID
-        WHERE l.Estado = 'Activo' AND l.Tenant_ID = %s
-        GROUP BY l.Producto, p.Descripcion, p.Imagen, p.Estado, p.id, p.codigo_interno, p.codigo_barras, p.ubicacion, p.visible_en_catalogo
-        ORDER BY l.Producto ASC
+            COALESCE(MIN(CASE WHEN l.Stock_Lote > 0 THEN l.Precio_Venta END), MAX(l.Precio_Venta), p.precio_servicio, 0) AS precio_min,
+            COALESCE(MAX(CASE WHEN l.Stock_Lote > 0 THEN l.Precio_Venta END), MAX(l.Precio_Venta), p.precio_servicio, 0) AS precio_max,
+            COALESCE(SUM(l.Costo * l.Stock_Lote) / NULLIF(SUM(l.Stock_Lote), 0), p.costo_servicio, 0) AS costo_promedio
+        FROM productos p
+        LEFT JOIN lotes l ON l.Producto = p.Producto AND l.Tenant_ID = p.Tenant_ID AND l.Estado = 'Activo'
+        WHERE p.Tenant_ID = %s AND p.Estado = 'Activo'
+        GROUP BY p.Producto, p.Descripcion, p.Imagen, p.Estado, p.id, p.codigo_interno, p.codigo_barras, p.ubicacion, p.visible_en_catalogo, p.sufijo_precio, p.tipo_producto, p.costo_servicio, p.precio_servicio
+        ORDER BY p.Producto ASC
     """, (tenant_id,))
+
+    # Adjuntar variaciones (POS/catálogo) y recetas (gestor) por producto
+    _adjuntar_variaciones(filas, tenant_id)
+    _adjuntar_recetas(filas, tenant_id)
+    _calcular_disponibilidad_compuestos(filas, tenant_id)
 
     # Elegir el precio sugerido según el modo del tenant y limpiar las variantes
     for f in filas:
-        if modo == "maximo":
+        # Servicio/Compuesto: no tienen lotes → el precio es su precio propio
+        # (precio_servicio se reutiliza como 'precio sin stock' para ambos tipos)
+        if f.get("tipo_producto") in ("servicio", "compuesto"):
+            f["precio_sugerido"] = f.get("precio_servicio") or 0
+            f["precio_venta"] = f.get("precio_servicio") or 0
+            f["precio_min"] = f.get("precio_servicio") or 0
+            f["precio_max"] = f.get("precio_servicio") or 0
+            f["costo_promedio"] = f.get("costo_servicio") or 0
+        elif modo == "maximo":
             f["precio_sugerido"] = f["precio_sug_maximo"]
         elif modo == "reciente":
             f["precio_sugerido"] = f["precio_sug_reciente"]
@@ -252,7 +377,7 @@ def agregar_lote(
     descripcion: str,
     costo: float,
     precio_venta: float,
-    stock: int,
+    stock: float,
     imagen: str = "No hay foto",
     categoria: list[str] = ["General"],
     tenant_id: str = "",
@@ -260,22 +385,38 @@ def agregar_lote(
     codigo_barras: str | None = None,
     ubicacion: str | None = None,
     etiqueta: str = "",
-    sufijo_precio: str = ""
+    sufijo_precio: str = "",
+    tipo_producto: str = "stock",
+    costo_servicio: float | None = None,
+    precio_servicio: float | None = None
 ) -> dict:
-    producto = producto.strip()
-    descripcion = descripcion.strip()
-    etiqueta_limpia = (etiqueta or "").strip()
     """
     Crea producto si no existe, luego inserta un lote nuevo
     o suma stock si ya existe uno con el mismo costo y precio.
     Las categorías se guardan en la tabla pivote producto_categorias.
+
+    Si tipo_producto == 'servicio' NO se crea lote: el producto se vende sin
+    inventario (ej. corte de cabello) y guarda costo/precio propios en
+    productos.costo_servicio / productos.precio_servicio.
+    Si tipo_producto == 'compuesto' tampoco se crea lote: su stock son los
+    MATERIALES de su receta (producto_recetas). Su precio de venta se guarda
+    en productos.precio_servicio (reutilizando la columna).
     """
+    producto = producto.strip()
+    descripcion = descripcion.strip()
+    etiqueta_limpia = (etiqueta or "").strip()
     # Upsert en productos (YA NO incluye Categoria, se maneja aparte)
     sufijo_limpio = (sufijo_precio or "").strip()
+    tipo = (tipo_producto or "stock").strip().lower()
+    if tipo not in ("stock", "servicio", "compuesto"):
+        tipo = "stock"
+    costo_srv = float(costo_servicio or 0)
+    precio_srv = float(precio_servicio or 0)
     result = query("""
         INSERT INTO productos (Producto, Descripcion, Imagen, Estado, tenant_id,
-                               codigo_interno, codigo_barras, ubicacion, sufijo_precio)
-        VALUES (%s, %s, %s, 'Activo', %s, %s, %s, %s, %s)
+                               codigo_interno, codigo_barras, ubicacion, sufijo_precio,
+                               tipo_producto, costo_servicio, precio_servicio)
+        VALUES (%s, %s, %s, 'Activo', %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT(Producto, tenant_id) DO UPDATE SET
             Descripcion = EXCLUDED.Descripcion,
             Imagen = CASE WHEN EXCLUDED.Imagen != 'No hay foto'
@@ -284,14 +425,27 @@ def agregar_lote(
             codigo_barras = COALESCE(EXCLUDED.codigo_barras, productos.codigo_barras),
             ubicacion = COALESCE(EXCLUDED.ubicacion, productos.ubicacion),
             sufijo_precio = CASE WHEN EXCLUDED.sufijo_precio != ''
-                                 THEN EXCLUDED.sufijo_precio ELSE productos.sufijo_precio END
+                                 THEN EXCLUDED.sufijo_precio ELSE productos.sufijo_precio END,
+            -- El tipo NO se pisa en restock: se define al crear el producto
+            tipo_producto = productos.tipo_producto,
+            costo_servicio = CASE WHEN EXCLUDED.costo_servicio > 0
+                                  THEN EXCLUDED.costo_servicio ELSE productos.costo_servicio END,
+            precio_servicio = CASE WHEN EXCLUDED.precio_servicio > 0
+                                   THEN EXCLUDED.precio_servicio ELSE productos.precio_servicio END
         RETURNING id
-    """, (producto, descripcion, imagen, tenant_id, codigo_interno, codigo_barras, ubicacion, sufijo_limpio))
+    """, (producto, descripcion, imagen, tenant_id, codigo_interno, codigo_barras, ubicacion,
+          sufijo_limpio, tipo, costo_srv, precio_srv))
 
     product_id = result[0]["id"]
 
     # Sincronizar categorías en la tabla pivote (Many-to-Many)
     _sincronizar_categorias(product_id, categoria, tenant_id)
+
+    # ── Servicio/Compuesto: no tienen inventario propio → no se crea lote ──
+    if tipo == "servicio":
+        return {"accion": "servicio_creado", "producto": producto}
+    if tipo == "compuesto":
+        return {"accion": "compuesto_creado", "producto": producto}
 
     # Buscar lote existente con mismo costo y precio.
     # Si la etiqueta nueva está vacía, se fusiona con cualquiera (comportamiento
@@ -336,7 +490,10 @@ def actualizar_producto(
     codigo_barras: str | None = None,
     ubicacion: str | None = None,
     visible_en_catalogo: bool | None = None,
-    sufijo_precio: str | None = None
+    sufijo_precio: str | None = None,
+    tipo_producto: str | None = None,
+    costo_servicio: float | None = None,
+    precio_servicio: float | None = None
 ) -> dict:
     producto = producto.strip()
     descripcion = descripcion.strip()
@@ -347,6 +504,7 @@ def actualizar_producto(
     Si se proporciona nuevo_producto, renombra el producto en todas las tablas.
     También actualiza codigo_interno, codigo_barras y ubicacion si se proporcionan.
     Si se proporciona visible_en_catalogo, actualiza la visibilidad en el catálogo público.
+    tipo_producto/costo_servicio/precio_servicio aplican a productos de servicio (sin stock).
     """
     nombre_final = producto
     if nuevo_producto is not None:
@@ -359,10 +517,14 @@ def actualizar_producto(
                 "codigo_barras=COALESCE(%s, codigo_barras), "
                 "ubicacion=COALESCE(%s, ubicacion), "
                 "visible_en_catalogo=COALESCE(%s, visible_en_catalogo), "
-                "sufijo_precio=COALESCE(%s, sufijo_precio) "
+                "sufijo_precio=COALESCE(%s, sufijo_precio), "
+                "tipo_producto=COALESCE(%s, tipo_producto), "
+                "costo_servicio=COALESCE(%s, costo_servicio), "
+                "precio_servicio=COALESCE(%s, precio_servicio) "
                 "WHERE Producto=%s AND tenant_id=%s",
                 (nombre_final, descripcion, imagen, estado,
-                 codigo_interno, codigo_barras, ubicacion, visible_en_catalogo, sufijo_precio, producto, tenant_id)
+                 codigo_interno, codigo_barras, ubicacion, visible_en_catalogo, sufijo_precio,
+                 tipo_producto, costo_servicio, precio_servicio, producto, tenant_id)
             )
             # Renombrar en lotes
             execute(
@@ -384,9 +546,13 @@ def actualizar_producto(
                     codigo_barras=COALESCE(%s, codigo_barras),
                     ubicacion=COALESCE(%s, ubicacion),
                     visible_en_catalogo=COALESCE(%s, visible_en_catalogo),
-                    sufijo_precio=COALESCE(%s, sufijo_precio)
+                    sufijo_precio=COALESCE(%s, sufijo_precio),
+                    tipo_producto=COALESCE(%s, tipo_producto),
+                    costo_servicio=COALESCE(%s, costo_servicio),
+                    precio_servicio=COALESCE(%s, precio_servicio)
                 WHERE Producto=%s AND tenant_id = %s
-            """, (descripcion, imagen, estado, codigo_interno, codigo_barras, ubicacion, visible_en_catalogo, sufijo_precio, producto, tenant_id))
+            """, (descripcion, imagen, estado, codigo_interno, codigo_barras, ubicacion, visible_en_catalogo, sufijo_precio,
+                   tipo_producto, costo_servicio, precio_servicio, producto, tenant_id))
     else:
         # Actualizar producto sin renombrar
         execute("""
@@ -395,9 +561,13 @@ def actualizar_producto(
                 codigo_barras=COALESCE(%s, codigo_barras),
                 ubicacion=COALESCE(%s, ubicacion),
                 visible_en_catalogo=COALESCE(%s, visible_en_catalogo),
-                sufijo_precio=COALESCE(%s, sufijo_precio)
+                sufijo_precio=COALESCE(%s, sufijo_precio),
+                tipo_producto=COALESCE(%s, tipo_producto),
+                costo_servicio=COALESCE(%s, costo_servicio),
+                precio_servicio=COALESCE(%s, precio_servicio)
             WHERE Producto=%s AND tenant_id = %s
-        """, (descripcion, imagen, estado, codigo_interno, codigo_barras, ubicacion, visible_en_catalogo, sufijo_precio, producto, tenant_id))
+        """, (descripcion, imagen, estado, codigo_interno, codigo_barras, ubicacion, visible_en_catalogo, sufijo_precio,
+               tipo_producto, costo_servicio, precio_servicio, producto, tenant_id))
 
     # Obtener el ID numérico del producto para la tabla pivote
     prod = query(
@@ -552,7 +722,7 @@ def eliminar_categoria_de_productos(categoria: str, tenant_id: str) -> dict:
     }
 
 
-def actualizar_lote(id_lote: str, costo: float, precio_venta: float, stock: int, tenant_id: str, etiqueta: str | None = None) -> dict:
+def actualizar_lote(id_lote: str, costo: float, precio_venta: float, stock: float, tenant_id: str, etiqueta: str | None = None) -> dict:
     """Actualiza costo, precio de venta, stock y etiqueta de un lote específico."""
     # 1. Actualizar el lote (etiqueta: COALESCE mantiene la actual si no se envía)
     execute("""
@@ -652,7 +822,7 @@ def eliminar_lote(id_lote: str, tenant_id: str) -> dict:
 
 def descontar_stock_peps(
     producto: str,
-    cantidad_total: int,
+    cantidad_total: float,
     precio_real: float,
     tenant_id: str,
     id_lote: str | None = None,
@@ -710,7 +880,7 @@ def descontar_stock_peps(
             }]
 
         lote = lotes[0]
-        nuevo_stock = int(lote["stock_lote"]) - cantidad_total
+        nuevo_stock = round(float(lote["stock_lote"]) - cantidad_total, 3)
         _e(conn,
             "UPDATE lotes SET Stock_Lote=%s WHERE ID_Lote=%s AND tenant_id = %s",
             (nuevo_stock, id_lote, tenant_id)
@@ -747,11 +917,11 @@ def descontar_stock_peps(
             break
 
         # Solo consumimos de lotes que tengan stock positivo
-        if int(lote["stock_lote"]) <= 0:
+        if float(lote["stock_lote"]) <= 0:
             continue
 
-        consumir    = min(restante, int(lote["stock_lote"]))
-        nuevo_stock = int(lote["stock_lote"]) - consumir
+        consumir    = min(restante, float(lote["stock_lote"]))
+        nuevo_stock = round(float(lote["stock_lote"]) - consumir, 3)
 
         _e(conn,
             "UPDATE lotes SET Stock_Lote=%s WHERE ID_Lote=%s AND tenant_id = %s",
@@ -780,7 +950,7 @@ def descontar_stock_peps(
         if lotes:
             # Usamos el lote más reciente (último del orden PEPS = último insertado)
             lote_destino = lotes[-1]
-            nuevo_stock = int(lote_destino["stock_lote"]) - restante
+            nuevo_stock = round(float(lote_destino["stock_lote"]) - restante, 3)
             
             _e(conn,
                 "UPDATE lotes SET Stock_Lote=%s WHERE ID_Lote=%s AND tenant_id = %s",
@@ -821,3 +991,248 @@ def descontar_stock_peps(
             })
 
     return ventas_generadas
+
+
+# ==============================================================================
+# Variaciones de producto (Fase 2)
+# Una variación es una presentación con su PROPIO precio para un mismo
+# producto (ej. Sencilla/Doble, S/M/L, Caballero/Dama). Aplica a cualquier
+# tipo de producto (stock, servicio o compuesto). En esta fase no consume
+# nada extra: solo cambia el precio.
+# ==============================================================================
+
+
+def _resolver_producto_id(producto: str, tenant_id: str) -> int | None:
+    """Resuelve el ID numérico de un producto por su nombre (o None)."""
+    r = query(
+        "SELECT id FROM productos WHERE Producto = %s AND tenant_id = %s",
+        (producto, tenant_id)
+    )
+    return r[0]["id"] if r else None
+
+
+def listar_variaciones_producto(producto: str, tenant_id: str) -> list[dict]:
+    """Variaciones de un producto concreto (nombre + precio propio + foto)."""
+    pid = _resolver_producto_id(producto, tenant_id)
+    if not pid:
+        return []
+    return query("""
+        SELECT id, nombre, precio, foto
+        FROM producto_variaciones
+        WHERE producto_id = %s AND tenant_id = %s
+        ORDER BY nombre ASC
+    """, (pid, tenant_id))
+
+
+def crear_variacion(producto: str, nombre: str, precio: float, tenant_id: str, foto: str = "") -> dict:
+    """
+    Crea una variación nueva para un producto.
+    Si ya existe una variación con el mismo nombre, devuelve error (UNIQUE).
+    """
+    producto = (producto or "").strip()
+    nombre = (nombre or "").strip()
+    if not nombre:
+        return {"ok": False, "mensaje": "El nombre de la variación es obligatorio"}
+    pid = _resolver_producto_id(producto, tenant_id)
+    if not pid:
+        return {"ok": False, "mensaje": "Producto no encontrado"}
+    try:
+        result = query("""
+            INSERT INTO producto_variaciones (producto_id, nombre, precio, tenant_id, foto)
+            VALUES (%s, %s, %s, %s, %s)
+            RETURNING id, nombre, precio, foto
+        """, (pid, nombre, float(precio or 0), tenant_id, foto or ""))
+    except UniqueViolation:
+        return {"ok": False, "mensaje": "Ya existe una variación con ese nombre"}
+    if not result:
+        return {"ok": False, "mensaje": "Ya existe una variación con ese nombre"}
+    v = result[0]
+    return {"ok": True, "variacion": {"id": v["id"], "nombre": v["nombre"], "precio": float(v["precio"] or 0), "foto": v.get("foto") or ""}}
+
+
+def actualizar_variacion(variacion_id: int, nombre: str, precio: float, tenant_id: str, foto: str | None = None) -> dict:
+    """Actualiza nombre y/o precio de una variación (validando pertenencia del tenant).
+    foto: None = conservar la actual; '' = quitar la foto."""
+    nombre = (nombre or "").strip()
+    if not nombre:
+        return {"ok": False, "mensaje": "El nombre de la variación es obligatorio"}
+    try:
+        result = query("""
+            UPDATE producto_variaciones
+            SET nombre = %s, precio = %s, foto = COALESCE(%s, foto)
+            WHERE id = %s AND tenant_id = %s
+            RETURNING id, nombre, precio, foto
+        """, (nombre, float(precio or 0), foto, variacion_id, tenant_id))
+    except UniqueViolation:
+        return {"ok": False, "mensaje": "Ya existe una variación con ese nombre"}
+    if not result:
+        return {"ok": False, "mensaje": "Variación no encontrada"}
+    v = result[0]
+    return {"ok": True, "variacion": {"id": v["id"], "nombre": v["nombre"], "precio": float(v["precio"] or 0), "foto": v.get("foto") or ""}}
+
+
+def eliminar_variacion(variacion_id: int, tenant_id: str) -> dict:
+    """Elimina una variación (validando pertenencia del tenant)."""
+    result = query("""
+        DELETE FROM producto_variaciones
+        WHERE id = %s AND tenant_id = %s
+        RETURNING id
+    """, (variacion_id, tenant_id))
+    if not result:
+        return {"ok": False, "mensaje": "Variación no encontrada"}
+    return {"ok": True, "id": variacion_id}
+
+
+# ==============================================================================
+# Recetas de productos compuestos (Fase 3)
+# Un compuesto (ej. hamburguesa) no tiene stock propio: al venderlo se
+# descuentan sus MATERIALES según la receta (BOM). Referencias por ID.
+# ==============================================================================
+
+
+def _adjuntar_recetas(filas: list[dict], tenant_id: str) -> None:
+    """
+    Adjunta las recetas de cada producto compuesto a una lista de filas que ya
+    contienen la llave `producto` (nombre). Muta las filas in-place añadiendo
+    `recetas` = [{id, material, cantidad, variacion_id}].
+
+    variacion_id: None = receta base; si no, receta de ESA variación.
+    Los que no son compuestos quedan con lista vacía.
+    """
+    if not filas:
+        return
+    recetas = query("""
+        SELECT c.Producto AS compuesto, r.id, m.Producto AS material, r.cantidad,
+               r.variacion_id, v.nombre AS variacion
+        FROM producto_recetas r
+        JOIN productos c ON c.id = r.producto_id
+        JOIN productos m ON m.id = r.material_id
+        LEFT JOIN producto_variaciones v ON v.id = r.variacion_id
+        WHERE c.tenant_id = %s
+        ORDER BY c.Producto ASC, v.nombre ASC NULLS FIRST, m.Producto ASC
+    """, (tenant_id,))
+    por_producto: dict = {}
+    for r in recetas:
+        por_producto.setdefault(r["compuesto"], []).append({
+            "id": r["id"],
+            "material": r["material"],
+            "cantidad": float(r["cantidad"] or 0),
+            "variacion_id": r.get("variacion_id"),
+            "variacion": r.get("variacion"),
+        })
+    for f in filas:
+        f["recetas"] = por_producto.get(f["producto"], [])
+
+
+def listar_recetas_producto(producto: str, tenant_id: str) -> list[dict]:
+    """Materiales de un compuesto (nombre + cantidad por unidad), con la
+    variación a la que pertenece cada receta (None = receta base)."""
+    pid = _resolver_producto_id(producto, tenant_id)
+    if not pid:
+        return []
+    return query("""
+        SELECT r.id, m.Producto AS material, r.cantidad, r.variacion_id,
+               v.nombre AS variacion
+        FROM producto_recetas r
+        JOIN productos m ON m.id = r.material_id
+        LEFT JOIN producto_variaciones v ON v.id = r.variacion_id
+        WHERE r.producto_id = %s AND r.tenant_id = %s
+        ORDER BY v.nombre ASC NULLS FIRST, m.Producto ASC
+    """, (pid, tenant_id))
+
+
+def agregar_material_receta(producto: str, material: str, cantidad: float, tenant_id: str, variacion_id: int | None = None) -> dict:
+    """
+    Añade (o actualiza la cantidad de) un material a la receta de un compuesto.
+
+    variacion_id:
+      None → receta BASE (se usa si la variación vendida no tiene receta propia)
+      {id} → receta específica de esa variación (ej. Hamburguesa Doble usa 200g)
+
+    Unicidad por índices parciales: (compuesto+material) para la base y
+    (compuesto+variación+material) para cada variación.
+    """
+    producto = (producto or "").strip()
+    material = (material or "").strip()
+    cantidad = float(cantidad or 0)
+    if not producto or not material:
+        return {"ok": False, "mensaje": "El compuesto y el material son obligatorios"}
+    if cantidad <= 0:
+        return {"ok": False, "mensaje": "La cantidad debe ser mayor a 0"}
+    pid = _resolver_producto_id(producto, tenant_id)
+    mid = _resolver_producto_id(material, tenant_id)
+    if not pid:
+        return {"ok": False, "mensaje": "Compuesto no encontrado"}
+    if not mid:
+        return {"ok": False, "mensaje": "Material no encontrado"}
+    if pid == mid:
+        return {"ok": False, "mensaje": "Un producto no puede ser material de sí mismo"}
+    if variacion_id is not None:
+        # Validar que la variación existe y pertenece a este compuesto + tenant
+        var = query(
+            "SELECT 1 FROM producto_variaciones WHERE id = %s AND producto_id = %s AND tenant_id = %s",
+            (variacion_id, pid, tenant_id)
+        )
+        if not var:
+            return {"ok": False, "mensaje": "La variación no pertenece a este compuesto"}
+
+    # ¿Ya existe este material para (compuesto, variación)? → actualizar cantidad
+    existente = query("""
+        SELECT id FROM producto_recetas
+        WHERE producto_id = %s AND material_id = %s AND tenant_id = %s
+          AND variacion_id IS NOT DISTINCT FROM %s
+        LIMIT 1
+    """, (pid, mid, tenant_id, variacion_id))
+    if existente:
+        result = query("""
+            UPDATE producto_recetas SET cantidad = %s
+            WHERE id = %s AND tenant_id = %s
+            RETURNING id, cantidad
+        """, (cantidad, existente[0]["id"], tenant_id))
+    else:
+        try:
+            result = query("""
+                INSERT INTO producto_recetas (producto_id, material_id, cantidad, tenant_id, variacion_id)
+                VALUES (%s, %s, %s, %s, %s)
+                RETURNING id, cantidad
+            """, (pid, mid, cantidad, tenant_id, variacion_id))
+        except UniqueViolation:
+            # Carrera (TOCTOU): otro request insertó el mismo material entre el
+            # SELECT y el INSERT → convertir en UPDATE (upsert atómico)
+            result = query("""
+                UPDATE producto_recetas SET cantidad = %s
+                WHERE producto_id = %s AND material_id = %s AND tenant_id = %s
+                  AND variacion_id IS NOT DISTINCT FROM %s
+                RETURNING id, cantidad
+            """, (cantidad, pid, mid, tenant_id, variacion_id))
+    if not result:
+        return {"ok": False, "mensaje": "Error al guardar el material"}
+    return {"ok": True, "material": material, "cantidad": float(result[0]["cantidad"] or 0)}
+
+
+def actualizar_material_receta(receta_id: int, cantidad: float, tenant_id: str) -> dict:
+    """Actualiza la cantidad de un material en la receta (validando tenant)."""
+    cantidad = float(cantidad or 0)
+    if cantidad <= 0:
+        return {"ok": False, "mensaje": "La cantidad debe ser mayor a 0"}
+    result = query("""
+        UPDATE producto_recetas
+        SET cantidad = %s
+        WHERE id = %s AND tenant_id = %s
+        RETURNING id, cantidad
+    """, (cantidad, receta_id, tenant_id))
+    if not result:
+        return {"ok": False, "mensaje": "Material no encontrado en la receta"}
+    return {"ok": True, "id": receta_id, "cantidad": float(result[0]["cantidad"] or 0)}
+
+
+def eliminar_material_receta(receta_id: int, tenant_id: str) -> dict:
+    """Elimina un material de la receta (validando tenant)."""
+    result = query("""
+        DELETE FROM producto_recetas
+        WHERE id = %s AND tenant_id = %s
+        RETURNING id
+    """, (receta_id, tenant_id))
+    if not result:
+        return {"ok": False, "mensaje": "Material no encontrado en la receta"}
+    return {"ok": True, "id": receta_id}

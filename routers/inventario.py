@@ -86,7 +86,11 @@ from database.lotes import (
     get_lotes, get_productos_meta, get_inventario_consolidado,
     get_detalle_lotes, agregar_lote, actualizar_producto, actualizar_lote,
     eliminar_categoria_de_productos, listar_categorias, renombrar_categoria,
-    crear_categoria, eliminar_lote, toggle_visibilidad_categoria
+    crear_categoria, eliminar_lote, toggle_visibilidad_categoria,
+    listar_variaciones_producto, crear_variacion, actualizar_variacion,
+    eliminar_variacion,
+    listar_recetas_producto, agregar_material_receta, actualizar_material_receta,
+    eliminar_material_receta
 )
 from database.conexion import query, execute
 from pydantic import Field
@@ -101,7 +105,7 @@ class NuevoProducto(BaseModel):
     descripcion    : str  = ""
     costo          : float
     precio_venta   : float
-    stock          : int
+    stock          : float
     imagen         : str  = "No hay foto"
     categoria      : list[str]  = ["General"]
     codigo_interno : Optional[str] = None
@@ -109,12 +113,15 @@ class NuevoProducto(BaseModel):
     ubicacion      : Optional[str] = None
     etiqueta       : Optional[str] = None  # Presentación del lote inicial (ej. "20cm", "Premium")
     sufijo_precio  : Optional[str] = None  # Sufijo del precio en el catálogo ("c/u", "por kilo", libre)
+    tipo_producto  : str = "stock"        # 'stock' (normal) | 'servicio' (sin inventario)
+    costo_servicio : Optional[float] = None
+    precio_servicio: Optional[float] = None
 
 class Restock(BaseModel):
     producto    : str
     costo       : float
     precio_venta: float
-    stock       : int
+    stock       : float
     etiqueta    : Optional[str] = None  # Presentación del nuevo lote (ej. "20cm", "Premium")
 
 class ActualizarProducto(BaseModel):
@@ -130,11 +137,14 @@ class ActualizarProducto(BaseModel):
     ubicacion           : Optional[str] = None
     visible_en_catalogo : Optional[bool] = None
     sufijo_precio       : Optional[str] = None  # Sufijo del precio en el catálogo ("c/u", "por kilo", libre)
+    tipo_producto       : Optional[str] = None  # 'stock' | 'servicio'
+    costo_servicio      : Optional[float] = None
+    precio_servicio     : Optional[float] = None
 
 class ActualizarLote(BaseModel):
     costo       : float
     precio_venta: float
-    stock       : int
+    stock       : float
     etiqueta    : Optional[str] = None  # Presentación del lote (opcional)
 
 class CrearCategoria(BaseModel):
@@ -145,6 +155,26 @@ class RenombrarCategoria(BaseModel):
 
 class BorrarImagen(BaseModel):
     url: str = Field(..., description="URL de Cloudinary a borrar (imagen reemplazada o eliminada)")
+
+class NuevaVariacion(BaseModel):
+    producto: str = Field(..., description="Nombre del producto al que pertenece la variación")
+    nombre  : str = Field(..., description="Nombre de la variación (ej. 'Doble', 'S', 'Premium')")
+    precio  : float = Field(0, description="Precio propio de la variación")
+    foto    : str = Field("", description="URL de Cloudinary de la foto propia de la variación (opcional)")
+
+class ActualizarVariacion(BaseModel):
+    nombre : str = Field(..., description="Nuevo nombre de la variación")
+    precio : float = Field(0, description="Nuevo precio de la variación")
+    foto   : Optional[str] = Field(None, description="URL de la foto; None = conservar, '' = quitar")
+
+class NuevoMaterialReceta(BaseModel):
+    producto : str = Field(..., description="Nombre del producto compuesto (el que se vende)")
+    material : str = Field(..., description="Nombre del material que consume (producto de stock)")
+    cantidad : float = Field(1, description="Cantidad de material por unidad del compuesto (permite 0.5, 150, etc.)")
+    variacion_id : Optional[int] = Field(None, description="Id de la variación a la que pertenece esta receta; None = receta base")
+
+class ActualizarMaterialReceta(BaseModel):
+    cantidad : float = Field(..., description="Nueva cantidad de material por unidad")
 
 class ActualizarPerfil(BaseModel):
     modo_precio_sugerido: Optional[str] = None  # 'antiguo' | 'maximo' | 'reciente'
@@ -234,7 +264,10 @@ def crear_producto(data: NuevoProducto, tenant_id: str = Depends(get_tenant_id))
         codigo_barras=data.codigo_barras,
         ubicacion=data.ubicacion,
         etiqueta=data.etiqueta,
-        sufijo_precio=data.sufijo_precio
+        sufijo_precio=data.sufijo_precio,
+        tipo_producto=data.tipo_producto,
+        costo_servicio=data.costo_servicio,
+        precio_servicio=data.precio_servicio
     )
 
 
@@ -335,10 +368,11 @@ def borrar_imagen(data: BorrarImagen, tenant_id: str = Depends(get_tenant_id)):
         fila = query(
             "SELECT 1 FROM productos WHERE Imagen=%s AND Tenant_ID=%s "
             "UNION SELECT 1 FROM producto_imagenes WHERE url=%s AND tenant_id=%s "
+            "UNION SELECT 1 FROM producto_variaciones WHERE foto=%s AND tenant_id=%s "
             "UNION SELECT 1 FROM tenants WHERE id=%s AND logo=%s "
             "UNION SELECT 1 FROM catalogo_config WHERE tenant_id=%s AND (banner_url=%s OR banner_url_movil=%s) "
             "LIMIT 1",
-            (url, tenant_id, url, tenant_id, tenant_id, url, tenant_id, url, url)
+            (url, tenant_id, url, tenant_id, url, tenant_id, tenant_id, url, tenant_id, url, url)
         )
         if not fila:
             return {"ok": False, "mensaje": "La imagen no pertenece a este tenant"}
@@ -370,7 +404,10 @@ def editar_producto(producto: str, data: ActualizarProducto, tenant_id: str = De
         codigo_barras=data.codigo_barras,
         ubicacion=data.ubicacion,
         visible_en_catalogo=data.visible_en_catalogo,
-        sufijo_precio=data.sufijo_precio
+        sufijo_precio=data.sufijo_precio,
+        tipo_producto=data.tipo_producto,
+        costo_servicio=data.costo_servicio,
+        precio_servicio=data.precio_servicio
     )
 
 
@@ -420,6 +457,123 @@ def alternar_visibilidad_catalogo(categoria: str, tenant_id: str = Depends(get_t
     Si estaba visible, se oculta; si estaba oculta, se muestra.
     """
     return toggle_visibilidad_categoria(categoria, tenant_id)
+
+
+# =============================================================================
+# ── VARIACIONES DE PRODUCTO (Fase 2) ────────────────────────────────────────
+# Una variación es una presentación con su PROPIO precio para un mismo producto
+# (ej. hamburguesa Sencilla/Doble, remera S/M/L, corte Caballero/Dama).
+# =============================================================================
+
+@router.get("/variaciones/{producto}")
+def obtener_variaciones(producto: str, tenant_id: str = Depends(get_tenant_id)):
+    """Variaciones de un producto concreto (nombre + precio propio)."""
+    return listar_variaciones_producto(producto, tenant_id)
+
+
+@router.post("/variaciones")
+def crear_variacion_endpoint(data: NuevaVariacion, tenant_id: str = Depends(get_tenant_id)):
+    """Crea una variación nueva para un producto (nombre + precio propio + foto opcional)."""
+    return crear_variacion(data.producto, data.nombre, data.precio, tenant_id, foto=data.foto)
+
+
+@router.patch("/variaciones/{variacion_id}")
+def editar_variacion_endpoint(variacion_id: int, data: ActualizarVariacion, tenant_id: str = Depends(get_tenant_id)):
+    """Actualiza nombre, precio y/o foto de una variación."""
+    return actualizar_variacion(variacion_id, data.nombre, data.precio, tenant_id, foto=data.foto)
+
+
+@router.delete("/variaciones/{variacion_id}")
+def borrar_variacion_endpoint(variacion_id: int, tenant_id: str = Depends(get_tenant_id)):
+    """Elimina una variación del producto (borra también su foto de Cloudinary)."""
+    try:
+        fila = query("SELECT foto FROM producto_variaciones WHERE id=%s AND tenant_id=%s", (variacion_id, tenant_id))
+        if fila and fila[0].get("foto"):
+            borrar_imagen_cloudinary(fila[0]["foto"])
+    except Exception as e:
+        print(f"Error borrando foto de variación en Cloudinary: {e}")
+    return eliminar_variacion(variacion_id, tenant_id)
+
+
+@router.post("/variaciones/{variacion_id}/foto")
+async def subir_foto_variacion(
+    variacion_id: int,
+    foto: UploadFile = File(...),
+    tenant_id: str = Depends(get_tenant_id)
+):
+    """
+    Sube (o reemplaza) la foto propia de una variación a Cloudinary.
+    - Valida que la variación pertenezca al tenant.
+    - Sube a la carpeta "variaciones" y borra la foto anterior de Cloudinary.
+    - Devuelve {ok, url}.
+    """
+    fila = query(
+        "SELECT foto FROM producto_variaciones WHERE id=%s AND tenant_id=%s",
+        (variacion_id, tenant_id)
+    )
+    if not fila:
+        raise HTTPException(status_code=404, detail="Variación no encontrada")
+
+    contents = await foto.read()
+    if not contents or len(contents) == 0:
+        raise HTTPException(status_code=400, detail="La imagen recibida está vacía (0 bytes)")
+    tamano_kb = len(contents) / 1024
+    if tamano_kb > 1024:
+        raise HTTPException(
+            status_code=413,
+            detail=f"La imagen es demasiado grande ({tamano_kb:.0f} KB). Máximo 1024 KB."
+        )
+
+    resultado = cloudinary.uploader.upload(
+        contents,
+        folder="variaciones",
+        public_id=f"var_{variacion_id}_{uuid.uuid4().hex[:8]}",
+        quality="auto:best",
+        fetch_format="auto"
+    )
+    url = resultado.get("secure_url")
+    execute(
+        "UPDATE producto_variaciones SET foto=%s WHERE id=%s AND tenant_id=%s",
+        (url, variacion_id, tenant_id)
+    )
+
+    old = fila[0].get("foto") or ""
+    if old and old != url:
+        borrar_imagen_cloudinary(old)
+
+    return {"ok": True, "url": url}
+
+
+# =============================================================================
+# ── RECETAS DE PRODUCTOS COMPUESTOS (Fase 3) ─────────────────────────────────
+# Un compuesto (ej. hamburguesa) no tiene stock propio: al venderlo se
+# descuentan sus MATERIALES (receta/BOM). Referencias por ID (sobreviven
+# renombrados). La cantidad es REAL (permite 0.5 pan, 150g, etc.).
+# =============================================================================
+
+@router.get("/recetas/{producto}")
+def obtener_recetas(producto: str, tenant_id: str = Depends(get_tenant_id)):
+    """Materiales de un compuesto (nombre + cantidad por unidad)."""
+    return listar_recetas_producto(producto, tenant_id)
+
+
+@router.post("/recetas")
+def agregar_material_endpoint(data: NuevoMaterialReceta, tenant_id: str = Depends(get_tenant_id)):
+    """Añade (o actualiza) un material a la receta de un compuesto.
+    variacion_id opcional: None = receta base, si no = receta de esa variación."""
+    return agregar_material_receta(data.producto, data.material, data.cantidad, tenant_id, variacion_id=data.variacion_id)
+
+
+@router.patch("/recetas/{receta_id}")
+def editar_material_endpoint(receta_id: int, data: ActualizarMaterialReceta, tenant_id: str = Depends(get_tenant_id)):
+    """Actualiza la cantidad de un material en la receta."""
+    return actualizar_material_receta(receta_id, data.cantidad, tenant_id)
+
+
+@router.delete("/recetas/{receta_id}")
+def borrar_material_endpoint(receta_id: int, tenant_id: str = Depends(get_tenant_id)):
+    """Elimina un material de la receta."""
+    return eliminar_material_receta(receta_id, tenant_id)
 
 
 # =============================================================================

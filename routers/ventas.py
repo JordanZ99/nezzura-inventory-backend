@@ -16,9 +16,10 @@ router = APIRouter(prefix="/ventas", tags=["Ventas"])
 
 class ItemCarrito(BaseModel):
     producto   : str
-    cantidad   : int
+    cantidad   : float  # REAL desde la Fase 5: permite vender 0.5 kg, 150g, etc.
     precio_real: float
     id_lote    : Optional[str] = None
+    variacion  : Optional[str] = None  # Nombre de la variación vendida (ej. "Doble", "S")
 
 class Carrito(BaseModel):
     items: list[ItemCarrito]
@@ -29,7 +30,7 @@ class ActualizarVenta(BaseModel):
     # actuales de la venta antes de delegar a la lógica de negocio, evitando
     # el error 422 que ocurría cuando el frontend enviaba solo los campos modificados.
     fecha         : Optional[str]   = None
-    cantidad      : Optional[int]   = None
+    cantidad      : Optional[float] = None  # REAL desde la Fase 5 (0.5 kg, etc.)
     precio_real   : Optional[float] = None
     costo_unitario: Optional[float] = None
     total_venta   : Optional[float] = None
@@ -58,14 +59,17 @@ def cobrar_carrito(carrito: Carrito, tenant_id: str = Depends(get_tenant_id)):
             "cantidad": item.cantidad,
             "precio_real": item.precio_real,
             "id_lote": item.id_lote,
+            "variacion": item.variacion,
         }
         for item in carrito.items
     ]
 
     resultado = cobrar_carrito_atomico(items, tenant_id)
     if not resultado.get("ok"):
+        # Errores de regla de negocio (ej. compuesto sin receta) → 422;
+        # errores internos/db → 500.
         raise HTTPException(
-            status_code=500,
+            status_code=422 if resultado.get("tipo") == "validacion" else 500,
             detail=resultado.get("mensaje", "Error al cobrar el carrito"),
         )
     return resultado
@@ -94,7 +98,7 @@ def corregir_venta(venta_id: int, data: ActualizarVenta, tenant_id: str = Depend
     # 2. Construir el payload completo mezclando valores existentes + nuevos.
     #    Si el frontend envió un campo, se usa ese; si no, se conserva el actual.
     fecha          = data.fecha          if data.fecha          is not None else v["fecha"]
-    cantidad       = data.cantidad       if data.cantidad       is not None else int(v["cantidad"])
+    cantidad       = data.cantidad       if data.cantidad       is not None else float(v["cantidad"])
     precio_real    = data.precio_real    if data.precio_real    is not None else float(v["precio_real"])
     costo_unitario = data.costo_unitario if data.costo_unitario is not None else float(v["costo_unitario"])
     total_venta    = data.total_venta    if data.total_venta    is not None else float(v["total_venta"])
@@ -110,4 +114,8 @@ def corregir_venta(venta_id: int, data: ActualizarVenta, tenant_id: str = Depend
 
 @router.delete("/{venta_id}")
 def borrar_venta(venta_id: int, tenant_id: str = Depends(get_tenant_id)):
-    return eliminar_venta(venta_id, tenant_id)
+    """Anula una venta y restaura el stock (transacción única)."""
+    resultado = eliminar_venta(venta_id, tenant_id)
+    if not resultado.get("ok"):
+        raise HTTPException(status_code=400, detail=resultado.get("mensaje"))
+    return resultado
