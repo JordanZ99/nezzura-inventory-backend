@@ -360,6 +360,23 @@ def inicializar_db():
             except Exception:
                 pass
 
+            # Migración: stock por variación (022 — idempotente)
+            # lotes.variacion_id: NULL = stock del producto/base; {id} = stock
+            # EXCLUSIVO de esa variación. productos.stock_por_variacion: flag
+            # por producto (default false = variaciones comparten stock).
+            try:
+                cur.execute("ALTER TABLE lotes ADD COLUMN IF NOT EXISTS variacion_id INTEGER REFERENCES producto_variaciones(id) ON DELETE CASCADE")
+            except Exception:
+                pass
+            try:
+                cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS stock_por_variacion boolean DEFAULT false")
+            except Exception:
+                pass
+            try:
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_lotes_variacion ON lotes (Producto, variacion_id, tenant_id)")
+            except Exception:
+                pass
+
         conn.commit()
     finally:
         release_conn(conn)

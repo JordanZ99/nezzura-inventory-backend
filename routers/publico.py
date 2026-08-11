@@ -78,6 +78,9 @@ def obtener_catalogo_publico(slug: str, response: Response):
             p.Imagen                      AS imagen,
             p.sufijo_precio               AS sufijo_precio,
             p.tipo_producto               AS tipo_producto,
+            -- Fase 6: si el producto maneja stock por variación, las variaciones
+            -- traen su propio `stock` (ver query de variaciones abajo).
+            p.stock_por_variacion         AS stock_por_variacion,
             -- Servicios (sin lotes) usan su precio de servicio; productos normales el MAX de lotes
             COALESCE(MAX(l.Precio_Venta), p.precio_servicio, 0) AS precio_venta,
             CASE WHEN p.tipo_producto IN ('servicio', 'compuesto') THEN 0
@@ -87,7 +90,7 @@ def obtener_catalogo_publico(slug: str, response: Response):
         LEFT JOIN lotes l ON l.Producto = p.Producto AND l.tenant_id = p.tenant_id AND l.Estado = 'Activo'
         WHERE p.Estado = 'Activo' AND p.tenant_id = %s
         AND p.visible_en_catalogo = true
-        GROUP BY p.Producto, p.Descripcion, p.Imagen, p.sufijo_precio, p.tipo_producto, p.precio_servicio, p.id
+        GROUP BY p.Producto, p.Descripcion, p.Imagen, p.sufijo_precio, p.tipo_producto, p.precio_servicio, p.stock_por_variacion, p.id
         ORDER BY p.Producto ASC
     """, (tenant_id,))
 
@@ -109,14 +112,19 @@ def obtener_catalogo_publico(slug: str, response: Response):
     # 3b. Variaciones por producto (nombre + precio propio).
     #     Si un producto tiene variaciones, el catálogo muestra "desde $X"
     #     (precio mínimo) y el modal permite elegir la variación.
-    variaciones = query(
-        "SELECT p.Producto AS producto, v.id, v.nombre, v.precio, v.foto "
-        "FROM producto_variaciones v "
-        "JOIN productos p ON p.id = v.producto_id "
-        "WHERE p.tenant_id = %s "
-        "ORDER BY p.Producto ASC, v.nombre ASC",
-        (tenant_id,)
-    )
+    # Stock por variación (Fase 6): suma el stock de los lotes ligados a cada
+    # variación. Solo es relevante si el producto activó stock_por_variacion;
+    # si no, las variaciones comparten el stock del producto (esto queda 0).
+    variaciones = query("""
+        SELECT p.Producto AS producto, v.id, v.nombre, v.precio, v.foto,
+               COALESCE((SELECT SUM(l.Stock_Lote) FROM lotes l
+                         WHERE l.variacion_id = v.id AND l.Estado='Activo'
+                           AND l.tenant_id = v.tenant_id), 0) AS stock
+        FROM producto_variaciones v
+        JOIN productos p ON p.id = v.producto_id
+        WHERE p.tenant_id = %s
+        ORDER BY p.Producto ASC, v.nombre ASC
+    """, (tenant_id,))
     variaciones_por_producto: dict = {}
     for v in variaciones:
         variaciones_por_producto.setdefault(v["producto"], []).append({
@@ -124,6 +132,7 @@ def obtener_catalogo_publico(slug: str, response: Response):
             "nombre": v["nombre"],
             "precio": float(v["precio"] or 0),
             "foto": v.get("foto") or "",
+            "stock": float(v["stock"] or 0),
         })
 
     # Armar el campo imagenes (sin duplicados y sin "No hay foto")
