@@ -176,6 +176,7 @@ def obtener_catalogo_publico(slug: str, response: Response):
             "banner_mostrar_texto": cfg.get("banner_mostrar_texto") is not False,
             "banner_mostrar_logo": cfg.get("banner_mostrar_logo") is not False,
             "anuncio_texto": cfg.get("anuncio_texto") or "",
+            "relacion_imagen": cfg.get("relacion_imagen") or "1:1",
             "logo": cfg.get("logo") or "",
         },
         "productos": productos
