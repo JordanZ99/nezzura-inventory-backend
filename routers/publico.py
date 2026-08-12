@@ -47,7 +47,7 @@ def obtener_catalogo_publico(slug: str, response: Response):
     #    LEFT JOIN con tenants para obtener el logo personalizado del negocio.
     config_rows = query(
         "SELECT cc.tenant_id, cc.tema, cc.template, cc.titulo, cc.subtitulo, "
-        "       cc.mostrar_precios, cc.mostrar_stock, cc.mostrar_categorias, cc.agrupar_por_categoria, cc.columnas_movil, cc.permitir_descarga, cc.ocultar_agotados, "
+        "       cc.mostrar_precios, cc.mostrar_stock, cc.mostrar_categorias, cc.agrupar_por_categoria, cc.columnas_movil, cc.permitir_descarga, cc.ocultar_agotados, cc.relacion_imagen, "
         "       cc.banner_url, cc.banner_url_movil, cc.hero_estilo, cc.banner_texto_color, cc.banner_mostrar_texto, cc.banner_mostrar_logo, cc.anuncio_texto, "
         "       t.logo "
         "FROM catalogo_config cc "
