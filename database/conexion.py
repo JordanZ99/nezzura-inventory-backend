@@ -233,6 +233,7 @@ def inicializar_db():
             # Migración: mostrar el logo sobre el banner (013 — idempotente)
             try:
                 cur.execute("ALTER TABLE catalogo_config ADD COLUMN IF NOT EXISTS banner_mostrar_logo boolean DEFAULT true")
+                cur.execute("ALTER TABLE catalogo_config ADD COLUMN IF NOT EXISTS relacion_imagen text DEFAULT '1:1'")
             except Exception:
                 pass
 

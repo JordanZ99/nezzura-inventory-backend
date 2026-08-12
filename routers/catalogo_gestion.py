@@ -44,6 +44,7 @@ class ActualizarCatalogo(BaseModel):
     mostrar_categorias: Optional[bool] = None
     agrupar_por_categoria: Optional[bool] = None  # Separar productos por secciones de categoría
     columnas_movil: Optional[Literal[1, 2]] = None  # 1 o 2 productos por fila en móvil (422 si es inválido)
+    relacion_imagen: Optional[str] = None  # '1:1' | '4:5' — relación global de las fotos de producto (catálogo, POS, gestor y crops)
     permitir_descarga: Optional[bool] = None  # Permitir a los clientes descargar las fotos del catálogo
     ocultar_agotados: Optional[bool] = None  # Ocultar los productos sin stock del catálogo público
     # Hero + Anuncios (006_catalogo_hero_anuncios.sql)
@@ -64,7 +65,7 @@ def obtener_config_catalogo(tenant_id: str = Depends(get_tenant_id)):
     """
     resultado = query(
         "SELECT id, slug, activo, tema, template, titulo, subtitulo, "
-        "       mostrar_precios, mostrar_stock, mostrar_categorias, agrupar_por_categoria, columnas_movil, permitir_descarga, ocultar_agotados, "
+        "       mostrar_precios, mostrar_stock, mostrar_categorias, agrupar_por_categoria, columnas_movil, permitir_descarga, ocultar_agotados, relacion_imagen, "
         "       banner_url, banner_url_movil, hero_estilo, banner_texto_color, banner_mostrar_texto, banner_mostrar_logo, anuncio_texto, created_at "
         "FROM catalogo_config WHERE tenant_id = %s",
         (tenant_id,)
@@ -77,7 +78,7 @@ def obtener_config_catalogo(tenant_id: str = Depends(get_tenant_id)):
         )
         resultado = query(
             "SELECT id, slug, activo, tema, template, titulo, subtitulo, "
-            "       mostrar_precios, mostrar_stock, mostrar_categorias, agrupar_por_categoria, columnas_movil, ocultar_agotados, "
+            "       mostrar_precios, mostrar_stock, mostrar_categorias, agrupar_por_categoria, columnas_movil, permitir_descarga, ocultar_agotados, relacion_imagen, "
             "       banner_url, banner_url_movil, hero_estilo, banner_texto_color, banner_mostrar_texto, banner_mostrar_logo, anuncio_texto, created_at "
             "FROM catalogo_config WHERE tenant_id = %s",
             (tenant_id,)
@@ -165,6 +166,9 @@ def actualizar_config_catalogo(
     if data.anuncio_texto is not None:
         campos.append("anuncio_texto = %s")
         valores.append(data.anuncio_texto)
+    if data.relacion_imagen is not None:
+        campos.append("relacion_imagen = %s")
+        valores.append(data.relacion_imagen)
 
     if not campos:
         return {"ok": True, "mensaje": "Nada que actualizar"}
