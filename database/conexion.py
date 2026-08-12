@@ -377,6 +377,33 @@ def inicializar_db():
             except Exception:
                 pass
 
+            # Migración: producto fraccionable (023 — idempotente)
+            # true = acepta decimales al vender (kg, lt, mt, ...);
+            # false (default) = solo unidades enteras (c/u, sin sufijo, ...).
+            try:
+                cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS fraccionable boolean DEFAULT false")
+            except Exception:
+                pass
+            # Derivación inicial para productos existentes (misma lógica que la
+            # migración SQL): los sufijos de peso/volumen/longitud pasan a true.
+            try:
+                cur.execute("""
+                    UPDATE productos SET fraccionable = true
+                    WHERE COALESCE(sufijo_precio, '') <> ''
+                      AND (
+                            lower(sufijo_precio) IN ('kg', 'lt', 'mt', 'g', 'ml', 'm',
+                                                     'por kilo', 'por litro', 'por metro',
+                                                     'kilo', 'litro', 'metro')
+                         OR lower(sufijo_precio) LIKE '%kilo%'
+                         OR lower(sufijo_precio) LIKE '%litro%'
+                         OR lower(sufijo_precio) LIKE '%metro%'
+                         OR lower(sufijo_precio) LIKE '%gramo%'
+                         OR lower(sufijo_precio) LIKE '%mililitro%'
+                      )
+                """)
+            except Exception:
+                pass
+
         conn.commit()
     finally:
         release_conn(conn)

@@ -466,9 +466,10 @@ def cobrar_carrito(items: list[dict], tenant_id: str) -> dict:
             tipo = "stock"
             costo_srv = 0.0
             precio_srv = 0.0
+            fraccionable = False
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(
-                    "SELECT tipo_producto, costo_servicio, precio_servicio "
+                    "SELECT tipo_producto, costo_servicio, precio_servicio, fraccionable "
                     "FROM productos WHERE Producto = %s AND tenant_id = %s",
                     (item["producto"], tenant_id)
                 )
@@ -477,8 +478,20 @@ def cobrar_carrito(items: list[dict], tenant_id: str) -> dict:
                     tipo = fila.get("tipo_producto") or "stock"
                     costo_srv = float(fila.get("costo_servicio") or 0)
                     precio_srv = float(fila.get("precio_servicio") or 0)
+                    fraccionable = bool(fila.get("fraccionable"))
 
             variacion = str(item.get("variacion") or "").strip()
+
+            # Validación de cantidad fraccionaria: si el producto NO está
+            # marcado como fraccionable (por defecto), solo se vende por
+            # unidades enteras. Así un llavero nunca se vende a 0.5, aunque se
+            # intente por API (protección real, no solo UX).
+            cantidad_item = float(item["cantidad"])
+            if not fraccionable and cantidad_item != int(cantidad_item):
+                raise ValueError(
+                    f"'{item['producto']}' solo se vende por unidades enteras. "
+                    "Corrige la cantidad e inténtalo de nuevo."
+                )
 
             if tipo == "compuesto":
                 # ── Compuesto: consume stock de sus MATERIALES (receta BOM) ──
