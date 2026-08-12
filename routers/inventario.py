@@ -8,6 +8,7 @@ from pydantic import BaseModel
 from typing import Optional
 from dependencies import get_tenant_id
 import os, uuid, re
+from urllib.parse import unquote
 
 # ── Integración con Cloudinary ──────────────────────────────────────────────
 # Cloudinary reemplaza el almacenamiento local en disco.
@@ -61,7 +62,11 @@ def _extraer_public_id(url: str) -> str | None:
             else:
                 break
         public_id = "/".join(segmentos[i:]).rsplit(".", 1)[0]
-        return public_id or None
+        # Decodificar caracteres URL-encoded: los public_id se generan con el
+        # nombre del producto (ej. 'Tortilla de maíz'), así que la URL guardada
+        # trae %20 / %C3%AD en vez de espacios/acentos. Sin este decode,
+        # destroy() recibe un public_id que no existe y falla en silencio.
+        return unquote(public_id) or None
     except Exception:
         return None
 
@@ -78,7 +83,13 @@ def borrar_imagen_cloudinary(url: str | None) -> None:
     if not public_id:
         return
     try:
-        cloudinary.uploader.destroy(public_id)
+        resultado = cloudinary.uploader.destroy(public_id)
+        estado = (resultado or {}).get("result")
+        # 'ok' = borrada. Cualquier otro estado ('not_found', 'error', ...) se
+        # loguea: así dejamos de fallar en silencio y detectamos public_ids mal
+        # extraídos o fotos ya borradas (refs duplicadas). Nunca bloquea el flujo.
+        if estado and estado != "ok":
+            print(f"Cloudinary: destroy devolvió '{estado}' para {public_id} (url: {url})")
     except Exception as e:
         print(f"Error borrando imagen de Cloudinary ({public_id}): {e}")
 
