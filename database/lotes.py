@@ -1344,10 +1344,16 @@ def listar_variaciones_producto(producto: str, tenant_id: str) -> list[dict]:
     """, (pid, tenant_id))
 
 
-def crear_variacion(producto: str, nombre: str, precio: float, tenant_id: str, foto: str = "") -> dict:
+def crear_variacion(producto: str, nombre: str, precio: float, tenant_id: str, foto: str = "", stock_inicial: float | None = None, costo: float | None = None) -> dict:
     """
     Crea una variación nueva para un producto.
     Si ya existe una variación con el mismo nombre, devuelve error (UNIQUE).
+
+    Si stock_inicial > 0 y el producto es de tipo 'stock', crea el LOTE de esa
+    variación (costo propio opcional; si se omite usa 0) y activa
+    stock_por_variacion — misma semántica que el ALTA de producto, para que
+    una variación agregada en edición pueda nacer con stock en lugar de
+    aparecer "Agotado" sin forma de darle inventario.
     """
     producto = (producto or "").strip()
     nombre = (nombre or "").strip()
@@ -1367,7 +1373,27 @@ def crear_variacion(producto: str, nombre: str, precio: float, tenant_id: str, f
     if not result:
         return {"ok": False, "mensaje": "Ya existe una variación con ese nombre"}
     v = result[0]
-    return {"ok": True, "variacion": {"id": v["id"], "nombre": v["nombre"], "precio": float(v["precio"] or 0), "foto": v.get("foto") or ""}}
+
+    # Lote inicial de la variación (espejo del ALTA): solo si trae stock y el
+    # producto es de tipo stock. Activa stock_por_variacion de una vez.
+    stock_final = 0
+    if float(stock_inicial or 0) > 0:
+        tipo_row = query(
+            "SELECT tipo_producto FROM productos WHERE id = %s AND tenant_id = %s",
+            (pid, tenant_id))
+        es_stock = (tipo_row[0].get("tipo_producto") or "stock") == "stock" if tipo_row else True
+        if es_stock:
+            stock_final = float(stock_inicial)
+            costo_lote = float(costo or 0) or 0
+            query("""
+                INSERT INTO lotes (ID_Lote, Producto, Costo, Precio_Venta,
+                                   Stock_Lote, Fecha_Entrada, Estado, tenant_id, variacion_id)
+                VALUES (%s, %s, %s, %s, %s, %s, 'Activo', %s, %s)
+            """, (str(uuid.uuid4())[:12], producto, costo_lote, float(precio or 0),
+                  stock_final, str(datetime.datetime.now(_TZ)), tenant_id, v["id"]))
+            query("UPDATE productos SET stock_por_variacion=true WHERE id=%s", (pid,))
+
+    return {"ok": True, "variacion": {"id": v["id"], "nombre": v["nombre"], "precio": float(v["precio"] or 0), "foto": v.get("foto") or "", "stock": stock_final}}
 
 
 def actualizar_variacion(variacion_id: int, nombre: str, precio: float, tenant_id: str, foto: str | None = None) -> dict:
