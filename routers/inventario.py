@@ -93,6 +93,106 @@ def borrar_imagen_cloudinary(url: str | None) -> None:
     except Exception as e:
         print(f"Error borrando imagen de Cloudinary ({public_id}): {e}")
 
+
+def _url_sigue_referenciada(url: str, tenant_id: str) -> bool:
+    """
+    True si la URL todavía está referenciada en alguna tabla del tenant
+    (producto, galería, variación, logo o banner).
+
+    Se consulta ANTES de destruir un asset en Cloudinary: nunca se borra una
+    imagen que sigue en uso. Esto evita la clase de bug donde una misma URL
+    compartida entre productos.imagen y producto_imagenes se destruía y
+    dejaba fotos rotas (negras) en el catálogo público.
+
+    Ante un error de BD devuelve True (ante la duda, no borrar).
+    """
+    if not url or "res.cloudinary.com" not in url:
+        return False
+    try:
+        fila = query(
+            "SELECT 1 FROM productos WHERE Imagen=%s AND tenant_id=%s "
+            "UNION SELECT 1 FROM producto_imagenes WHERE url=%s AND tenant_id=%s "
+            "UNION SELECT 1 FROM producto_variaciones WHERE foto=%s AND tenant_id=%s "
+            "UNION SELECT 1 FROM tenants WHERE id=%s AND logo=%s "
+            "UNION SELECT 1 FROM catalogo_config WHERE tenant_id=%s AND (banner_url=%s OR banner_url_movil=%s) "
+            "LIMIT 1",
+            (url, tenant_id, url, tenant_id, url, tenant_id, tenant_id, url, tenant_id, url, url)
+        )
+        return bool(fila)
+    except Exception as e:
+        print(f"Error comprobando si la URL sigue referenciada: {e}")
+        return True
+
+
+def _sincronizar_principal_galeria(producto_id: int, nueva_url: str, tenant_id: str) -> None:
+    """
+    Mantiene la foto principal (productos.imagen) reflejada en la galería
+    (producto_imagenes, orden 1) para tenants Plus.
+
+    Así la principal es UNA SOLA fila con id dentro de la galería: el editor
+    no la duplica y el reordenamiento no la pisa con una URL vieja.
+
+    Casos:
+      - nueva_url vacía o "No hay foto": se elimina la fila de orden 1 (la
+        galería promueve la siguiente al borrarla).
+      - La URL ya existe en OTRA posición (el usuario arrastró una foto al
+        primer puesto): se intercambian (swap) la fila de orden 1 y la que ya
+        tenía esa URL, para que ninguna foto se pierda.
+      - No existe fila de orden 1: se inserta; si existe, se actualiza.
+    """
+    if not nueva_url or nueva_url == "No hay foto":
+        execute(
+            "DELETE FROM producto_imagenes WHERE producto_id=%s AND tenant_id=%s AND orden=1",
+            (producto_id, tenant_id)
+        )
+        return
+
+    fila1 = query(
+        "SELECT id, url FROM producto_imagenes "
+        "WHERE producto_id=%s AND tenant_id=%s AND orden=1",
+        (producto_id, tenant_id)
+    )
+    if fila1 and fila1[0].get("url") == nueva_url:
+        return  # ya sincronizada
+
+    fila_otra = query(
+        "SELECT id FROM producto_imagenes "
+        "WHERE producto_id=%s AND tenant_id=%s AND url=%s AND orden != 1",
+        (producto_id, tenant_id, nueva_url)
+    )
+    if fila_otra:
+        if fila1:
+            # Swap: la fila 1 pasa a la URL nueva; la fila que la tenía
+            # recupera la URL anterior de la principal (rotación, sin perder
+            # ninguna foto).
+            execute(
+                "UPDATE producto_imagenes SET url=%s WHERE id=%s",
+                (nueva_url, fila1[0]["id"])
+            )
+            execute(
+                "UPDATE producto_imagenes SET url=%s WHERE id=%s",
+                (fila1[0]["url"], fila_otra[0]["id"])
+            )
+        else:
+            # No hay fila 1: la fila que ya tiene la URL sube a orden 1
+            execute(
+                "UPDATE producto_imagenes SET orden=1 WHERE id=%s",
+                (fila_otra[0]["id"],)
+            )
+        return
+
+    if fila1:
+        execute(
+            "UPDATE producto_imagenes SET url=%s WHERE id=%s",
+            (nueva_url, fila1[0]["id"])
+        )
+    else:
+        execute(
+            "INSERT INTO producto_imagenes (producto_id, tenant_id, url, orden) "
+            "VALUES (%s, %s, %s, 1)",
+            (producto_id, tenant_id, nueva_url)
+        )
+
 from database.lotes import (
     get_lotes, get_productos_meta, get_inventario_consolidado,
     get_detalle_lotes, agregar_lote, crear_producto_completo, actualizar_producto,
@@ -445,19 +545,22 @@ def borrar_imagen(data: BorrarImagen, tenant_id: str = Depends(get_tenant_id)):
 @router.patch("/{producto}")
 def editar_producto(producto: str, data: ActualizarProducto, tenant_id: str = Depends(get_tenant_id)):
     """Actualiza metadatos (descripción, imagen, estado) de un producto."""
-    # Intentar borrar la imagen anterior de Cloudinary si se reemplazó.
-    # Esto evita acumular fotos huérfanas en el CDN (que cuestan almacenamiento).
+    # Foto anterior: se lee ANTES del update (scoped al tenant) para poder
+    # borrarla de Cloudinary SOLO si el guardado tiene éxito, la imagen cambió
+    # y la URL dejó de estar referenciada. Nunca se destruye un asset que sigue
+    # en uso (evita la clase de fotos rotas del catálogo público).
+    old_url = None
     try:
-        old_meta = query("SELECT Imagen as imagen FROM productos WHERE Producto=%s", (producto,))
+        old_meta = query(
+            "SELECT Imagen as imagen FROM productos WHERE Producto=%s AND tenant_id=%s",
+            (producto, tenant_id)
+        )
         if old_meta:
             old_url = old_meta[0]["imagen"]
-            # Solo intentamos borrar si la URL vieja era de Cloudinary y cambió.
-            if old_url and old_url != data.imagen:
-                borrar_imagen_cloudinary(old_url)
     except Exception as e:
-        print(f"Error interno borrando foto antigua de Cloudinary: {e}")
+        print(f"Error leyendo foto actual del producto: {e}")
 
-    return actualizar_producto(
+    resultado = actualizar_producto(
         producto, data.descripcion, data.imagen, data.estado, data.categoria,
         data.costo, data.precio_venta, tenant_id,
         nuevo_producto=data.producto,
@@ -472,6 +575,29 @@ def editar_producto(producto: str, data: ActualizarProducto, tenant_id: str = De
         precio_servicio=data.precio_servicio,
         stock_por_variacion=data.stock_por_variacion
     )
+
+    # ── Sincronizar la foto principal con la galería (plan Plus) ──
+    # La principal vive en productos.imagen y también debe reflejarse en
+    # producto_imagenes (orden 1). Así el editor la ve como una foto con id
+    # y el reordenamiento no la pisa con una URL vieja.
+    nueva_img = (data.imagen or "").strip()
+    try:
+        if _get_tenant_plan(tenant_id) == "plus":
+            fila_id = query(
+                "SELECT id FROM productos WHERE Producto = %s AND tenant_id = %s",
+                (resultado.get("producto") or producto, tenant_id)
+            )
+            if fila_id:
+                _sincronizar_principal_galeria(fila_id[0]["id"], nueva_img, tenant_id)
+    except Exception as e:
+        print(f"Error sincronizando foto principal con la galería: {e}")
+
+    # Borrar la foto anterior SOLO si el guardado tuvo éxito, la imagen cambió
+    # y la URL quedó huérfana (ya no está referenciada en ninguna tabla).
+    if old_url and old_url != nueva_img and not _url_sigue_referenciada(old_url, tenant_id):
+        borrar_imagen_cloudinary(old_url)
+
+    return resultado
 
 
 @router.patch("/lote/{id_lote}")
@@ -766,28 +892,41 @@ async def subir_imagen_extra(
             raise HTTPException(status_code=400, detail="orden_target debe estar entre 1 y 5")
         nueva_orden = orden_target
 
-        # Borrar la imagen existente en ese orden de Cloudinary + DB
+        # La imagen que ocupa ese orden (si existe) se borra SOLO después de
+        # subir la nueva (paso 8): si la subida falla, la foto vieja se
+        # conserva en Cloudinary y en la BD (no se pierde nada).
         existente = query(
             "SELECT id, url FROM producto_imagenes "
             "WHERE producto_id = %s AND tenant_id = %s AND orden = %s",
             (producto_id, tenant_id, nueva_orden)
         )
-        if existente:
-            old_url = existente[0]["url"]
-            borrar_imagen_cloudinary(old_url)
-            execute(
-                "DELETE FROM producto_imagenes WHERE id = %s",
-                (existente[0]["id"],)
-            )
+        reemplazo_id = existente[0]["id"] if existente else None
+        reemplazo_url_anterior = existente[0]["url"] if existente else None
     else:
-        # Inserción nueva: calcular siguiente slot disponible
+        # Inserción nueva: calcular siguiente slot disponible.
+        # El slot 1 está RESERVADO para la foto principal: si el producto ya
+        # tiene foto en productos.imagen, las extras solo ocupan slots 2-5.
+        # (Antes la primera extra tomaba el slot 1 y SOBREESCRIBÍA la foto
+        #  principal — el bug por el que "la foto 2 reemplazaba a la 1".)
+        tiene_principal = False
+        fila_prod = query(
+            "SELECT Imagen FROM productos WHERE id = %s AND tenant_id = %s",
+            (producto_id, tenant_id)
+        )
+        if fila_prod:
+            img = fila_prod[0].get("Imagen") or ""
+            tiene_principal = bool(img) and img != "No hay foto"
+
         conteo = query(
             "SELECT COUNT(*) as total FROM producto_imagenes "
             "WHERE producto_id = %s AND tenant_id = %s",
             (producto_id, tenant_id)
         )
         total_actual = conteo[0]["total"] if conteo else 0
-        if total_actual >= 5:
+        # Un producto está lleno cuando la galería completa (incluyendo la
+        # principal, que vive en productos.imagen) suma 5.
+        total_fotos = total_actual + (1 if tiene_principal else 0)
+        if total_fotos >= 5:
             raise HTTPException(
                 status_code=403,
                 detail="Este producto ya tiene 5 imágenes. Elimina una antes de subir otra."
@@ -799,11 +938,19 @@ async def subir_imagen_extra(
             (producto_id, tenant_id)
         )
         ordenes_usadas = {r["orden"] for r in ordenes}
-        nueva_orden = 1
-        for i in range(1, 6):
+        inicio = 2 if tiene_principal else 1
+        nueva_orden = None
+        for i in range(inicio, 6):
             if i not in ordenes_usadas:
                 nueva_orden = i
                 break
+        if nueva_orden is None:
+            raise HTTPException(
+                status_code=403,
+                detail="Este producto ya tiene 5 imágenes. Elimina una antes de subir otra."
+            )
+        reemplazo_id = None
+        reemplazo_url_anterior = None
 
     # 5. Subir a Cloudinary en la carpeta "productos/galeria"
     resultado = cloudinary.uploader.upload(
@@ -815,12 +962,19 @@ async def subir_imagen_extra(
     )
     url = resultado.get("secure_url")
 
-    # 6. Insertar en la base de datos
-    execute(
-        "INSERT INTO producto_imagenes (producto_id, tenant_id, url, orden) "
-        "VALUES (%s, %s, %s, %s)",
-        (producto_id, tenant_id, url, nueva_orden)
-    )
+    # 6. Guardar en la base de datos: si es reemplazo, actualizamos la fila
+    #    existente (mismo id, mismo orden); si es foto nueva, INSERT.
+    if reemplazo_id is not None:
+        execute(
+            "UPDATE producto_imagenes SET url = %s WHERE id = %s",
+            (url, reemplazo_id)
+        )
+    else:
+        execute(
+            "INSERT INTO producto_imagenes (producto_id, tenant_id, url, orden) "
+            "VALUES (%s, %s, %s, %s)",
+            (producto_id, tenant_id, url, nueva_orden)
+        )
 
     # 7. Sincronizar productos.imagen si la orden es 1 (la principal)
     if nueva_orden == 1:
@@ -828,6 +982,10 @@ async def subir_imagen_extra(
             "UPDATE productos SET Imagen = %s WHERE id = %s AND tenant_id = %s",
             (url, producto_id, tenant_id)
         )
+
+    # 8. Borrar la imagen anterior de Cloudinary SOLO tras subir la nueva
+    if reemplazo_url_anterior and reemplazo_url_anterior != url:
+        borrar_imagen_cloudinary(reemplazo_url_anterior)
 
     return {"ok": True, "url": url, "orden": nueva_orden}
 
