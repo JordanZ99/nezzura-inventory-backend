@@ -441,6 +441,12 @@ def agregar_lote(
         tipo = "stock"
     costo_srv = float(costo_servicio or 0)
     precio_srv = float(precio_servicio or 0)
+    # ¿El producto ya existía? Las categorías solo se sincronizan al CREAR un
+    # producto nuevo; en un restock de un producto existente NO se tocan (el
+    # default ["General"] antes borraba las categorías en cada restock — bug).
+    producto_existia = bool(query(
+        "SELECT 1 FROM productos WHERE Producto = %s AND tenant_id = %s",
+        (producto, tenant_id)))
     result = query("""
         INSERT INTO productos (Producto, Descripcion, Imagen, Estado, tenant_id,
                                codigo_interno, codigo_barras, ubicacion, sufijo_precio,
@@ -469,8 +475,11 @@ def agregar_lote(
 
     product_id = result[0]["id"]
 
-    # Sincronizar categorías en la tabla pivote (Many-to-Many)
-    _sincronizar_categorias(product_id, categoria, tenant_id)
+    # Sincronizar categorías SOLO si el producto es nuevo: el restock de un
+    # producto existente conserva las categorías que ya tenía (evita que el
+    # default ["General"] las borre en cada restock).
+    if not producto_existia:
+        _sincronizar_categorias(product_id, categoria, tenant_id)
 
     # ── Servicio/Compuesto: no tienen inventario propio → no se crea lote ──
     if tipo == "servicio":
