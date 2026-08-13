@@ -339,6 +339,8 @@ class NuevaVariacion(BaseModel):
     nombre  : str = Field(..., description="Nombre de la variación (ej. 'Doble', 'S', 'Premium')")
     precio  : float = Field(0, description="Precio propio de la variación")
     foto    : str = Field("", description="URL de Cloudinary de la foto propia de la variación (opcional)")
+    stock_inicial: Optional[float] = Field(None, description="Stock inicial propio de esta variación (crea su lote y activa stock por variación)")
+    costo   : Optional[float] = Field(None, description="Costo del lote inicial (si se omite, usa 0)")
 
 class ActualizarVariacion(BaseModel):
     nombre : str = Field(..., description="Nuevo nombre de la variación")
@@ -719,8 +721,9 @@ def obtener_variaciones(producto: str, tenant_id: str = Depends(get_tenant_id)):
 
 @router.post("/variaciones")
 def crear_variacion_endpoint(data: NuevaVariacion, tenant_id: str = Depends(get_tenant_id)):
-    """Crea una variación nueva para un producto (nombre + precio propio + foto opcional)."""
-    return crear_variacion(data.producto, data.nombre, data.precio, tenant_id, foto=data.foto)
+    """Crea una variación nueva para un producto (nombre + precio propio + foto opcional).
+    Si stock_inicial > 0, crea el lote de la variación (como en el ALTA)."""
+    return crear_variacion(data.producto, data.nombre, data.precio, tenant_id, foto=data.foto, stock_inicial=data.stock_inicial, costo=data.costo)
 
 
 @router.patch("/variaciones/{variacion_id}")
