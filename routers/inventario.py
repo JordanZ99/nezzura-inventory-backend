@@ -30,6 +30,50 @@ cloudinary.config(
 )
 
 
+_TRANSFORM_RE = re.compile(r"^[a-z]{1,4}_[\w:.%+-]+$", re.IGNORECASE)
+
+
+def _es_segmento_transformacion(seg: str) -> bool:
+    """
+    True si el segmento es una cadena de transformación de Cloudinary:
+    una o más claves "param_valor" separadas por coma (ej. "w_600,c_fill,q_auto").
+
+    IMPORTANTE: un public_id cuyo nombre contiene comas (ej. "Pizza, especial_ab12")
+    NO se considera transformación. Antes se saltaba cualquier segmento con coma
+    y destroy() recibía un public_id incompleto, fallando en silencio y dejando
+    la foto para siempre en Cloudinary.
+    """
+    if not seg:
+        return False
+    return all(bool(_TRANSFORM_RE.match(p)) for p in seg.split(","))
+
+
+def _es_imagen_valida(contenido: bytes) -> bool:
+    """
+    Valida los "magic bytes" del archivo para aceptar solo imágenes reales
+    (JPG, PNG, GIF, WebP, BMP, AVIF/HEIC). El frontend siempre comprime a
+    JPEG antes de subir; esto es una red de seguridad contra llamadas directas
+    a la API con archivos que no son imágenes.
+    """
+    if not contenido or len(contenido) < 12:
+        return False
+    if contenido[:3] == b"\xff\xd8\xff":                 # JPEG
+        return True
+    if contenido[:8] == b"\x89PNG\r\n\x1a\n":            # PNG
+        return True
+    if contenido[:6] in (b"GIF87a", b"GIF89a"):          # GIF
+        return True
+    if contenido[:4] == b"RIFF" and contenido[8:12] == b"WEBP":  # WebP
+        return True
+    if contenido[:2] == b"BM":                            # BMP
+        return True
+    if contenido[4:8] == b"ftyp":                        # AVIF / HEIC (ISO-BMFF)
+        marca = contenido[8:16]
+        if any(b in marca for b in (b"avif", b"avis", b"heic", b"heix", b"mif1", b"heim", b"heis")):
+            return True
+    return False
+
+
 def _extraer_public_id(url: str) -> str | None:
     """
     Extrae el public_id de una URL de Cloudinary, manejando prefijos de
@@ -51,13 +95,12 @@ def _extraer_public_id(url: str) -> str | None:
         if "?" in ruta:
             ruta = ruta.split("?", 1)[0]
         segmentos = ruta.split("/")
-        # Saltar prefijos de transformación y de versión (v123/)
+        # Saltar prefijos de transformación y de versión (v123/). El último
+        # segmento (public_id.ext) nunca se salta: es la foto en sí.
         i = 0
         while i < len(segmentos) - 1:
             seg = segmentos[i]
-            if re.match(r"^v\d+$", seg) or "," in seg or re.match(
-                r"^(f_|q_|w_|c_|e_|t_|dpr_|g_|r_|o_|a_|x_|y_|fl_|l_|if_|b_)", seg
-            ):
+            if re.match(r"^v\d+$", seg) or _es_segmento_transformacion(seg):
                 i += 1
             else:
                 break
@@ -204,7 +247,8 @@ from database.lotes import (
     listar_recetas_producto, agregar_material_receta, actualizar_material_receta,
     eliminar_material_receta
 )
-from database.conexion import query, execute
+from database.conexion import query, execute, get_conn, release_conn
+from psycopg2.extras import RealDictCursor
 from pydantic import Field
 from dependencies import validar_sesion
 
@@ -465,6 +509,13 @@ async def subir_foto(producto: str, foto: UploadFile = File(...), tenant_id: str
         if not contents or len(contents) == 0:
             raise HTTPException(status_code=400, detail="La imagen recibida está vacía (0 bytes)")
 
+        # Validar magic bytes: solo se aceptan imágenes reales
+        if not _es_imagen_valida(contents):
+            raise HTTPException(
+                status_code=400,
+                detail="El archivo no es una imagen válida (solo JPG, PNG, GIF, WebP, BMP, AVIF o HEIC)."
+            )
+
         # Obtenemos el tamaño en kilobytes para validación
         tamano_kb = len(contents) / 1024
 
@@ -481,6 +532,12 @@ async def subir_foto(producto: str, foto: UploadFile = File(...), tenant_id: str
                        "antes de subirlas para evitar este error."
             )
 
+        # Los logos y banners se suben con nombres clave _logo_{id} / _banner_{id}:
+        # van a su propia carpeta para no ensuciar la de fotos de producto.
+        carpeta = "productos"
+        if producto.startswith("_logo_") or producto.startswith("_banner"):
+            carpeta = "branding"
+
         # Subimos a Cloudinary con optimización automática de calidad.
         # folder="productos" agrupa todas las fotos en una carpeta en Cloudinary.
         # public_id usa el nombre del producto + un hex aleatorio para unicidad.
@@ -490,7 +547,7 @@ async def subir_foto(producto: str, foto: UploadFile = File(...), tenant_id: str
         # eficiente (WebP en navegadores modernos, JPEG en el resto).
         resultado = cloudinary.uploader.upload(
             contents,
-            folder="productos",
+            folder=carpeta,
             public_id=f"{producto}_{uuid.uuid4().hex[:8]}",
             quality="auto:best",
             fetch_format="auto"
@@ -731,6 +788,11 @@ async def subir_foto_variacion(
     contents = await foto.read()
     if not contents or len(contents) == 0:
         raise HTTPException(status_code=400, detail="La imagen recibida está vacía (0 bytes)")
+    if not _es_imagen_valida(contents):
+        raise HTTPException(
+            status_code=400,
+            detail="El archivo no es una imagen válida (solo JPG, PNG, GIF, WebP, BMP, AVIF o HEIC)."
+        )
     tamano_kb = len(contents) / 1024
     if tamano_kb > 1024:
         raise HTTPException(
@@ -876,6 +938,11 @@ async def subir_imagen_extra(
     contents = await foto.read()
     if not contents or len(contents) == 0:
         raise HTTPException(status_code=400, detail="La imagen recibida está vacía (0 bytes)")
+    if not _es_imagen_valida(contents):
+        raise HTTPException(
+            status_code=400,
+            detail="El archivo no es una imagen válida (solo JPG, PNG, GIF, WebP, BMP, AVIF o HEIC)."
+        )
 
     tamano_kb = len(contents) / 1024
     MAX_TAMANO_KB = 1024  # 1 MB
@@ -885,7 +952,9 @@ async def subir_imagen_extra(
             detail=f"La imagen es demasiado grande ({tamano_kb:.0f} KB). Máximo {MAX_TAMANO_KB} KB."
         )
 
-    # 4. Determinar el orden y si es reemplazo o inserción nueva
+    # 4. Determinar el orden y si es reemplazo o inserción nueva (PRE-CHECK
+    #    optimista: sirve para el public_id y para fallar rápido antes de subir;
+    #    el cómputo definitivo se revalida bajo lock en el paso 6).
     if orden_target is not None:
         # Reemplazo: validar que el orden esté en rango
         if orden_target < 1 or orden_target > 5:
@@ -893,7 +962,7 @@ async def subir_imagen_extra(
         nueva_orden = orden_target
 
         # La imagen que ocupa ese orden (si existe) se borra SOLO después de
-        # subir la nueva (paso 8): si la subida falla, la foto vieja se
+        # subir la nueva (paso 7): si la subida falla, la foto vieja se
         # conserva en Cloudinary y en la BD (no se pierde nada).
         existente = query(
             "SELECT id, url FROM producto_imagenes "
@@ -939,11 +1008,7 @@ async def subir_imagen_extra(
         )
         ordenes_usadas = {r["orden"] for r in ordenes}
         inicio = 2 if tiene_principal else 1
-        nueva_orden = None
-        for i in range(inicio, 6):
-            if i not in ordenes_usadas:
-                nueva_orden = i
-                break
+        nueva_orden = next((i for i in range(inicio, 6) if i not in ordenes_usadas), None)
         if nueva_orden is None:
             raise HTTPException(
                 status_code=403,
@@ -962,28 +1027,88 @@ async def subir_imagen_extra(
     )
     url = resultado.get("secure_url")
 
-    # 6. Guardar en la base de datos: si es reemplazo, actualizamos la fila
-    #    existente (mismo id, mismo orden); si es foto nueva, INSERT.
-    if reemplazo_id is not None:
-        execute(
-            "UPDATE producto_imagenes SET url = %s WHERE id = %s",
-            (url, reemplazo_id)
-        )
-    else:
-        execute(
-            "INSERT INTO producto_imagenes (producto_id, tenant_id, url, orden) "
-            "VALUES (%s, %s, %s, %s)",
-            (producto_id, tenant_id, url, nueva_orden)
-        )
+    # 6. Guardar en la BD en UNA transacción con bloqueo de la fila del producto
+    #    (SELECT ... FOR UPDATE). Esto serializa las escrituras concurrentes de
+    #    la galería por producto: dos requests simultáneos ya no pueden elegir el
+    #    mismo slot y violar UNIQUE(producto_id, orden). El slot y la capacidad
+    #    se RECOMPUTAN bajo el lock; el paso 4 fue solo un pre-check optimista.
+    descartar_url = None
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "SELECT id FROM productos WHERE id=%s AND tenant_id=%s FOR UPDATE",
+                (producto_id, tenant_id)
+            )
+            if reemplazo_id is not None:
+                # Reemplazo: actualizar la fila existente (mismo id, mismo orden)
+                cur.execute(
+                    "UPDATE producto_imagenes SET url=%s WHERE id=%s AND tenant_id=%s",
+                    (url, reemplazo_id, tenant_id)
+                )
+            else:
+                # Inserción nueva: recomputar slot libre y capacidad bajo el lock
+                cur.execute(
+                    "SELECT Imagen FROM productos WHERE id=%s AND tenant_id=%s",
+                    (producto_id, tenant_id)
+                )
+                fila_lock = cur.fetchone() or {}
+                img_lock = fila_lock.get("Imagen") or ""
+                tiene_principal_lock = bool(img_lock) and img_lock != "No hay foto"
 
-    # 7. Sincronizar productos.imagen si la orden es 1 (la principal)
-    if nueva_orden == 1:
-        execute(
-            "UPDATE productos SET Imagen = %s WHERE id = %s AND tenant_id = %s",
-            (url, producto_id, tenant_id)
-        )
+                cur.execute(
+                    "SELECT COUNT(*) AS total FROM producto_imagenes "
+                    "WHERE producto_id=%s AND tenant_id=%s",
+                    (producto_id, tenant_id)
+                )
+                total_lock = (cur.fetchone() or {}).get("total") or 0
+                if total_lock + (1 if tiene_principal_lock else 0) >= 5:
+                    # El producto se llenó entre el pre-check y aquí (race): no
+                    # queda slot. Se descarta la imagen recién subida a Cloudinary.
+                    descartar_url = url
+                    raise HTTPException(
+                        status_code=403,
+                        detail="Este producto ya tiene 5 imágenes. Elimina una antes de subir otra."
+                    )
 
-    # 8. Borrar la imagen anterior de Cloudinary SOLO tras subir la nueva
+                cur.execute(
+                    "SELECT orden FROM producto_imagenes "
+                    "WHERE producto_id=%s AND tenant_id=%s ORDER BY orden",
+                    (producto_id, tenant_id)
+                )
+                usadas_lock = {r["orden"] for r in cur.fetchall()}
+                inicio_lock = 2 if tiene_principal_lock else 1
+                nueva_orden = next((i for i in range(inicio_lock, 6) if i not in usadas_lock), None)
+                if nueva_orden is None:
+                    descartar_url = url
+                    raise HTTPException(
+                        status_code=403,
+                        detail="Este producto ya tiene 5 imágenes. Elimina una antes de subir otra."
+                    )
+                cur.execute(
+                    "INSERT INTO producto_imagenes (producto_id, tenant_id, url, orden) "
+                    "VALUES (%s, %s, %s, %s)",
+                    (producto_id, tenant_id, url, nueva_orden)
+                )
+            # Sincronizar productos.imagen si la orden es 1 (la principal)
+            if nueva_orden == 1:
+                cur.execute(
+                    "UPDATE productos SET Imagen=%s WHERE id=%s AND tenant_id=%s",
+                    (url, producto_id, tenant_id)
+                )
+        conn.commit()
+    except HTTPException:
+        conn.rollback()
+        if descartar_url:
+            borrar_imagen_cloudinary(descartar_url)
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=f"Error guardando la imagen: {str(e)}")
+    finally:
+        release_conn(conn)
+
+    # 7. Borrar la imagen anterior de Cloudinary SOLO tras subir la nueva
     if reemplazo_url_anterior and reemplazo_url_anterior != url:
         borrar_imagen_cloudinary(reemplazo_url_anterior)
 
