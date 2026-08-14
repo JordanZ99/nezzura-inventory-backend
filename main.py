@@ -9,7 +9,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from database.conexion import inicializar_db
-from routers import inventario, ventas, gastos, gastos_programados, catalogo_gestion, publico
+from routers import inventario, ventas, gastos, gastos_programados, catalogo_gestion, publico, exportacion
 
 app = FastAPI(
     title="Nezzura Digital API",
@@ -61,6 +61,7 @@ app.include_router(gastos.router)
 app.include_router(gastos_programados.router)
 app.include_router(catalogo_gestion.router)
 app.include_router(publico.router)
+app.include_router(exportacion.router)
 
 @app.get("/")
 def root():
