@@ -363,14 +363,9 @@ def inicializar_db():
 
             # Migración: stock por variación (022 — idempotente)
             # lotes.variacion_id: NULL = stock del producto/base; {id} = stock
-            # EXCLUSIVO de esa variación. productos.stock_por_variacion: flag
-            # por producto (default false = variaciones comparten stock).
+            # EXCLUSIVO de esa variación.
             try:
                 cur.execute("ALTER TABLE lotes ADD COLUMN IF NOT EXISTS variacion_id INTEGER REFERENCES producto_variaciones(id) ON DELETE CASCADE")
-            except Exception:
-                pass
-            try:
-                cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS stock_por_variacion boolean DEFAULT false")
             except Exception:
                 pass
             try:
@@ -402,6 +397,36 @@ def inicializar_db():
                          OR lower(sufijo_precio) LIKE '%mililitro%'
                       )
                 """)
+            except Exception:
+                pass
+
+            # Migración: eliminar la opción "stock por variación" (025 — idempotente)
+            # El flag ya no existe: un producto con variaciones SIEMPRE maneja
+            # stock por variación. Los lotes base (variacion_id NULL) de productos
+            # con variaciones se reasignan a la PRIMERA variación (stock compartido
+            # legacy); sus demás variaciones quedan en 0. El UPDATE va en su propio
+            # try (falla silenciosamente si la columna ya fue eliminada) y el DROP
+            # en otro (para que re-ejecutar sea seguro).
+            try:
+                cur.execute("""
+                    UPDATE lotes l
+                    SET variacion_id = sub.primera_var
+                    FROM (
+                        SELECT p.id, p.producto, p.tenant_id, MIN(v.id) AS primera_var
+                        FROM productos p
+                        JOIN producto_variaciones v ON v.producto_id = p.id
+                        WHERE COALESCE(p.stock_por_variacion, false) = false
+                        GROUP BY p.id, p.producto, p.tenant_id
+                    ) sub
+                    WHERE l.producto = sub.producto
+                      AND l.tenant_id = sub.tenant_id
+                      AND l.variacion_id IS NULL
+                      AND l.estado = 'Activo'
+                """)
+            except Exception:
+                pass
+            try:
+                cur.execute("ALTER TABLE productos DROP COLUMN IF EXISTS stock_por_variacion")
             except Exception:
                 pass
 

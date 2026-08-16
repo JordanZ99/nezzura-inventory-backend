@@ -117,23 +117,22 @@ def _resolver_receta_compuesto(cur, producto: str, variacion: str | None, tenant
 
 def _resolver_variacion_venta(cur, v: dict, tenant_id: str) -> int | None:
     """
-    Resuelve el id de variación de una venta de STOCK, SOLO si el producto
-    maneja stock por variación (flag stock_por_variacion ON).
-    None = stock compartido/base (comportamiento estándar).
+    Resuelve el id de variación de una venta de STOCK: si la venta trae el
+    nombre de una variación que EXISTE para el producto, descuenta de los
+    lotes de ESA variación. None = sin variación (stock base del producto).
     """
     variacion = str(v.get("variacion") or "").strip()
     if not variacion:
         return None
     cur.execute(
-        "SELECT p.stock_por_variacion, vv.id AS vid "
-        "FROM productos p "
-        "LEFT JOIN producto_variaciones vv ON vv.producto_id = p.id "
-        "  AND vv.nombre = %s AND vv.tenant_id = p.tenant_id "
-        "WHERE p.Producto = %s AND p.tenant_id = %s",
+        "SELECT vv.id AS vid "
+        "FROM producto_variaciones vv "
+        "JOIN productos p ON p.id = vv.producto_id "
+        "WHERE vv.nombre = %s AND p.Producto = %s AND p.tenant_id = %s",
         (variacion, v["producto"], tenant_id)
     )
     fila = cur.fetchone()
-    if fila and fila.get("stock_por_variacion") and fila.get("vid"):
+    if fila and fila.get("vid"):
         return fila["vid"]
     return None
 
