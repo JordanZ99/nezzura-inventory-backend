@@ -72,8 +72,7 @@ def get_datos_tenant(tenant_id: str) -> dict:
         productos = query(
             "SELECT id, Producto, Descripcion, Imagen, Estado, codigo_interno, "
             "       codigo_barras, ubicacion, visible_en_catalogo, sufijo_precio, "
-            "       fraccionable, tipo_producto, costo_servicio, precio_servicio, "
-            "       stock_por_variacion "
+            "       fraccionable, tipo_producto, costo_servicio, precio_servicio "
             "FROM productos WHERE tenant_id = %s ORDER BY Producto ASC",
             (tenant_id,)
         )
@@ -236,7 +235,6 @@ def _filas_para_xlsx(data: dict) -> dict[str, list[dict]]:
             "Codigo interno": p.get("codigo_interno") or "",
             "Codigo de barras": p.get("codigo_barras") or "",
             "Ubicacion": p.get("ubicacion") or "",
-            "Stock por variacion": "Si" if p.get("stock_por_variacion") else "No",
             "Estado": p.get("estado") or "",
             "Foto (URL)": p.get("imagen") or "",
         }

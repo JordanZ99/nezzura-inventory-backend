@@ -316,7 +316,6 @@ class ActualizarProducto(BaseModel):
     tipo_producto       : Optional[str] = None  # 'stock' | 'servicio'
     costo_servicio      : Optional[float] = None
     precio_servicio     : Optional[float] = None
-    stock_por_variacion : Optional[bool] = None  # Fase 6: si true, el stock vive en lotes por variación
 
 class ActualizarLote(BaseModel):
     costo       : float
@@ -631,8 +630,7 @@ def editar_producto(producto: str, data: ActualizarProducto, tenant_id: str = De
         fraccionable=data.fraccionable,
         tipo_producto=data.tipo_producto,
         costo_servicio=data.costo_servicio,
-        precio_servicio=data.precio_servicio,
-        stock_por_variacion=data.stock_por_variacion
+        precio_servicio=data.precio_servicio
     )
 
     # ── Sincronizar la foto principal con la galería (plan Plus) ──
