@@ -78,6 +78,62 @@ def execute(sql: str, params: tuple = None) -> None:
         release_conn(conn)
 
 
+def _dividir_sql(sql: str) -> list[str]:
+    """Divide un script SQL en statements individuales, respetando bloques
+    $$...$$ (las migraciones 003/006 usan DO blocks con `;` internos)."""
+    statements = []
+    actual = []
+    i = 0
+    en_dolar = False
+    while i < len(sql):
+        c = sql[i]
+        if sql.startswith("$$", i):
+            en_dolar = not en_dolar
+            actual.append("$$")
+            i += 2
+            continue
+        if c == ";" and not en_dolar:
+            stmt = "".join(actual).strip()
+            if stmt:
+                statements.append(stmt)
+            actual = []
+            i += 1
+            continue
+        actual.append(c)
+        i += 1
+    stmt = "".join(actual).strip()
+    if stmt:
+        statements.append(stmt)
+    return statements
+
+
+def _ejecutar_migraciones(cur) -> None:
+    """Ejecuta los archivos de migrations/*.sql en orden numérico.
+
+    Es la FUENTE ÚNICA del esquema: antes estos statements estaban duplicados
+    inline en inicializar_db() (con comentarios tipo "misma columna que 005..."),
+    lo que generaba drift silencioso si solo se cambiaba uno de los dos lugares.
+
+    Cada statement va en su propio try/except (mismo comportamiento tolerante
+    que el código anterior): un fallo puntual —tabla/columna que aún no existe,
+    migración ya aplicada— no detiene el resto ni rompe el arranque.
+    """
+    directorio = Path(__file__).resolve().parent.parent / "migrations"
+    if not directorio.exists():
+        return
+    for archivo in sorted(directorio.glob("*.sql")):
+        try:
+            sql = archivo.read_text(encoding="utf-8")
+        except Exception as e:
+            print(f"Error leyendo {archivo.name}: {e}")
+            continue
+        for stmt in _dividir_sql(sql):
+            try:
+                cur.execute(stmt)
+            except Exception as e:
+                print(f"Migración {archivo.name}: {e}")
+
+
 def inicializar_db():
     """Crea las tablas si no existen al arrancar."""
     conn = get_conn()
@@ -178,257 +234,12 @@ def inicializar_db():
                 except Exception:
                     pass
 
-            # Migración: visibilidad de producto en catálogo público
-            # (misma columna que 005_producto_visible_catalogo.sql — idempotente)
-            try:
-                cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS visible_en_catalogo boolean DEFAULT true")
-            except Exception:
-                pass
-
-            # Migración: hero + anuncios del catálogo público
-            # (mismas columnas que 006_catalogo_hero_anuncios.sql — idempotente)
-            try:
-                cur.execute("ALTER TABLE catalogo_config ADD COLUMN IF NOT EXISTS banner_url text DEFAULT ''")
-                cur.execute("ALTER TABLE catalogo_config ADD COLUMN IF NOT EXISTS hero_estilo text DEFAULT 'gradiente'")
-                cur.execute("ALTER TABLE catalogo_config ADD COLUMN IF NOT EXISTS anuncio_texto text DEFAULT ''")
-            except Exception:
-                pass
-
-            # Migración: agrupación por categoría configurable en el catálogo público
-            # (misma columna que 007_catalogo_agrupar_paginar.sql — idempotente)
-            try:
-                cur.execute("ALTER TABLE catalogo_config ADD COLUMN IF NOT EXISTS agrupar_por_categoria boolean")
-                cur.execute("ALTER TABLE catalogo_config ADD COLUMN IF NOT EXISTS columnas_movil integer DEFAULT 2")
-            except Exception:
-                pass
-
-            # Migración: permitir descargar fotos del catálogo (009 — idempotente)
-            try:
-                cur.execute("ALTER TABLE catalogo_config ADD COLUMN IF NOT EXISTS permitir_descarga boolean DEFAULT false")
-            except Exception:
-                pass
-
-            # Migración: visibilidad del catálogo (010 — idempotente)
-            try:
-                cur.execute("ALTER TABLE catalogo_config ADD COLUMN IF NOT EXISTS ocultar_agotados boolean DEFAULT false")
-                # El stock se muestra por defecto: normalizar NULLs y fijar default true
-                cur.execute("UPDATE catalogo_config SET mostrar_stock = true WHERE mostrar_stock IS NULL")
-                cur.execute("ALTER TABLE catalogo_config ALTER COLUMN mostrar_stock SET DEFAULT true")
-            except Exception:
-                pass
-
-            # Migración: texto del banner en modo imagen (011 — idempotente)
-            try:
-                cur.execute("ALTER TABLE catalogo_config ADD COLUMN IF NOT EXISTS banner_texto_color text DEFAULT '#ffffff'")
-                cur.execute("ALTER TABLE catalogo_config ADD COLUMN IF NOT EXISTS banner_mostrar_texto boolean DEFAULT true")
-            except Exception:
-                pass
-
-            # Migración: banner específico para móvil (012 — idempotente)
-            try:
-                cur.execute("ALTER TABLE catalogo_config ADD COLUMN IF NOT EXISTS banner_url_movil text DEFAULT ''")
-            except Exception:
-                pass
-
-            # Migración: mostrar el logo sobre el banner (013 — idempotente)
-            try:
-                cur.execute("ALTER TABLE catalogo_config ADD COLUMN IF NOT EXISTS banner_mostrar_logo boolean DEFAULT true")
-                cur.execute("ALTER TABLE catalogo_config ADD COLUMN IF NOT EXISTS relacion_imagen text DEFAULT '1:1'")
-            except Exception:
-                pass
-
-            # Migración: etiqueta/presentación por lote (014 — idempotente)
-            try:
-                cur.execute("ALTER TABLE lotes ADD COLUMN IF NOT EXISTS etiqueta text DEFAULT ''")
-            except Exception:
-                pass
-
-            # Migración: modo de precio sugerido del POS (015 — idempotente)
-            try:
-                cur.execute("ALTER TABLE tenants ADD COLUMN IF NOT EXISTS modo_precio_sugerido text DEFAULT 'antiguo'")
-            except Exception:
-                pass
-
-            # Migración: sufijo del precio en el catálogo (016 — idempotente)
-            # '' = sin sufijo; 'c/u', 'por kilo' o texto libre (ej. 'por litro')
-            try:
-                cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS sufijo_precio text DEFAULT ''")
-            except Exception:
-                pass
-
-            # Migración: productos de servicio sin stock (017 — idempotente)
-            # tipo_producto: 'stock' (normal) | 'servicio' (sin inventario)
-            try:
-                cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS tipo_producto text DEFAULT 'stock'")
-                cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS costo_servicio real DEFAULT 0")
-                cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS precio_servicio real DEFAULT 0")
-                # Las ventas guardan el tipo del producto vendido, para saber al
-                # editar/anular si hay que tocar inventario.
-                cur.execute("ALTER TABLE ventas ADD COLUMN IF NOT EXISTS tipo_producto text DEFAULT 'stock'")
-            except Exception:
-                pass
-
-            # Migración: variaciones de producto (018 — idempotente)
-            # Una variación es una presentación con su PROPIO precio para un mismo
-            # producto (ej. Sencilla/Doble, S/M/L). Aplica a cualquier tipo de producto.
-            try:
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS producto_variaciones (
-                        id          BIGSERIAL PRIMARY KEY,
-                        producto_id INTEGER NOT NULL REFERENCES productos(id) ON DELETE CASCADE,
-                        nombre      TEXT    NOT NULL,
-                        precio      REAL    NOT NULL DEFAULT 0,
-                        tenant_id   UUID    NOT NULL,
-                        UNIQUE(producto_id, nombre)
-                    )
-                """)
-                cur.execute("CREATE INDEX IF NOT EXISTS idx_producto_variaciones_producto ON producto_variaciones (producto_id, tenant_id)")
-                # Las ventas guardan QUÉ variación se vendió (historial)
-                cur.execute("ALTER TABLE ventas ADD COLUMN IF NOT EXISTS variacion text DEFAULT ''")
-            except Exception:
-                pass
-
-            # Migración: productos compuestos con receta (019 — idempotente)
-            # Un compuesto (ej. hamburguesa) NO tiene stock propio: al venderlo se
-            # descuenta el stock de sus MATERIALES (producto_recetas = BOM).
-            try:
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS producto_recetas (
-                        id          BIGSERIAL PRIMARY KEY,
-                        producto_id INTEGER NOT NULL REFERENCES productos(id) ON DELETE CASCADE,  -- el compuesto
-                        material_id INTEGER NOT NULL REFERENCES productos(id) ON DELETE CASCADE,   -- el material (producto de stock)
-                        cantidad    REAL    NOT NULL DEFAULT 1,
-                        tenant_id   UUID    NOT NULL,
-                        UNIQUE(producto_id, material_id)
-                    )
-                """)
-                cur.execute("CREATE INDEX IF NOT EXISTS idx_producto_recetas_producto ON producto_recetas (producto_id, tenant_id)")
-                # Las ventas de compuestos guardan el CONSUMO real: [{material, id_lote, cantidad, costo}]
-                # — esto permite anular/editar revirtiendo EXACTAMENTE los lotes usados.
-                cur.execute("ALTER TABLE ventas ADD COLUMN IF NOT EXISTS consumo jsonb DEFAULT NULL")
-            except Exception:
-                pass
-
-            # Migración: recetas POR VARIACIÓN (020 — idempotente)
-            # variacion_id NULL = receta base (se usa si la variación vendida no
-            # tiene receta propia); si no, receta específica de esa variación.
-            try:
-                cur.execute("ALTER TABLE producto_recetas ADD COLUMN IF NOT EXISTS variacion_id INTEGER REFERENCES producto_variaciones(id) ON DELETE CASCADE")
-            except Exception:
-                pass
-            # El UNIQUE(producto_id, material_id) bloqueaba dos variaciones con
-            # el mismo material → se reemplaza por índices únicos parciales.
-            # (Bloque separado: si el nombre del constraint difiriera en algún
-            #  entorno, no se pierden los índices por el fallo del DROP.)
-            try:
-                cur.execute("ALTER TABLE producto_recetas DROP CONSTRAINT IF EXISTS producto_recetas_producto_id_material_id_key")
-            except Exception:
-                pass
-            try:
-                cur.execute("DROP INDEX IF EXISTS uq_producto_recetas_base")
-                cur.execute("""
-                    CREATE UNIQUE INDEX uq_producto_recetas_base
-                        ON producto_recetas (producto_id, material_id)
-                        WHERE variacion_id IS NULL
-                """)
-            except Exception:
-                pass
-            try:
-                cur.execute("DROP INDEX IF EXISTS uq_producto_recetas_variacion")
-                cur.execute("""
-                    CREATE UNIQUE INDEX uq_producto_recetas_variacion
-                        ON producto_recetas (producto_id, variacion_id, material_id)
-                        WHERE variacion_id IS NOT NULL
-                """)
-            except Exception:
-                pass
-
-            # Migración: stock decimal + foto por variación (021 — idempotente)
-            # Stock_Lote y ventas.Cantidad pasan de INTEGER a REAL (vender 0.5 kg,
-            # 150g...). PostgreSQL convierte INTEGER → REAL automáticamente.
-            try:
-                cur.execute("ALTER TABLE lotes ALTER COLUMN Stock_Lote TYPE REAL")
-            except Exception:
-                pass
-            try:
-                cur.execute("ALTER TABLE ventas ALTER COLUMN Cantidad TYPE REAL")
-            except Exception:
-                pass
-            # Foto propia por variación (el catálogo muestra la foto de la
-            # presentación seleccionada, ej. Hamburguesa Doble vs Sencilla).
-            try:
-                cur.execute("ALTER TABLE producto_variaciones ADD COLUMN IF NOT EXISTS foto text DEFAULT ''")
-            except Exception:
-                pass
-
-            # Migración: stock por variación (022 — idempotente)
-            # lotes.variacion_id: NULL = stock del producto/base; {id} = stock
-            # EXCLUSIVO de esa variación.
-            try:
-                cur.execute("ALTER TABLE lotes ADD COLUMN IF NOT EXISTS variacion_id INTEGER REFERENCES producto_variaciones(id) ON DELETE CASCADE")
-            except Exception:
-                pass
-            try:
-                cur.execute("CREATE INDEX IF NOT EXISTS idx_lotes_variacion ON lotes (Producto, variacion_id, tenant_id)")
-            except Exception:
-                pass
-
-            # Migración: producto fraccionable (023 — idempotente)
-            # true = acepta decimales al vender (kg, lt, mt, ...);
-            # false (default) = solo unidades enteras (c/u, sin sufijo, ...).
-            try:
-                cur.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS fraccionable boolean DEFAULT false")
-            except Exception:
-                pass
-            # Derivación inicial para productos existentes (misma lógica que la
-            # migración SQL): los sufijos de peso/volumen/longitud pasan a true.
-            try:
-                cur.execute("""
-                    UPDATE productos SET fraccionable = true
-                    WHERE COALESCE(sufijo_precio, '') <> ''
-                      AND (
-                            lower(sufijo_precio) IN ('kg', 'lt', 'mt', 'g', 'ml', 'm',
-                                                     'por kilo', 'por litro', 'por metro',
-                                                     'kilo', 'litro', 'metro')
-                         OR lower(sufijo_precio) LIKE '%kilo%'
-                         OR lower(sufijo_precio) LIKE '%litro%'
-                         OR lower(sufijo_precio) LIKE '%metro%'
-                         OR lower(sufijo_precio) LIKE '%gramo%'
-                         OR lower(sufijo_precio) LIKE '%mililitro%'
-                      )
-                """)
-            except Exception:
-                pass
-
-            # Migración: eliminar la opción "stock por variación" (025 — idempotente)
-            # El flag ya no existe: un producto con variaciones SIEMPRE maneja
-            # stock por variación. Los lotes base (variacion_id NULL) de productos
-            # con variaciones se reasignan a la PRIMERA variación (stock compartido
-            # legacy); sus demás variaciones quedan en 0. El UPDATE va en su propio
-            # try (falla silenciosamente si la columna ya fue eliminada) y el DROP
-            # en otro (para que re-ejecutar sea seguro).
-            try:
-                cur.execute("""
-                    UPDATE lotes l
-                    SET variacion_id = sub.primera_var
-                    FROM (
-                        SELECT p.id, p.producto, p.tenant_id, MIN(v.id) AS primera_var
-                        FROM productos p
-                        JOIN producto_variaciones v ON v.producto_id = p.id
-                        WHERE COALESCE(p.stock_por_variacion, false) = false
-                        GROUP BY p.id, p.producto, p.tenant_id
-                    ) sub
-                    WHERE l.producto = sub.producto
-                      AND l.tenant_id = sub.tenant_id
-                      AND l.variacion_id IS NULL
-                      AND l.estado = 'Activo'
-                """)
-            except Exception:
-                pass
-            try:
-                cur.execute("ALTER TABLE productos DROP COLUMN IF EXISTS stock_por_variacion")
-            except Exception:
-                pass
+            # ── Migraciones del esquema: fuente única en migrations/*.sql ──
+            # Antes, cada migración (005-025) estaba DUPLICADA inline aquí con
+            # comentarios tipo "misma columna que 005..." — dos fuentes de verdad
+            # que podían divergir en silencio. El runner ejecuta los archivos en
+            # orden; cada statement en su propio try/except (tolerante a fallos).
+            _ejecutar_migraciones(cur)
 
         conn.commit()
     finally:
