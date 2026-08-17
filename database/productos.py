@@ -12,6 +12,7 @@
 
 import uuid
 import datetime
+import json
 from psycopg2.errors import UniqueViolation
 from database.conexion import query, execute
 from database.helpers import _TZ, _q, _e, _obtener_categorias_subquery, _sincronizar_categorias
@@ -85,6 +86,7 @@ def get_inventario_consolidado(tenant_id: str) -> list[dict]:
             p.tipo_producto                                          AS tipo_producto,
             p.costo_servicio                                         AS costo_servicio,
             p.precio_servicio                                        AS precio_servicio,
+            p.post_override                                          AS post_override,
             {cat_subquery},
             COALESCE(SUM(l.Stock_Lote), 0)                           AS stock_total,
             COALESCE(MAX(l.Precio_Venta), p.precio_servicio, 0)      AS precio_venta,
@@ -101,7 +103,7 @@ def get_inventario_consolidado(tenant_id: str) -> list[dict]:
         FROM productos p
         LEFT JOIN lotes l ON l.Producto = p.Producto AND l.Tenant_ID = p.Tenant_ID AND l.Estado = 'Activo'
         WHERE p.Tenant_ID = %s AND p.Estado = 'Activo'
-        GROUP BY p.Producto, p.Descripcion, p.Imagen, p.Estado, p.id, p.codigo_interno, p.codigo_barras, p.ubicacion, p.visible_en_catalogo, p.sufijo_precio, p.fraccionable, p.tipo_producto, p.costo_servicio, p.precio_servicio
+        GROUP BY p.Producto, p.Descripcion, p.Imagen, p.Estado, p.id, p.codigo_interno, p.codigo_barras, p.ubicacion, p.visible_en_catalogo, p.sufijo_precio, p.fraccionable, p.tipo_producto, p.costo_servicio, p.precio_servicio, p.post_override
         ORDER BY p.Producto ASC
     """, (tenant_id,))
 
@@ -112,6 +114,17 @@ def get_inventario_consolidado(tenant_id: str) -> list[dict]:
 
     # Elegir el precio sugerido según el modo del tenant y limpiar las variantes
     for f in filas:
+        # post_override (JSONB): psycopg2 lo entrega como texto si no hay
+        # typecaster registrado; normalizarlo a dict (o None si es NULL).
+        ov = f.get("post_override")
+        if isinstance(ov, str) and ov.strip():
+            try:
+                f["post_override"] = json.loads(ov)
+            except Exception:
+                f["post_override"] = None
+        elif not isinstance(ov, dict):
+            f["post_override"] = None
+
         # Servicio/Compuesto: no tienen lotes → el precio es su precio propio
         # (precio_servicio se reutiliza como 'precio sin stock' para ambos tipos)
         if f.get("tipo_producto") in ("servicio", "compuesto"):
