@@ -237,15 +237,21 @@ def _sincronizar_principal_galeria(producto_id: int, nueva_url: str, tenant_id: 
         )
 
 from database.lotes import (
-    get_lotes, get_productos_meta, get_inventario_consolidado,
-    get_detalle_lotes, agregar_lote, crear_producto_completo, actualizar_producto,
-    actualizar_lote,
+    get_lotes, get_detalle_lotes, agregar_lote, actualizar_lote, eliminar_lote,
+)
+from database.productos import (
+    get_productos_meta, get_inventario_consolidado, crear_producto_completo, actualizar_producto,
+)
+from database.categorias import (
     eliminar_categoria_de_productos, listar_categorias, renombrar_categoria,
-    crear_categoria, eliminar_lote, toggle_visibilidad_categoria,
-    listar_variaciones_producto, crear_variacion, actualizar_variacion,
-    eliminar_variacion,
+    crear_categoria, toggle_visibilidad_categoria,
+)
+from database.variaciones import (
+    listar_variaciones_producto, crear_variacion, actualizar_variacion, eliminar_variacion,
+)
+from database.recetas import (
     listar_recetas_producto, agregar_material_receta, actualizar_material_receta,
-    eliminar_material_receta
+    eliminar_material_receta,
 )
 from database.conexion import query, execute, get_conn, release_conn
 from psycopg2.extras import RealDictCursor
