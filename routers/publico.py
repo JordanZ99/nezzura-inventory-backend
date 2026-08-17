@@ -14,7 +14,7 @@
 
 from fastapi import APIRouter, HTTPException, Response
 from database.conexion import query
-from database.lotes import _obtener_categorias_subquery
+from database.helpers import _obtener_categorias_subquery
 
 router = APIRouter(prefix="/public", tags=["Catálogo Público"])
 
