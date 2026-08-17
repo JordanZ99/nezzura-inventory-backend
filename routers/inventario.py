@@ -3,6 +3,7 @@
 # Endpoints de inventario, lotes y productos.
 # ==============================================================================
 
+import json
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Depends
 from pydantic import BaseModel
 from typing import Optional
@@ -12,6 +13,10 @@ from database.imagenes import (
     _url_sigue_referenciada, _sincronizar_principal_galeria,
     _get_tenant_plan, _ErrorGaleria,
     borrar_imagen_url,
+    # Bug latente corregido: editar_producto y borrar_variacion_endpoint ya
+    # usaban borrar_imagen_cloudinary() (definida en database/imagenes.py) sin
+    # importarla — NameError al reemplazar una foto de producto.
+    borrar_imagen_cloudinary,
     listar_imagenes_producto as listar_imagenes_dominio,
     subir_imagen_extra as subir_imagen_extra_negocio,
     eliminar_imagen_extra as eliminar_imagen_extra_negocio,
@@ -145,6 +150,12 @@ class ActualizarMaterialReceta(BaseModel):
 
 class ActualizarPerfil(BaseModel):
     modo_precio_sugerido: Optional[str] = None  # 'antiguo' | 'maximo' | 'reciente'
+
+class ActualizarPostOverride(BaseModel):
+    """Override de la tarjeta de post para UN producto (Posts Automáticos, Fase 1).
+    post_override: dict parcial tipo {"template":"marco","color":"strawberry",...}
+    o null para quitar el override (el producto vuelve a usar los defaults del negocio)."""
+    post_override: Optional[dict] = None
 
 
 # --- Endpoints ---
@@ -402,6 +413,65 @@ def alternar_visibilidad_catalogo(categoria: str, tenant_id: str = Depends(get_t
     Si estaba visible, se oculta; si estaba oculta, se muestra.
     """
     return toggle_visibilidad_categoria(categoria, tenant_id)
+
+
+# =============================================================================
+# ── POSTS AUTOMÁTICOS (Fase 1): override de la tarjeta por producto ──────────
+# Un producto sin override (post_override NULL) usa los defaults del negocio
+# (tabla post_config). El override solo existe para la foto rebelde que lo pida.
+# =============================================================================
+
+# Valores permitidos (mismos que en routers/catalogo_gestion.py — post_config)
+_TEMPLATES_POST = ("marco", "overlay", "tarjeta")
+_COLORES_POST = ("default", "midnightBlack", "strawberry", "cozyYellow", "white")
+_FUENTES_POST = ("moderna", "elegante", "redondeada")
+_POSICIONES_POST = ("arriba", "abajo")
+
+
+@router.patch("/{producto}/post_override")
+def guardar_post_override(producto: str, data: ActualizarPostOverride, tenant_id: str = Depends(get_tenant_id)):
+    """
+    Guarda (o quita) el override de la tarjeta de post de un producto.
+
+    - post_override = {template?, color?, font?, posicion?, mostrar?} → se guarda
+      tal cual (las claves ausentes se heredan de los defaults del negocio).
+    - post_override = null → se quita el override: el producto vuelve a usar
+      los defaults del negocio.
+
+    Valida los valores contra las listas permitidas (422 si son inválidos).
+    """
+    ov = data.post_override
+    if ov is not None:
+        if not isinstance(ov, dict):
+            raise HTTPException(status_code=422, detail="post_override debe ser un objeto o null")
+        if "template" in ov and ov["template"] not in _TEMPLATES_POST:
+            raise HTTPException(status_code=422, detail=f"template debe ser uno de: {', '.join(_TEMPLATES_POST)}")
+        if "color" in ov and ov["color"] not in _COLORES_POST:
+            raise HTTPException(status_code=422, detail=f"color debe ser uno de: {', '.join(_COLORES_POST)}")
+        if "font" in ov and ov["font"] not in _FUENTES_POST:
+            raise HTTPException(status_code=422, detail=f"font debe ser uno de: {', '.join(_FUENTES_POST)}")
+        if "posicion" in ov and ov["posicion"] not in _POSICIONES_POST:
+            raise HTTPException(status_code=422, detail=f"posicion debe ser uno de: {', '.join(_POSICIONES_POST)}")
+        if "mostrar" in ov:
+            mostrar = ov["mostrar"]
+            permitidas = {"nombre", "precio", "negocio"}
+            if not isinstance(mostrar, dict) or not set(mostrar.keys()).issubset(permitidas):
+                raise HTTPException(status_code=422, detail="mostrar debe ser un objeto con solo las claves: nombre, precio, negocio")
+
+    # Verificar que el producto exista y pertenezca al tenant (evita crear
+    # overrides sobre productos inexistentes/ajenos)
+    existe = query(
+        "SELECT id FROM productos WHERE Producto = %s AND tenant_id = %s",
+        (producto, tenant_id)
+    )
+    if not existe:
+        raise HTTPException(status_code=404, detail="Producto no encontrado")
+
+    execute(
+        "UPDATE productos SET post_override = %s::jsonb WHERE Producto = %s AND tenant_id = %s",
+        (json.dumps(ov) if ov is not None else None, producto, tenant_id)
+    )
+    return {"ok": True, "producto": producto, "post_override": ov}
 
 
 # =============================================================================
