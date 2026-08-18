@@ -4,6 +4,7 @@
 # ==============================================================================
 
 import json
+import re
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Depends
 from pydantic import BaseModel
 from typing import Optional
@@ -427,6 +428,19 @@ _COLORES_POST = ("default", "midnightBlack", "strawberry", "cozyYellow", "white"
 _FUENTES_POST = ("moderna", "elegante", "redondeada")
 _POSICIONES_POST = ("arriba", "abajo")
 
+# Color de texto personalizable (nombre+negocio = primario, precio = secundario):
+# hex #RRGGBB o '' = automático por plantilla.
+_RE_HEX_COLOR_POST = re.compile(r"^#[0-9a-fA-F]{6}$")
+
+
+def _validar_color_texto_post(valor, campo: str) -> None:
+    """Valida un color de texto del override: hex #RRGGBB o '' (automático)."""
+    if not isinstance(valor, str) or not (valor == "" or _RE_HEX_COLOR_POST.match(valor)):
+        raise HTTPException(
+            status_code=422,
+            detail=f"{campo} debe ser un color hex (#RRGGBB) o una cadena vacía para usar el color por defecto",
+        )
+
 
 @router.patch("/{producto}/post_override")
 def guardar_post_override(producto: str, data: ActualizarPostOverride, tenant_id: str = Depends(get_tenant_id)):
@@ -464,6 +478,10 @@ def guardar_post_override(producto: str, data: ActualizarPostOverride, tenant_id
                 raise HTTPException(status_code=422, detail="cta debe ser un objeto con solo las claves: texto, url")
             if any(not isinstance(v, str) for v in cta.values()):
                 raise HTTPException(status_code=422, detail="cta.texto y cta.url deben ser texto")
+        if "color_primario" in ov:
+            _validar_color_texto_post(ov["color_primario"], "color_primario")
+        if "color_secundario" in ov:
+            _validar_color_texto_post(ov["color_secundario"], "color_secundario")
 
     # Verificar que el producto exista y pertenezca al tenant (evita crear
     # overrides sobre productos inexistentes/ajenos)

@@ -15,6 +15,7 @@
 # ==============================================================================
 
 import json
+import re
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from typing import Optional, Literal
@@ -212,6 +213,8 @@ class ActualizarPostConfig(BaseModel):
     mostrar: Optional[dict] = None         # {nombre: bool, precio: bool, negocio: bool}
     cta_texto: Optional[str] = None        # Texto del botón CTA en la tarjeta (Fase 4, §9.4); '' o None = sin CTA
     cta_url: Optional[str] = None          # URL opcional del CTA (no se dibuja en el PNG)
+    color_primario: Optional[str] = None   # Color del NOMBRE + NEGOCIO (hex #RRGGBB o '' = automático por plantilla)
+    color_secundario: Optional[str] = None # Color del PRECIO (hex #RRGGBB o '' = automático)
 
 
 def _crear_post_config_default(tenant_id: str) -> None:
@@ -221,6 +224,18 @@ def _crear_post_config_default(tenant_id: str) -> None:
         execute(
             "INSERT INTO post_config (tenant_id) VALUES (%s)",
             (tenant_id,)
+        )
+
+
+_RE_HEX_COLOR = re.compile(r"^#[0-9a-fA-F]{6}$")
+
+
+def _validar_color_texto(valor, campo: str) -> None:
+    """Valida un color de texto: hex #RRGGBB o cadena vacía (= automático)."""
+    if not isinstance(valor, str) or not (valor == "" or _RE_HEX_COLOR.match(valor)):
+        raise HTTPException(
+            status_code=422,
+            detail=f"{campo} debe ser un color hex (#RRGGBB) o una cadena vacía para usar el color por defecto",
         )
 
 
@@ -245,7 +260,8 @@ def obtener_post_config(tenant_id: str = Depends(get_tenant_id)):
     """
     _crear_post_config_default(tenant_id)
     fila = query(
-        "SELECT tenant_id, template_default, color, font, posicion, mostrar, cta_texto, cta_url "
+        "SELECT tenant_id, template_default, color, font, posicion, mostrar, cta_texto, cta_url, "
+        "color_primario, color_secundario "
         "FROM post_config WHERE tenant_id = %s",
         (tenant_id,)
     )
@@ -302,6 +318,14 @@ def actualizar_post_config(
     if data.cta_url is not None:
         campos.append("cta_url = %s")
         valores.append(data.cta_url.strip() if isinstance(data.cta_url, str) else data.cta_url)
+    if data.color_primario is not None:
+        _validar_color_texto(data.color_primario, "color_primario")
+        campos.append("color_primario = %s")
+        valores.append(data.color_primario)
+    if data.color_secundario is not None:
+        _validar_color_texto(data.color_secundario, "color_secundario")
+        campos.append("color_secundario = %s")
+        valores.append(data.color_secundario)
 
     if not campos:
         return {"ok": True, "mensaje": "Nada que actualizar"}
