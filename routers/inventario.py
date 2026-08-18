@@ -457,6 +457,13 @@ def guardar_post_override(producto: str, data: ActualizarPostOverride, tenant_id
             permitidas = {"nombre", "precio", "negocio"}
             if not isinstance(mostrar, dict) or not set(mostrar.keys()).issubset(permitidas):
                 raise HTTPException(status_code=422, detail="mostrar debe ser un objeto con solo las claves: nombre, precio, negocio")
+        if "cta" in ov:
+            cta = ov["cta"]
+            permitidas_cta = {"texto", "url"}
+            if not isinstance(cta, dict) or not set(cta.keys()).issubset(permitidas_cta):
+                raise HTTPException(status_code=422, detail="cta debe ser un objeto con solo las claves: texto, url")
+            if any(not isinstance(v, str) for v in cta.values()):
+                raise HTTPException(status_code=422, detail="cta.texto y cta.url deben ser texto")
 
     # Verificar que el producto exista y pertenezca al tenant (evita crear
     # overrides sobre productos inexistentes/ajenos)
