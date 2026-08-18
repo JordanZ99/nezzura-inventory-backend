@@ -210,6 +210,8 @@ class ActualizarPostConfig(BaseModel):
     font: Optional[str] = None             # 'moderna' | 'elegante' | 'redondeada'
     posicion: Optional[str] = None         # 'arriba' | 'abajo' (solo Overlay, Fase 2)
     mostrar: Optional[dict] = None         # {nombre: bool, precio: bool, negocio: bool}
+    cta_texto: Optional[str] = None        # Texto del botón CTA en la tarjeta (Fase 4, §9.4); '' o None = sin CTA
+    cta_url: Optional[str] = None          # URL opcional del CTA (no se dibuja en el PNG)
 
 
 def _crear_post_config_default(tenant_id: str) -> None:
@@ -243,7 +245,7 @@ def obtener_post_config(tenant_id: str = Depends(get_tenant_id)):
     """
     _crear_post_config_default(tenant_id)
     fila = query(
-        "SELECT tenant_id, template_default, color, font, posicion, mostrar "
+        "SELECT tenant_id, template_default, color, font, posicion, mostrar, cta_texto, cta_url "
         "FROM post_config WHERE tenant_id = %s",
         (tenant_id,)
     )
@@ -294,6 +296,12 @@ def actualizar_post_config(
             raise HTTPException(status_code=422, detail="mostrar debe ser un objeto con solo las claves: nombre, precio, negocio")
         campos.append("mostrar = %s::jsonb")
         valores.append(json.dumps(mostrar))
+    if data.cta_texto is not None:
+        campos.append("cta_texto = %s")
+        valores.append(data.cta_texto.strip() if isinstance(data.cta_texto, str) else data.cta_texto)
+    if data.cta_url is not None:
+        campos.append("cta_url = %s")
+        valores.append(data.cta_url.strip() if isinstance(data.cta_url, str) else data.cta_url)
 
     if not campos:
         return {"ok": True, "mensaje": "Nada que actualizar"}
