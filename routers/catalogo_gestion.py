@@ -35,8 +35,7 @@ class TemplateEnum(str, Enum):
 
 
 # Valores permitidos para la config de posts (Fase 1 — Posts Automáticos)
-TEMPLATES_POST = ("marco", "overlay", "tarjeta")
-COLORES_POST = ("default", "midnightBlack", "strawberry", "cozyYellow", "white")
+TEMPLATES_POST = ("marco", "overlay")  # 'tarjeta' se eliminó (el render la trata como Marco)
 FUENTES_POST = ("moderna", "elegante", "redondeada")
 POSICIONES_POST = ("arriba", "abajo")
 
@@ -206,15 +205,12 @@ def actualizar_config_catalogo(
 
 class ActualizarPostConfig(BaseModel):
     """Modelo para actualizar los defaults de posts del negocio. PATCH parcial."""
-    template_default: Optional[str] = None  # 'marco' | 'overlay' | 'tarjeta'
-    color: Optional[str] = None            # key de paleta (default | midnightBlack | strawberry | cozyYellow | white)
+    template_default: Optional[str] = None  # 'marco' | 'overlay'
     font: Optional[str] = None             # 'moderna' | 'elegante' | 'redondeada'
     posicion: Optional[str] = None         # 'arriba' | 'abajo' (solo Overlay, Fase 2)
     mostrar: Optional[dict] = None         # {nombre: bool, precio: bool, negocio: bool}
-    cta_texto: Optional[str] = None        # Texto del botón CTA en la tarjeta (Fase 4, §9.4); '' o None = sin CTA
-    cta_url: Optional[str] = None          # URL opcional del CTA (no se dibuja en el PNG)
     color_primario: Optional[str] = None   # Color del NOMBRE + NEGOCIO (hex #RRGGBB o '' = automático por plantilla)
-    color_secundario: Optional[str] = None # Color del PRECIO (hex #RRGGBB o '' = automático)
+    color_secundario: Optional[str] = None # Color del PRECIO (hex #RRGGBB o '' = azul por defecto)
 
 
 def _crear_post_config_default(tenant_id: str) -> None:
@@ -290,11 +286,6 @@ def actualizar_post_config(
             raise HTTPException(status_code=422, detail=f"template_default debe ser uno de: {', '.join(TEMPLATES_POST)}")
         campos.append("template_default = %s")
         valores.append(data.template_default)
-    if data.color is not None:
-        if data.color not in COLORES_POST:
-            raise HTTPException(status_code=422, detail=f"color debe ser uno de: {', '.join(COLORES_POST)}")
-        campos.append("color = %s")
-        valores.append(data.color)
     if data.font is not None:
         if data.font not in FUENTES_POST:
             raise HTTPException(status_code=422, detail=f"font debe ser uno de: {', '.join(FUENTES_POST)}")
@@ -312,12 +303,6 @@ def actualizar_post_config(
             raise HTTPException(status_code=422, detail="mostrar debe ser un objeto con solo las claves: nombre, precio, negocio")
         campos.append("mostrar = %s::jsonb")
         valores.append(json.dumps(mostrar))
-    if data.cta_texto is not None:
-        campos.append("cta_texto = %s")
-        valores.append(data.cta_texto.strip() if isinstance(data.cta_texto, str) else data.cta_texto)
-    if data.cta_url is not None:
-        campos.append("cta_url = %s")
-        valores.append(data.cta_url.strip() if isinstance(data.cta_url, str) else data.cta_url)
     if data.color_primario is not None:
         _validar_color_texto(data.color_primario, "color_primario")
         campos.append("color_primario = %s")
