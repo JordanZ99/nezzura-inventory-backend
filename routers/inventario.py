@@ -423,8 +423,7 @@ def alternar_visibilidad_catalogo(categoria: str, tenant_id: str = Depends(get_t
 # =============================================================================
 
 # Valores permitidos (mismos que en routers/catalogo_gestion.py — post_config)
-_TEMPLATES_POST = ("marco", "overlay", "tarjeta")
-_COLORES_POST = ("default", "midnightBlack", "strawberry", "cozyYellow", "white")
+_TEMPLATES_POST = ("marco", "overlay")  # 'tarjeta' se eliminó (el render la trata como Marco)
 _FUENTES_POST = ("moderna", "elegante", "redondeada")
 _POSICIONES_POST = ("arriba", "abajo")
 
@@ -460,8 +459,6 @@ def guardar_post_override(producto: str, data: ActualizarPostOverride, tenant_id
             raise HTTPException(status_code=422, detail="post_override debe ser un objeto o null")
         if "template" in ov and ov["template"] not in _TEMPLATES_POST:
             raise HTTPException(status_code=422, detail=f"template debe ser uno de: {', '.join(_TEMPLATES_POST)}")
-        if "color" in ov and ov["color"] not in _COLORES_POST:
-            raise HTTPException(status_code=422, detail=f"color debe ser uno de: {', '.join(_COLORES_POST)}")
         if "font" in ov and ov["font"] not in _FUENTES_POST:
             raise HTTPException(status_code=422, detail=f"font debe ser uno de: {', '.join(_FUENTES_POST)}")
         if "posicion" in ov and ov["posicion"] not in _POSICIONES_POST:
@@ -471,13 +468,6 @@ def guardar_post_override(producto: str, data: ActualizarPostOverride, tenant_id
             permitidas = {"nombre", "precio", "negocio"}
             if not isinstance(mostrar, dict) or not set(mostrar.keys()).issubset(permitidas):
                 raise HTTPException(status_code=422, detail="mostrar debe ser un objeto con solo las claves: nombre, precio, negocio")
-        if "cta" in ov:
-            cta = ov["cta"]
-            permitidas_cta = {"texto", "url"}
-            if not isinstance(cta, dict) or not set(cta.keys()).issubset(permitidas_cta):
-                raise HTTPException(status_code=422, detail="cta debe ser un objeto con solo las claves: texto, url")
-            if any(not isinstance(v, str) for v in cta.values()):
-                raise HTTPException(status_code=422, detail="cta.texto y cta.url deben ser texto")
         if "color_primario" in ov:
             _validar_color_texto_post(ov["color_primario"], "color_primario")
         if "color_secundario" in ov:
