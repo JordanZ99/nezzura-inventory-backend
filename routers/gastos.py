@@ -10,8 +10,9 @@ from database.gastos import (
     renombrar_categoria_gasto, eliminar_categoria_gasto
 )
 from database.gastos_programados import verificar_y_generar_gastos_programados
+from database.helpers import resolver_rango_q
 from dependencies import get_tenant_id
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, HTTPException, Depends
 from typing import Optional
 from pydantic import BaseModel, Field
 
@@ -41,14 +42,24 @@ class ActualizarGasto(BaseModel):
 
 
 @router.get("/")
-def listar_gastos(tenant_id: str = Depends(get_tenant_id)):
+def listar_gastos(
+    desde: Optional[str] = None,
+    hasta: Optional[str] = None,
+    tenant_id: str = Depends(get_tenant_id),
+):
     """
-    Historial completo de gastos.
+    Gastos en la ventana contable pedida (?desde/?hasta, 'YYYY-MM-DD').
+    Sin ?desde ni ?hasta devuelve SOLO el mes contable actual (antes traía
+    el historial completo sin límite).
     Antes de retornar, ejecuta el motor de verificación de gastos programados
     para generar automáticamente los gastos cuya proxima_fecha ya venció.
     """
     verificar_y_generar_gastos_programados(tenant_id)
-    resultado = get_gastos(tenant_id)
+    try:
+        d_desde, d_hasta = resolver_rango_q(tenant_id, desde, hasta)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    resultado = get_gastos(tenant_id, d_desde, d_hasta)
     return resultado
 
 

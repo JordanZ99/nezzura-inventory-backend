@@ -2,17 +2,38 @@ import psycopg2.extras
 import json
 import re
 import uuid
-from datetime import date
+from datetime import date, datetime
 from database.conexion import query, execute, get_conn, release_conn
 from database.lotes import descontar_stock_peps
 from database.helpers import ahora_negocio, _parsear_ts, zona_tenant, hoy_negocio
 
-def get_ventas(tenant_id: str, limit: int = 500) -> list[dict]:
-    """Lee ventas del usuario ordenadas por fecha descendente."""
-    return query(
-        "SELECT id, n_ticket, fecha, producto, cantidad, precio_lista, precio_real, costo_unitario, total_venta, ganancia_bruta, estado, tipo_producto, variacion, consumo, orden_id FROM ventas WHERE tenant_id = %s ORDER BY Fecha DESC LIMIT %s",
-        (tenant_id, limit)
+def get_ventas(
+    tenant_id: str,
+    limit: int = 500,
+    desde_ts: datetime | None = None,
+    hasta_ts: datetime | None = None,
+) -> list[dict]:
+    """
+    Renglones de venta ordenados por instante descendente (fecha_ts, con
+    índice idx_ventas_tenant_fecha_ts). desde_ts/hasta_ts acotan la ventana
+    [inclusive, exclusiva); None = límite abierto. Sin filtros el router
+    pasa el mes contable actual, evitando transportar todo el historial.
+    """
+    sql = (
+        "SELECT id, n_ticket, fecha, producto, cantidad, precio_lista, precio_real, "
+        "costo_unitario, total_venta, ganancia_bruta, estado, tipo_producto, variacion, consumo, orden_id "
+        "FROM ventas WHERE tenant_id = %s"
     )
+    params: list = [tenant_id]
+    if desde_ts is not None:
+        sql += " AND fecha_ts >= %s"
+        params.append(desde_ts)
+    if hasta_ts is not None:
+        sql += " AND fecha_ts < %s"
+        params.append(hasta_ts)
+    sql += " ORDER BY fecha_ts DESC LIMIT %s"
+    params.append(limit)
+    return query(sql, tuple(params))
 
 
 def _recalcular_orden(cur, orden_id, tenant_id: str) -> None:
@@ -45,21 +66,36 @@ def _recalcular_orden(cur, orden_id, tenant_id: str) -> None:
     )
 
 
-def get_ordenes(tenant_id: str, limit: int = 500) -> list[dict]:
+def get_ordenes(
+    tenant_id: str,
+    limit: int = 500,
+    desde_ts: datetime | None = None,
+    hasta_ts: datetime | None = None,
+) -> list[dict]:
     """
     Órdenes (tickets) con sus renglones anidados, más recientes primero.
     El ordenamiento usa fecha_ts (instante canónico), no el TEXT legado.
+    desde_ts/hasta_ts acotan la ventana [inclusive, exclusiva) sobre
+    o.fecha_ts (índice idx_ordenes_tenant_fecha_ts); None = abierto.
     """
     conn = get_conn()
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(
+            sql = (
                 "SELECT id, n_ticket, fecha_ts, total, ganancia, cantidad_items, estado, "
                 "       metodo_pago, pagos, propina, monto_recibido, cambio, comision_total, turno_id "
-                "FROM ordenes WHERE tenant_id = %s "
-                "ORDER BY fecha_ts DESC LIMIT %s",
-                (tenant_id, limit)
+                "FROM ordenes WHERE tenant_id = %s"
             )
+            params: list = [tenant_id]
+            if desde_ts is not None:
+                sql += " AND fecha_ts >= %s"
+                params.append(desde_ts)
+            if hasta_ts is not None:
+                sql += " AND fecha_ts < %s"
+                params.append(hasta_ts)
+            sql += " ORDER BY fecha_ts DESC LIMIT %s"
+            params.append(limit)
+            cur.execute(sql, tuple(params))
             ordenes = [dict(o) for o in cur.fetchall()]
             if not ordenes:
                 return []
