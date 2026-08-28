@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 from psycopg2.errors import UndefinedTable
 
 from database.conexion import inicializar_db
-from routers import inventario, ventas, gastos, gastos_programados, catalogo_gestion, publico, exportacion, terminales, turnos
+from routers import inventario, ventas, gastos, gastos_programados, catalogo_gestion, publico, exportacion, terminales, turnos, stats
 
 app = FastAPI(
     title="Nezzura Digital API",
@@ -83,6 +83,7 @@ app.include_router(publico.router)
 app.include_router(exportacion.router)
 app.include_router(terminales.router)
 app.include_router(turnos.router)
+app.include_router(stats.router)
 
 @app.get("/")
 def root():
