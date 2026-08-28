@@ -82,6 +82,9 @@ def get_ordenes(tenant_id: str, limit: int = 500) -> list[dict]:
     por_orden: dict = {}
     for o in ordenes:
         o["ventas"] = []
+        # `fecha` = alias de fecha_ts para el contrato del frontend (ISO con zona).
+        # fecha_ts se conserva como instante canónico.
+        o["fecha"] = o["fecha_ts"]
         por_orden[o["id"]] = o
     for r in renglones:
         o = por_orden.get(r.get("orden_id"))
