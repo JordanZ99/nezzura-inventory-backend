@@ -3,6 +3,7 @@
 from database.ventas import (
     get_ventas,
     get_ordenes,
+    get_ordenes_paginadas,
     actualizar_venta,
     eliminar_venta,
     anular_orden,
@@ -94,6 +95,33 @@ def listar_ordenes(
         raise HTTPException(status_code=422, detail=str(e))
     desde_ts, hasta_ts = ventana_ts_de_rango(tenant_id, d_desde, d_hasta)
     return get_ordenes(tenant_id, limit, desde_ts, hasta_ts)
+
+
+@router.get("/ordenes/paginadas")
+def listar_ordenes_paginadas(
+    desde: Optional[str] = None,
+    hasta: Optional[str] = None,
+    pagina: int = 1,
+    por_pagina: int = 10,
+    busqueda: Optional[str] = None,
+    orden: str = "fecha-desc",
+    tenant_id: str = Depends(get_tenant_id),
+):
+    """
+    Historial de tickets paginado en servidor (una página por request).
+    ?busqueda busca por folio o producto; ?orden: fecha-desc|fecha-asc|
+    monto-desc|monto-asc|ganancia-desc. Sin ?desde/?hasta usa el mes contable.
+    """
+    try:
+        d_desde, d_hasta = resolver_rango_q(tenant_id, desde, hasta)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    desde_ts, hasta_ts = ventana_ts_de_rango(tenant_id, d_desde, d_hasta)
+    return get_ordenes_paginadas(
+        tenant_id, desde_ts, hasta_ts,
+        pagina=pagina, por_pagina=por_pagina,
+        busqueda=busqueda, orden=orden,
+    )
 
 @router.patch("/ordenes/{orden_id}")
 def editar_orden(orden_id: str, data: ActualizarOrden, tenant_id: str = Depends(get_tenant_id)):

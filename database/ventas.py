@@ -129,6 +129,92 @@ def get_ordenes(
             o["ventas"].append(r)
     return ordenes
 
+
+_ORDENES_ORDEN_SQL = {
+    "fecha-desc": "o.fecha_ts DESC",
+    "fecha-asc": "o.fecha_ts ASC",
+    "monto-desc": "o.total DESC",
+    "monto-asc": "o.total ASC",
+    "ganancia-desc": "o.ganancia DESC",
+}
+
+
+def get_ordenes_paginadas(
+    tenant_id: str,
+    desde_ts=None,
+    hasta_ts=None,
+    pagina: int = 1,
+    por_pagina: int = 10,
+    busqueda: str | None = None,
+    orden: str = "fecha-desc",
+) -> dict:
+    """
+    Historial de tickets PAGINADO en servidor (una página = un payload chico,
+    el historial puede crecer por años sin saturar la red ni el celular).
+    Ventana [desde_ts, hasta_ts) sobre o.fecha_ts (índice); búsqueda por folio
+    o nombre de producto; orden whitelisted. Devuelve {ordenes, total,
+    pagina, por_pagina, total_paginas}.
+    """
+    orden_sql = _ORDENES_ORDEN_SQL.get(orden, "o.fecha_ts DESC")
+    pagina = max(1, pagina)
+    por_pagina = min(max(1, por_pagina), 100)
+
+    where = "o.tenant_id = %s"
+    params: list = [tenant_id]
+    if desde_ts is not None:
+        where += " AND o.fecha_ts >= %s"
+        params.append(desde_ts)
+    if hasta_ts is not None:
+        where += " AND o.fecha_ts < %s"
+        params.append(hasta_ts)
+    if busqueda and busqueda.strip():
+        patron = f"%{busqueda.strip()}%"
+        where += " AND (o.n_ticket::text ILIKE %s OR EXISTS (SELECT 1 FROM ventas v WHERE v.orden_id = o.id AND v.producto ILIKE %s))"
+        params.extend([patron, patron])
+
+    total = query(f"SELECT COUNT(*) AS total FROM ordenes o WHERE {where}", tuple(params))[0]["total"]
+
+    filas = query(
+        "SELECT o.id, o.n_ticket, o.fecha_ts, o.total, o.ganancia, o.cantidad_items, o.estado, "
+        "o.metodo_pago, o.pagos, o.propina, o.monto_recibido, o.cambio, o.comision_total, o.turno_id "
+        f"FROM ordenes o WHERE {where} "
+        f"ORDER BY {orden_sql} LIMIT %s OFFSET %s",
+        tuple(params) + (por_pagina, (pagina - 1) * por_pagina)
+    )
+    ordenes = [dict(o) for o in filas]
+    if ordenes:
+        _anidar_renglones(tenant_id, ordenes)
+
+    return {
+        "ordenes": ordenes,
+        "total": int(total or 0),
+        "pagina": pagina,
+        "por_pagina": por_pagina,
+        "total_paginas": max(1, -(-int(total or 0) // por_pagina)),
+    }
+
+
+def _anidar_renglones(tenant_id: str, ordenes: list[dict]) -> None:
+    """Adjunta ventas[] a cada orden (renglones de la página, no del historial)."""
+    if not ordenes:
+        return
+    ids = [o["id"] for o in ordenes]
+    renglones = query(
+        "SELECT id, n_ticket, fecha, producto, cantidad, precio_lista, precio_real, "
+        "       costo_unitario, total_venta, ganancia_bruta, estado, tipo_producto, "
+        "       variacion, consumo, orden_id "
+        "FROM ventas WHERE tenant_id = %s AND orden_id = ANY(%s::uuid[]) "
+        "ORDER BY fecha_ts ASC, id ASC",
+        (tenant_id, ids)
+    )
+    por_orden: dict = {o["id"]: o for o in ordenes}
+    for o in ordenes:
+        o["ventas"] = []
+    for r in renglones:
+        o = por_orden.get(r.get("orden_id"))
+        if o is not None:
+            o["ventas"].append(r)
+
 def insertar_venta(venta: dict, tenant_id: str, conn=None) -> None:
     """
     Inserta una venta etiquetada con el tenant_id.
