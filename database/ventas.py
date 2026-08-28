@@ -1,16 +1,93 @@
 import psycopg2.extras
 import json
+import re
 import uuid
+from datetime import date
 from database.conexion import query, execute, get_conn, release_conn
 from database.lotes import descontar_stock_peps
-from database.helpers import ahora_negocio, _parsear_ts
+from database.helpers import ahora_negocio, _parsear_ts, zona_tenant
 
 def get_ventas(tenant_id: str, limit: int = 500) -> list[dict]:
     """Lee ventas del usuario ordenadas por fecha descendente."""
     return query(
-        "SELECT id, n_ticket, fecha, producto, cantidad, precio_lista, precio_real, costo_unitario, total_venta, ganancia_bruta, estado, tipo_producto, variacion, consumo FROM ventas WHERE tenant_id = %s ORDER BY Fecha DESC LIMIT %s",
+        "SELECT id, n_ticket, fecha, producto, cantidad, precio_lista, precio_real, costo_unitario, total_venta, ganancia_bruta, estado, tipo_producto, variacion, consumo, orden_id FROM ventas WHERE tenant_id = %s ORDER BY Fecha DESC LIMIT %s",
         (tenant_id, limit)
     )
+
+
+def _recalcular_orden(cur, orden_id, tenant_id: str) -> None:
+    """
+    Recalcula los agregados de una orden desde SUS RENGLONES activos
+    (total, ganancia, unidades y estado). Se llama tras toda mutación de
+    ventas (editar/anular) para que la cabecera nunca quede desfasada.
+    Con orden_id NULL (venta legada sin orden) no hace nada.
+    """
+    if not orden_id:
+        return
+    cur.execute(
+        """
+        UPDATE ordenes o
+        SET total = COALESCE(ag.total, 0),
+            ganancia = COALESCE(ag.ganancia, 0),
+            cantidad_items = COALESCE(ag.unidades, 0),
+            estado = CASE WHEN COALESCE(ag.activos, 0) = 0 THEN 'Anulada' ELSE 'Activa' END
+        FROM (
+            SELECT SUM(total_venta) FILTER (WHERE estado != 'Inactivo') AS total,
+                   SUM(ganancia_bruta) FILTER (WHERE estado != 'Inactivo') AS ganancia,
+                   SUM(cantidad) FILTER (WHERE estado != 'Inactivo') AS unidades,
+                   COUNT(*) FILTER (WHERE estado != 'Inactivo') AS activos
+            FROM ventas
+            WHERE orden_id = %s AND tenant_id = %s
+        ) ag
+        WHERE o.id = %s AND o.tenant_id = %s
+        """,
+        (orden_id, tenant_id, orden_id, tenant_id)
+    )
+
+
+def get_ordenes(tenant_id: str, limit: int = 500) -> list[dict]:
+    """
+    Órdenes (tickets) con sus renglones anidados, más recientes primero.
+    El ordenamiento usa fecha_ts (instante canónico), no el TEXT legado.
+    """
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT id, n_ticket, fecha_ts, total, ganancia, cantidad_items, estado "
+                "FROM ordenes WHERE tenant_id = %s "
+                "ORDER BY fecha_ts DESC LIMIT %s",
+                (tenant_id, limit)
+            )
+            ordenes = [dict(o) for o in cur.fetchall()]
+            if not ordenes:
+                return []
+            ids = [o["id"] for o in ordenes]
+            cur.execute(
+                "SELECT id, n_ticket, fecha, producto, cantidad, precio_lista, precio_real, "
+                "       costo_unitario, total_venta, ganancia_bruta, estado, tipo_producto, "
+                "       variacion, consumo, orden_id "
+                "FROM ventas WHERE tenant_id = %s AND orden_id = ANY(%s::uuid[]) "
+                "ORDER BY fecha_ts ASC, id ASC",
+                (tenant_id, ids)
+            )
+            renglones = [dict(r) for r in cur.fetchall()]
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_conn(conn)
+
+    por_orden: dict = {}
+    for o in ordenes:
+        o["ventas"] = []
+        por_orden[o["id"]] = o
+    for r in renglones:
+        o = por_orden.get(r.get("orden_id"))
+        if o is not None:
+            o["ventas"].append(r)
+    return ordenes
 
 def insertar_venta(venta: dict, tenant_id: str, conn=None) -> None:
     """
@@ -38,8 +115,8 @@ def insertar_venta(venta: dict, tenant_id: str, conn=None) -> None:
         INSERT INTO ventas
             (Fecha, fecha_ts, Producto, producto_id, Cantidad, Precio_Lista,
              Precio_Real, Costo_Unitario, Total_Venta, Ganancia_Bruta, Estado, ID_Lote, tenant_id,
-             tipo_producto, variacion, consumo)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'Activo', %s, %s, %s, %s, %s)
+             tipo_producto, variacion, consumo, orden_id, n_ticket)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'Activo', %s, %s, %s, %s, %s, %s, %s)
     """
     params = (
         venta["fecha"],
@@ -56,7 +133,9 @@ def insertar_venta(venta: dict, tenant_id: str, conn=None) -> None:
         tenant_id,
         venta.get("tipo_producto", "stock"),
         venta.get("variacion", ""),
-        psycopg2.extras.Json(venta.get("consumo") or None)
+        psycopg2.extras.Json(venta.get("consumo") or None),
+        venta.get("orden_id"),
+        venta.get("n_ticket"),
     )
     if conn is not None:
         with conn.cursor() as cur:
@@ -290,6 +369,8 @@ def actualizar_venta(venta_id: int, fecha: str, cantidad: float, precio_real: fl
                      ganancia_bruta, psycopg2.extras.Json(consumo_nuevo or None),
                      venta_id, tenant_id)
                 )
+                # La orden debe reflejar el renglón editado
+                _recalcular_orden(cur, v.get("orden_id"), tenant_id)
                 conn.commit()
                 return {"ok": True, "id": venta_id}
             elif dif > 0:
@@ -328,6 +409,9 @@ def actualizar_venta(venta_id: int, fecha: str, cantidad: float, precio_real: fl
                 SET Fecha=%s, fecha_ts=%s, Cantidad=%s, Precio_Real=%s, Costo_Unitario=%s, Total_Venta=%s, Ganancia_Bruta=%s
                 WHERE id=%s AND tenant_id=%s
             """, (fecha, _parsear_ts(fecha), cantidad, precio_real, costo_unitario, total_venta, ganancia_bruta, venta_id, tenant_id))
+
+            # 4. La orden debe reflejar el renglón editado
+            _recalcular_orden(cur, v.get("orden_id"), tenant_id)
             conn.commit()
             return {"ok": True, "id": venta_id}
     except Exception as e:
@@ -336,18 +420,99 @@ def actualizar_venta(venta_id: int, fecha: str, cantidad: float, precio_real: fl
     finally:
         release_conn(conn)
 
+def _restaurar_stock_venta(cur, v: dict, tenant_id: str) -> float:
+    """
+    Devuelve al inventario el stock consumido por UN renglón de venta
+    (dentro de una transacción). Compartido por eliminar_venta y anular_orden.
+
+    - Compuesto: revierte su `consumo` (los lotes EXACTOS registrados).
+    - Stock: restaura al lote EXACTO que se vendió (ventas.ID_Lote); si ese
+      lote ya no existe, se recrea con los datos de la venta. Ventas antiguas
+      sin id_lote caen al match por costo+precio.
+    - Servicio: sin inventario, no restaura nada.
+
+    Devuelve las unidades restauradas.
+    """
+    stock_restaurado = 0.0
+    tipo = v.get("tipo_producto")
+
+    if tipo == "compuesto":
+        consumo = v.get("consumo")
+        if isinstance(consumo, str):
+            try:
+                consumo = json.loads(consumo)
+            except Exception:
+                consumo = None
+        _revertir_consumo(cur, consumo, tenant_id)
+        stock_restaurado = float(v["cantidad"] or 0)
+    elif tipo != "servicio":
+        # ── Producto de stock: restaurar al lote EXACTO de la venta ──
+        id_lote = v.get("id_lote")
+        cantidad = float(v.get("cantidad") or 0)
+        if id_lote and cantidad > 0:
+            cur.execute(
+                "SELECT 1 FROM lotes WHERE ID_Lote = %s AND tenant_id = %s",
+                (id_lote, tenant_id)
+            )
+            if cur.fetchone():
+                cur.execute(
+                    "UPDATE lotes SET Stock_Lote = Stock_Lote + %s, Estado = 'Activo' "
+                    "WHERE ID_Lote = %s AND tenant_id = %s",
+                    (cantidad, id_lote, tenant_id)
+                )
+            else:
+                # El lote fue eliminado: recrearlo con costo y precio de
+                # la venta original (no con precio = costo).
+                fe_recreacion = str(ahora_negocio(tenant_id))
+                cur.execute(
+                    "INSERT INTO lotes (ID_Lote, Producto, producto_id, Costo, Precio_Venta, "
+                    "Stock_Lote, Fecha_Entrada, fecha_entrada_ts, Estado, tenant_id) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'Activo', %s)",
+                    (id_lote, v["producto"], v["producto_id"], v.get("costo_unitario") or 0,
+                     v.get("precio_lista") or 0, cantidad,
+                     fe_recreacion, _parsear_ts(fe_recreacion), tenant_id)
+                )
+            stock_restaurado = cantidad
+        else:
+            # Venta antigua sin id_lote: fallback al comportamiento previo
+            # (sumar al lote que coincida por costo+precio o crear uno
+            # nuevo), pero DENTRO de la transacción con el cursor `cur`
+            # para no romper la atomicidad (agregar_lote usa el pool con
+            # auto-commit aparte y reintroduciría el Bug #3).
+            cur.execute(
+                "SELECT ID_Lote FROM lotes "
+                "WHERE producto_id=%s AND Costo=%s AND Precio_Venta=%s "
+                "AND Estado='Activo' AND tenant_id=%s LIMIT 1",
+                (v.get("producto_id"), v.get("costo_unitario") or 0,
+                 v.get("precio_lista") or 0, tenant_id)
+            )
+            fila_lote = cur.fetchone()
+            if fila_lote:
+                cur.execute(
+                    "UPDATE lotes SET Stock_Lote = Stock_Lote + %s "
+                    "WHERE ID_Lote=%s AND tenant_id=%s",
+                    (cantidad, fila_lote["ID_Lote"], tenant_id)
+                )
+            else:
+                nuevo_id = str(uuid.uuid4())[:12]
+                fe = str(ahora_negocio(tenant_id))
+                cur.execute(
+                    "INSERT INTO lotes (ID_Lote, Producto, producto_id, Costo, Precio_Venta, "
+                    "Stock_Lote, Fecha_Entrada, fecha_entrada_ts, Estado, tenant_id) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'Activo', %s)",
+                    (nuevo_id, v["producto"], v.get("producto_id"), v.get("costo_unitario") or 0,
+                     v.get("precio_lista") or 0, cantidad, fe, _parsear_ts(fe), tenant_id)
+                )
+            stock_restaurado = cantidad
+
+    return stock_restaurado
+
+
 def eliminar_venta(venta_id: int, tenant_id: str) -> dict:
     """
-    Anula una venta y restaura el stock en la MISMA transacción:
-    - Compuesto: revierte su `consumo` (los lotes EXACTOS registrados).
-    - Stock: restaura al lote EXACTO que se vendió (ventas.ID_Lote), en vez de
-      buscar por costo+precio (corrige el bug de "restaurar al lote
-      equivocado" cuando había varios lotes con el mismo costo/precio).
-      Si ese lote ya no existe, se recrea con los datos de la venta.
-    - Servicio: sin inventario, solo se anula.
-
-    Todo ocurre en un solo commit: nunca puede quedar el stock restaurado sin
-    la venta anulada (ni al revés), aunque el proceso muera a mitad.
+    Anula una venta y restaura el stock en la MISMA transacción (usa el helper
+    compartido _restaurar_stock_venta). La orden se recalcula; si era el último
+    renglón activo, la orden queda Anulada.
     """
     v_rows = query("SELECT * FROM ventas WHERE id=%s AND tenant_id=%s", (venta_id, tenant_id))
     if not v_rows:
@@ -359,88 +524,126 @@ def eliminar_venta(venta_id: int, tenant_id: str) -> dict:
     conn = get_conn()
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            tipo = v.get("tipo_producto")
-            stock_restaurado = 0
-
-            if tipo == "compuesto":
-                consumo = v.get("consumo")
-                if isinstance(consumo, str):
-                    try:
-                        consumo = json.loads(consumo)
-                    except Exception:
-                        consumo = None
-                _revertir_consumo(cur, consumo, tenant_id)
-                stock_restaurado = v["cantidad"]
-            elif tipo != "servicio":
-                # ── Producto de stock: restaurar al lote EXACTO de la venta ──
-                id_lote = v.get("id_lote")
-                cantidad = float(v.get("cantidad") or 0)
-                if id_lote and cantidad > 0:
-                    cur.execute(
-                        "SELECT 1 FROM lotes WHERE ID_Lote = %s AND tenant_id = %s",
-                        (id_lote, tenant_id)
-                    )
-                    if cur.fetchone():
-                        cur.execute(
-                            "UPDATE lotes SET Stock_Lote = Stock_Lote + %s, Estado = 'Activo' "
-                            "WHERE ID_Lote = %s AND tenant_id = %s",
-                            (cantidad, id_lote, tenant_id)
-                        )
-                    else:
-                        # El lote fue eliminado: recrearlo con costo y precio de
-                        # la venta original (no con precio = costo).
-                        fe_recreacion = str(ahora_negocio(tenant_id))
-                        cur.execute(
-                            "INSERT INTO lotes (ID_Lote, Producto, producto_id, Costo, Precio_Venta, "
-                            "Stock_Lote, Fecha_Entrada, fecha_entrada_ts, Estado, tenant_id) "
-                            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'Activo', %s)",
-                            (id_lote, v["producto"], v["producto_id"], v.get("costo_unitario") or 0,
-                             v.get("precio_lista") or 0, cantidad,
-                             fe_recreacion, _parsear_ts(fe_recreacion), tenant_id)
-                        )
-                    stock_restaurado = v["cantidad"]
-                else:
-                    # Venta antigua sin id_lote: fallback al comportamiento previo
-                    # (sumar al lote que coincida por costo+precio o crear uno
-                    # nuevo), pero DENTRO de la transacción con el cursor `cur`
-                    # para no romper la atomicidad (agregar_lote usa el pool con
-                    # auto-commit aparte y reintroduciría el Bug #3).
-                    cur.execute(
-                        "SELECT ID_Lote FROM lotes "
-                        "WHERE producto_id=%s AND Costo=%s AND Precio_Venta=%s "
-                        "AND Estado='Activo' AND tenant_id=%s LIMIT 1",
-                        (v["producto_id"], v.get("costo_unitario") or 0,
-                         v.get("precio_lista") or 0, tenant_id)
-                    )
-                    fila_lote = cur.fetchone()
-                    if fila_lote:
-                        cur.execute(
-                            "UPDATE lotes SET Stock_Lote = Stock_Lote + %s "
-                            "WHERE ID_Lote=%s AND tenant_id=%s",
-                            (cantidad, fila_lote["ID_Lote"], tenant_id)
-                        )
-                    else:
-                        nuevo_id = str(uuid.uuid4())[:12]
-                        fe = str(ahora_negocio(tenant_id))
-                        cur.execute(
-                            "INSERT INTO lotes (ID_Lote, Producto, producto_id, Costo, Precio_Venta, "
-                            "Stock_Lote, Fecha_Entrada, fecha_entrada_ts, Estado, tenant_id) "
-                            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'Activo', %s)",
-                            (nuevo_id, v["producto"], v["producto_id"], v.get("costo_unitario") or 0,
-                             v.get("precio_lista") or 0, cantidad, fe, _parsear_ts(fe), tenant_id)
-                        )
-                    stock_restaurado = v["cantidad"]
+            stock_restaurado = _restaurar_stock_venta(cur, v, tenant_id)
 
             # Marcar la venta anulada en la MISMA transacción (antes del commit)
             cur.execute(
                 "UPDATE ventas SET Estado='Inactivo' WHERE id=%s AND tenant_id=%s",
                 (venta_id, tenant_id)
             )
+            # La orden se recalcula: si era el último renglón activo, queda Anulada
+            _recalcular_orden(cur, v.get("orden_id"), tenant_id)
         conn.commit()
         return {"ok": True, "id": venta_id, "stock_restaurado": stock_restaurado}
     except Exception as e:
         conn.rollback()
         return {"ok": False, "mensaje": f"Error al anular la venta: {str(e)}"}
+    finally:
+        release_conn(conn)
+
+
+def anular_orden(orden_id: str, tenant_id: str) -> dict:
+    """
+    Anula un TICKET completo en UNA transacción: restaura el stock de todos sus
+    renglones activos (por lote exacto o revirtiendo el consumo de compuestos),
+    los marca Inactivo y deja la orden en estado 'Anulada'.
+    Idempotente: anular un ticket ya anulado no hace nada.
+    """
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT id, n_ticket, estado FROM ordenes WHERE id=%s::uuid AND tenant_id=%s FOR UPDATE",
+                (orden_id, tenant_id)
+            )
+            orden = cur.fetchone()
+            if not orden:
+                return {"ok": False, "mensaje": "Ticket no encontrado"}
+            if orden.get("estado") == "Anulada":
+                return {"ok": True, "anuladas": 0, "n_ticket": orden.get("n_ticket"),
+                        "mensaje": "El ticket ya estaba anulado"}
+
+            cur.execute(
+                "SELECT * FROM ventas WHERE orden_id=%s::uuid AND tenant_id=%s "
+                "AND estado != 'Inactivo' FOR UPDATE",
+                (orden_id, tenant_id)
+            )
+            renglones = cur.fetchall()
+
+            stock_total = 0.0
+            for v in renglones:
+                stock_total += _restaurar_stock_venta(cur, v, tenant_id)
+                cur.execute(
+                    "UPDATE ventas SET Estado='Inactivo' WHERE id=%s AND tenant_id=%s",
+                    (v["id"], tenant_id)
+                )
+
+            # Recalcula agregados (total/ganancia/unidades = 0) y pone estado 'Anulada'
+            _recalcular_orden(cur, orden_id, tenant_id)
+        conn.commit()
+        return {
+            "ok": True,
+            "anuladas": len(renglones),
+            "stock_restaurado": stock_total,
+            "n_ticket": orden.get("n_ticket"),
+        }
+    except Exception as e:
+        conn.rollback()
+        return {"ok": False, "mensaje": f"Error al anular el ticket: {str(e)}"}
+    finally:
+        release_conn(conn)
+
+
+def actualizar_orden(orden_id: str, fecha: str, tenant_id: str) -> dict:
+    """
+    Edita la FECHA de un ticket: cambia el día contable de la orden y de TODOS
+    sus renglones, conservando la hora original. No se permiten editar tickets
+    anulados (el stock ya fue devuelto).
+    """
+    fecha = (fecha or "").strip()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", fecha):
+        return {"ok": False, "tipo": "validacion", "mensaje": "Fecha inválida (formato YYYY-MM-DD)"}
+    try:
+        nuevo_dia = date.fromisoformat(fecha)
+    except ValueError:
+        return {"ok": False, "tipo": "validacion", "mensaje": "Fecha inválida"}
+
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT id, n_ticket, fecha_ts, estado FROM ordenes "
+                "WHERE id=%s::uuid AND tenant_id=%s FOR UPDATE",
+                (orden_id, tenant_id)
+            )
+            orden = cur.fetchone()
+            if not orden:
+                return {"ok": False, "mensaje": "Ticket no encontrado"}
+            if orden.get("estado") == "Anulada":
+                return {"ok": False, "tipo": "validacion",
+                        "mensaje": "No se puede editar un ticket anulado"}
+
+            # Conservar la hora original; cambiar solo el día (zona del negocio)
+            tz = zona_tenant(tenant_id)
+            viejo = _parsear_ts(orden["fecha_ts"]).astimezone(tz)
+            nuevo_ts = viejo.replace(year=nuevo_dia.year, month=nuevo_dia.month, day=nuevo_dia.day)
+
+            # Dual-write: fecha TEXT de los renglones + instante canónico
+            fecha_str = str(nuevo_ts)
+            cur.execute(
+                "UPDATE ordenes SET fecha_ts=%s WHERE id=%s::uuid AND tenant_id=%s",
+                (nuevo_ts, orden_id, tenant_id)
+            )
+            cur.execute(
+                "UPDATE ventas SET Fecha=%s, fecha_ts=%s "
+                "WHERE orden_id=%s::uuid AND tenant_id=%s",
+                (fecha_str, nuevo_ts, orden_id, tenant_id)
+            )
+        conn.commit()
+        return {"ok": True, "orden_id": str(orden_id), "n_ticket": orden.get("n_ticket"), "fecha": fecha}
+    except Exception as e:
+        conn.rollback()
+        return {"ok": False, "mensaje": f"Error al editar el ticket: {str(e)}"}
     finally:
         release_conn(conn)
 
@@ -613,7 +816,33 @@ def cobrar_carrito(items: list[dict], tenant_id: str) -> dict:
                 v["variacion"] = variacion
             ventas_a_guardar.extend(resultado)
 
+        # ── Cabecera de la ORDEN (migración 032): un cobro = un ticket ──
+        # El folio lo asigna el trigger trigger_folio_ordenes (advisory lock por
+        # tenant, concurrente-seguro). Los agregados salen de los renglones.
+        orden_id = None
+        n_ticket = None
+        if ventas_a_guardar:
+            fecha_orden = ventas_a_guardar[0]["fecha"]
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "INSERT INTO ordenes (tenant_id, n_ticket, fecha_ts, total, ganancia, cantidad_items, estado) "
+                    "VALUES (%s, NULL, %s, %s, %s, %s, 'Activa') "
+                    "RETURNING id, n_ticket",
+                    (
+                        tenant_id,
+                        _parsear_ts(fecha_orden),
+                        sum(float(v["total_venta"] or 0) for v in ventas_a_guardar),
+                        sum(float(v["ganancia_bruta"] or 0) for v in ventas_a_guardar),
+                        sum(float(v["cantidad"] or 0) for v in ventas_a_guardar),
+                    )
+                )
+                fila_orden = cur.fetchone()
+                orden_id = fila_orden["id"]
+                n_ticket = fila_orden["n_ticket"]
+
         for venta in ventas_a_guardar:
+            venta["orden_id"] = orden_id
+            venta["n_ticket"] = n_ticket
             insertar_venta(venta, tenant_id, conn=conn)
 
         total = sum(v["total_venta"] for v in ventas_a_guardar)
@@ -626,6 +855,8 @@ def cobrar_carrito(items: list[dict], tenant_id: str) -> dict:
             "ok": True,
             "ventas": len(ventas_a_guardar),
             "total_cobrado": total,
+            "orden_id": str(orden_id) if orden_id else None,
+            "n_ticket": n_ticket,
         }
     except ValueError as e:
         # Error de REGLA DE NEGOCIO (ej. compuesto sin receta): se distingue de

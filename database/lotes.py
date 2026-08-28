@@ -257,11 +257,31 @@ def actualizar_lote(id_lote: str, costo: float, precio_venta: float, stock: floa
 
     # 2. Recalcular ganancias en ventas asociadas a este lote
     execute("""
-        UPDATE ventas 
+        UPDATE ventas
         SET Costo_Unitario = %s,
             Ganancia_Bruta = (Precio_Real - %s) * Cantidad
         WHERE ID_Lote = %s AND Estado = 'Activo' AND tenant_id = %s
     """, (costo, costo, id_lote, tenant_id))
+
+    # 3. Las órdenes que contienen esas ventas deben reflejar la nueva ganancia
+    execute("""
+        UPDATE ordenes o
+        SET total = COALESCE(ag.total, 0),
+            ganancia = COALESCE(ag.ganancia, 0),
+            cantidad_items = COALESCE(ag.unidades, 0),
+            estado = CASE WHEN COALESCE(ag.activos, 0) = 0 THEN 'Anulada' ELSE 'Activa' END
+        FROM (
+            SELECT orden_id,
+                   SUM(total_venta) FILTER (WHERE estado != 'Inactivo') AS total,
+                   SUM(ganancia_bruta) FILTER (WHERE estado != 'Inactivo') AS ganancia,
+                   SUM(cantidad) FILTER (WHERE estado != 'Inactivo') AS unidades,
+                   COUNT(*) FILTER (WHERE estado != 'Inactivo') AS activos
+            FROM ventas
+            WHERE ID_Lote = %s AND tenant_id = %s
+            GROUP BY orden_id
+        ) ag
+        WHERE o.id = ag.orden_id AND o.tenant_id = %s
+    """, (id_lote, tenant_id, tenant_id))
 
     return {"ok": True, "id_lote": id_lote}
 

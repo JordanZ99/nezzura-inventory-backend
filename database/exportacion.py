@@ -154,13 +154,21 @@ def get_datos_tenant(tenant_id: str) -> dict:
         ventas = query(
             "SELECT id, n_ticket, Fecha, Producto, producto_id, Cantidad, Precio_Lista, "
             "       Precio_Real, Costo_Unitario, Total_Venta, Ganancia_Bruta, "
-            "       Estado, ID_Lote, tipo_producto, variacion, consumo "
+            "       Estado, ID_Lote, tipo_producto, variacion, consumo, orden_id "
             "FROM ventas WHERE tenant_id = %s ORDER BY Fecha DESC",
             (tenant_id,)
         )
         for v in ventas:
             v["consumo"] = _parsear_jsonb(v.get("consumo"))
         data["ventas"] = ventas
+
+    # ── Órdenes (tickets; cabecera de cada cobro) ──
+    if "ordenes" in tablas:
+        data["ordenes"] = query(
+            "SELECT id, tenant_id, n_ticket, fecha_ts, total, ganancia, cantidad_items, estado "
+            "FROM ordenes WHERE tenant_id = %s ORDER BY fecha_ts DESC",
+            (tenant_id,)
+        )
 
     # ── Gastos ──
     if "gastos" in tablas:
@@ -309,6 +317,19 @@ def _filas_para_xlsx(data: dict) -> dict[str, list[dict]]:
             "Estado": v.get("estado") or "",
         }
         for v in data.get("ventas", [])
+    ]
+
+    # Órdenes (tickets)
+    hojas["Ordenes"] = [
+        {
+            "Folio": o.get("n_ticket"),
+            "Fecha": str(o.get("fecha_ts") or ""),
+            "Total": o.get("total") or 0,
+            "Ganancia": o.get("ganancia") or 0,
+            "Unidades": o.get("cantidad_items") or 0,
+            "Estado": o.get("estado") or "",
+        }
+        for o in data.get("ordenes", [])
     ]
 
     # Gastos
