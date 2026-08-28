@@ -2,8 +2,11 @@
 
 from database.ventas import (
     get_ventas,
+    get_ordenes,
     actualizar_venta,
     eliminar_venta,
+    anular_orden,
+    actualizar_orden,
     cobrar_carrito as cobrar_carrito_atomico,
 )
 from database.conexion import query          # Necesario para leer la venta actual al procesar un PATCH parcial
@@ -36,9 +39,40 @@ class ActualizarVenta(BaseModel):
     total_venta   : Optional[float] = None
     ganancia_bruta: Optional[float] = None
 
+class ActualizarOrden(BaseModel):
+    fecha: str  # 'YYYY-MM-DD' — nuevo día contable del ticket (conserva la hora)
+
 @router.get("/")
 def listar_ventas(limit: int = 500, tenant_id: str = Depends(get_tenant_id)):
     resultado = get_ventas(tenant_id, limit)
+    return resultado
+
+@router.get("/ordenes")
+def listar_ordenes(limit: int = 500, tenant_id: str = Depends(get_tenant_id)):
+    """
+    Tickets (órdenes) con sus renglones anidados, más recientes primero.
+    Cada orden: id, n_ticket (folio), fecha (ISO con zona), total, ganancia,
+    cantidad_items (unidades), estado y ventas[] (renglones de la venta).
+    """
+    return get_ordenes(tenant_id, limit)
+
+@router.patch("/ordenes/{orden_id}")
+def editar_orden(orden_id: str, data: ActualizarOrden, tenant_id: str = Depends(get_tenant_id)):
+    """Edita la fecha de un ticket (cascada a todos sus renglones)."""
+    resultado = actualizar_orden(orden_id, data.fecha, tenant_id)
+    if not resultado.get("ok"):
+        raise HTTPException(
+            status_code=422 if resultado.get("tipo") == "validacion" else 400,
+            detail=resultado.get("mensaje"),
+        )
+    return resultado
+
+@router.delete("/ordenes/{orden_id}")
+def anular_ticket(orden_id: str, tenant_id: str = Depends(get_tenant_id)):
+    """Anula un ticket completo: restaura el stock de todos sus renglones."""
+    resultado = anular_orden(orden_id, tenant_id)
+    if not resultado.get("ok"):
+        raise HTTPException(status_code=400, detail=resultado.get("mensaje"))
     return resultado
 
 @router.post("/cobrar")
