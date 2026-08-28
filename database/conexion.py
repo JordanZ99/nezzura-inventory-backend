@@ -80,31 +80,75 @@ def execute(sql: str, params: tuple = None) -> None:
 
 def _dividir_sql(sql: str) -> list[str]:
     """Divide un script SQL en statements individuales, respetando bloques
-    $$...$$ (las migraciones 003/006 usan DO blocks con `;` internos)."""
+    $$...$$ (las migraciones 003/006 usan DO blocks con `;` internos), así como
+    comentarios de línea (--), comentarios de bloque (/* ... */) y cadenas literales ('...')."""
     statements = []
     actual = []
     i = 0
     en_dolar = False
-    while i < len(sql):
+    en_comentario_linea = False
+    en_comentario_bloque = False
+    en_cadena = False
+    
+    n = len(sql)
+    while i < n:
+        # Detectar delimitadores de comentario, cadena o bloque de forma segura
+        # sólo si no estamos ya dentro de otro tipo de delimitador.
+        if not en_comentario_linea and not en_comentario_bloque and not en_cadena:
+            if sql.startswith("$$", i):
+                en_dolar = not en_dolar
+                actual.append("$$")
+                i += 2
+                continue
+            if sql.startswith("--", i):
+                en_comentario_linea = True
+                actual.append("--")
+                i += 2
+                continue
+            if sql.startswith("/*", i):
+                en_comentario_bloque = True
+                actual.append("/*")
+                i += 2
+                continue
+        
         c = sql[i]
-        if sql.startswith("$$", i):
-            en_dolar = not en_dolar
-            actual.append("$$")
-            i += 2
-            continue
-        if c == ";" and not en_dolar:
-            stmt = "".join(actual).strip()
-            if stmt:
-                statements.append(stmt)
-            actual = []
-            i += 1
-            continue
+        
+        if en_comentario_linea:
+            if c in ("\n", "\r"):
+                en_comentario_linea = False
+        elif en_comentario_bloque:
+            if sql.startswith("*/", i):
+                en_comentario_bloque = False
+                actual.append("*/")
+                i += 2
+                continue
+        elif en_cadena:
+            # Manejar el escape estándar de comilla simple en SQL: ''
+            if sql.startswith("''", i):
+                actual.append("''")
+                i += 2
+                continue
+            if c == "'":
+                en_cadena = False
+        else: # Código SQL normal
+            if c == "'":
+                en_cadena = True
+            elif c == ";" and not en_dolar:
+                stmt = "".join(actual).strip()
+                if stmt:
+                    statements.append(stmt)
+                actual = []
+                i += 1
+                continue
+                
         actual.append(c)
         i += 1
+        
     stmt = "".join(actual).strip()
     if stmt:
         statements.append(stmt)
     return statements
+
 
 
 def _ejecutar_migraciones(cur) -> None:
