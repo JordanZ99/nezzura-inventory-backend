@@ -24,8 +24,20 @@ class ItemCarrito(BaseModel):
     id_lote    : Optional[str] = None
     variacion  : Optional[str] = None  # Nombre de la variación vendida (ej. "Doble", "S")
 
+class PagoItem(BaseModel):
+    metodo    : str          # 'efectivo' | 'tarjeta_debito' | 'tarjeta_credito'
+    monto     : float
+    referencia: Optional[str] = None  # útlimos 4 dígitos / folio de voucher (opcional)
+
+class PagoCarrito(BaseModel):
+    metodo        : str                      # 'efectivo' | 'tarjeta_*' | 'mixto'
+    propina       : float = 0.0
+    pagos         : Optional[list[PagoItem]] = None  # obligatorio en mixto
+    monto_recibido: Optional[float] = None           # solo efectivo (cálculo de cambio)
+
 class Carrito(BaseModel):
     items: list[ItemCarrito]
+    pago : Optional[PagoCarrito] = None      # None = cobro legado sin registrar método
 
 class ActualizarVenta(BaseModel):
     # Todos los campos son opcionales para soportar PATCH parcial.
@@ -98,7 +110,19 @@ def cobrar_carrito(carrito: Carrito, tenant_id: str = Depends(get_tenant_id)):
         for item in carrito.items
     ]
 
-    resultado = cobrar_carrito_atomico(items, tenant_id)
+    pago = None
+    if carrito.pago is not None:
+        pago = {
+            "metodo": carrito.pago.metodo,
+            "propina": carrito.pago.propina,
+            "pagos": (
+                [{"metodo": p.metodo, "monto": p.monto, "referencia": p.referencia} for p in carrito.pago.pagos]
+                if carrito.pago.pagos is not None else None
+            ),
+            "monto_recibido": carrito.pago.monto_recibido,
+        }
+
+    resultado = cobrar_carrito_atomico(items, tenant_id, pago=pago)
     if not resultado.get("ok"):
         # Errores de regla de negocio (ej. compuesto sin receta) → 422;
         # errores internos/db → 500.

@@ -5,7 +5,7 @@ import uuid
 from datetime import date
 from database.conexion import query, execute, get_conn, release_conn
 from database.lotes import descontar_stock_peps
-from database.helpers import ahora_negocio, _parsear_ts, zona_tenant
+from database.helpers import ahora_negocio, _parsear_ts, zona_tenant, hoy_negocio
 
 def get_ventas(tenant_id: str, limit: int = 500) -> list[dict]:
     """Lee ventas del usuario ordenadas por fecha descendente."""
@@ -54,7 +54,8 @@ def get_ordenes(tenant_id: str, limit: int = 500) -> list[dict]:
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
-                "SELECT id, n_ticket, fecha_ts, total, ganancia, cantidad_items, estado "
+                "SELECT id, n_ticket, fecha_ts, total, ganancia, cantidad_items, estado, "
+                "       metodo_pago, pagos, propina, monto_recibido, cambio, comision_total, turno_id "
                 "FROM ordenes WHERE tenant_id = %s "
                 "ORDER BY fecha_ts DESC LIMIT %s",
                 (tenant_id, limit)
@@ -651,7 +652,95 @@ def actualizar_orden(orden_id: str, fecha: str, tenant_id: str) -> dict:
         release_conn(conn)
 
 
-def cobrar_carrito(items: list[dict], tenant_id: str) -> dict:
+# Métodos de pago (Fase A de cobro). En las órdenes 'mixto' también existe;
+# en cada pago individual solo los métodos reales.
+METODOS_PAGO = ("efectivo", "tarjeta_debito", "tarjeta_credito")
+METODOS_ORDEN = METODOS_PAGO + ("mixto",)
+
+
+def _procesar_pago(pago: dict | None, total_venta: float, terminales_map: dict | None = None) -> dict:
+    """
+    Valida y normaliza el pago de un carrito; devuelve las columnas para ordenes.
+
+    Reglas:
+      - Sin pago (API legada) → metodo_pago/pagos NULL, propina 0.
+      - total_a_pagar = total_venta (productos) + propina.
+      - Método simple: se genera UN pago por el total_a_pagar; en efectivo
+        monto_recibido >= total_a_pagar y cambio = recibido - total_a_pagar.
+      - Mixto: lista de pagos reales cuya suma debe cuadrar (±1 centavo).
+      - Pagos con tarjeta pueden llevar terminal_id: la comisión se calcula con
+        la tarifa de ESA terminal (pct débito/crédito + cuota fija) y queda
+        dentro de cada pago + comision_total de la orden (Fase B).
+    Errores de regla de negocio → ValueError (el router responde 422).
+    """
+    if not pago:
+        return {"metodo_pago": None, "pagos": None, "propina": 0.0,
+                "monto_recibido": None, "cambio": None, "comision_total": 0.0}
+
+    metodo = str(pago.get("metodo") or "").strip()
+    if metodo not in METODOS_ORDEN:
+        raise ValueError(f"Método de pago inválido: '{metodo}'")
+
+    propina = round(float(pago.get("propina") or 0), 2)
+    if propina < 0:
+        raise ValueError("La propina no puede ser negativa")
+    total_a_pagar = round(total_venta + propina, 2)
+    recibido = None
+    cambio = None
+
+    if metodo == "mixto":
+        pagos_in = pago.get("pagos") or []
+        if len(pagos_in) < 2:
+            raise ValueError("El pago mixto requiere al menos dos pagos")
+        pagos = []
+        for p in pagos_in:
+            m = str(p.get("metodo") or "").strip()
+            if m not in METODOS_PAGO:
+                raise ValueError(f"Método de pago inválido: '{m}'")
+            monto = round(float(p.get("monto") or 0), 2)
+            if monto <= 0:
+                raise ValueError("Los montos de cada pago deben ser mayores a 0")
+            pagos.append({"metodo": m, "monto": monto,
+                          "referencia": (str(p.get("referencia")) or "").strip() or None,
+                          "terminal_id": p.get("terminal_id") or None})
+        if abs(sum(p["monto"] for p in pagos) - total_a_pagar) > 0.01:
+            raise ValueError(
+                f"La suma de los pagos (${sum(p['monto'] for p in pagos):.2f}) "
+                f"no coincide con el total a pagar (${total_a_pagar:.2f})"
+            )
+    else:
+        if metodo == "efectivo":
+            recibido_raw = pago.get("monto_recibido")
+            recibido = round(float(recibido_raw), 2) if recibido_raw is not None else total_a_pagar
+            if recibido < total_a_pagar:
+                raise ValueError(
+                    f"El monto recibido (${recibido:.2f}) es menor al total a pagar (${total_a_pagar:.2f})"
+                )
+            cambio = round(recibido - total_a_pagar, 2)
+        pagos = [{"metodo": metodo, "monto": total_a_pagar, "referencia":
+                  (str(pago.get("referencia")) or "").strip() or None,
+                  "terminal_id": pago.get("terminal_id") or None}]
+
+    # ── Comisiones de terminal (Fase B) ──
+    comision_total = 0.0
+    for p in pagos:
+        tid = p.get("terminal_id")
+        t = terminales_map.get(tid) if (tid and terminales_map) else None
+        if p["metodo"] in ("tarjeta_debito", "tarjeta_credito") and t:
+            pct = t["comision_debito_pct"] if p["metodo"] == "tarjeta_debito" else t["comision_credito_pct"]
+            comision = round(p["monto"] * float(pct) / 100.0 + float(t["comision_fija"] or 0), 2)
+            p["comision"] = comision
+            p["terminal_nombre"] = t["nombre"]
+            comision_total += comision
+        else:
+            p["comision"] = 0.0
+
+    return {"metodo_pago": metodo, "pagos": pagos, "propina": propina,
+            "monto_recibido": recibido, "cambio": cambio,
+            "comision_total": round(comision_total, 2)}
+
+
+def cobrar_carrito(items: list[dict], tenant_id: str, pago: dict | None = None) -> dict:
     """
     Cobra un carrito completo de forma ATÓMICA (todo en una sola transacción).
 
@@ -826,22 +915,67 @@ def cobrar_carrito(items: list[dict], tenant_id: str) -> dict:
         n_ticket = None
         if ventas_a_guardar:
             fecha_orden = ventas_a_guardar[0]["fecha"]
+            # Pago (Fase A/B): método, propina, mixto, cambio, comisiones de terminal.
+            total_productos = sum(float(v["total_venta"] or 0) for v in ventas_a_guardar)
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(
-                    "INSERT INTO ordenes (tenant_id, n_ticket, fecha_ts, total, ganancia, cantidad_items, estado) "
-                    "VALUES (%s, NULL, %s, %s, %s, %s, 'Activa') "
+                    "SELECT id, nombre, comision_debito_pct, comision_credito_pct, comision_fija "
+                    "FROM terminales WHERE tenant_id = %s AND activo = true", (tenant_id,)
+                )
+                terminales_map = {str(t["id"]): t for t in cur.fetchall()}
+            pago_cols = _procesar_pago(pago, total_productos, terminales_map)
+
+            # Turno abierto (Fase C): si existe, el ticket se adscribe a él
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT id FROM turnos WHERE tenant_id = %s AND estado = 'Abierto' "
+                    "ORDER BY abierta_en DESC LIMIT 1", (tenant_id,)
+                )
+                fila_turno = cur.fetchone()
+                turno_id = fila_turno["id"] if fila_turno else None
+
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "INSERT INTO ordenes (tenant_id, n_ticket, fecha_ts, total, ganancia, cantidad_items, estado, "
+                    "metodo_pago, pagos, propina, monto_recibido, cambio, comision_total, turno_id) "
+                    "VALUES (%s, NULL, %s, %s, %s, %s, 'Activa', %s, %s, %s, %s, %s, %s, %s) "
                     "RETURNING id, n_ticket",
                     (
                         tenant_id,
                         _parsear_ts(fecha_orden),
-                        sum(float(v["total_venta"] or 0) for v in ventas_a_guardar),
+                        total_productos,
                         sum(float(v["ganancia_bruta"] or 0) for v in ventas_a_guardar),
                         sum(float(v["cantidad"] or 0) for v in ventas_a_guardar),
+                        pago_cols["metodo_pago"],
+                        psycopg2.extras.Json(pago_cols["pagos"]),
+                        pago_cols["propina"],
+                        pago_cols["monto_recibido"],
+                        pago_cols["cambio"],
+                        pago_cols["comision_total"],
+                        turno_id,
                     )
                 )
                 fila_orden = cur.fetchone()
                 orden_id = fila_orden["id"]
                 n_ticket = fila_orden["n_ticket"]
+
+            # Gasto automático de comisiones (si el tenant lo activó)
+            if pago_cols["comision_total"] > 0:
+                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                    cur.execute(
+                        "SELECT gasto_comision_automatico FROM tenants WHERE id = %s", (tenant_id,)
+                    )
+                    fila_flag = cur.fetchone()
+                if fila_flag and fila_flag["gasto_comision_automatico"]:
+                    with conn.cursor() as cur:
+                        fecha_hoy = hoy_negocio(tenant_id).isoformat()
+                        cur.execute(
+                            "INSERT INTO gastos (Fecha, fecha_negocio, Categoria, Descripcion, Monto, Tenant_ID, Estado) "
+                            "VALUES (%s, %s, %s, %s, %s, %s, 'pagado')",
+                            (fecha_hoy, fecha_hoy, "Comisiones bancarias",
+                             f"Comisión de terminal — ticket #{n_ticket}",
+                             pago_cols["comision_total"], tenant_id)
+                        )
 
         for venta in ventas_a_guardar:
             venta["orden_id"] = orden_id
@@ -860,6 +994,9 @@ def cobrar_carrito(items: list[dict], tenant_id: str) -> dict:
             "total_cobrado": total,
             "orden_id": str(orden_id) if orden_id else None,
             "n_ticket": n_ticket,
+            "metodo_pago": pago_cols["metodo_pago"] if ventas_a_guardar else None,
+            "propina": pago_cols["propina"] if ventas_a_guardar else 0,
+            "cambio": pago_cols["cambio"] if ventas_a_guardar else None,
         }
     except ValueError as e:
         # Error de REGLA DE NEGOCIO (ej. compuesto sin receta): se distingue de
