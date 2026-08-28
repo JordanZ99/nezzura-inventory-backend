@@ -7,7 +7,7 @@
 
 import re
 import time
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from psycopg2.extras import RealDictCursor
 from database.conexion import query, execute
@@ -91,6 +91,61 @@ def fecha_negocio_de(valor, tenant_id: str) -> date:
     if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
         return date.fromisoformat(s)
     return _parsear_ts(s).astimezone(zona_tenant(tenant_id)).date()
+
+
+# ── Rangos de fechas para listados (?desde / ?hasta) ──
+# Semántica: ventana [inicio, fin) — 'fin' es EXCLUSIVA. Un rango de un solo
+# día se expresa como (d, d+1). Todo se calcula con el día contable del
+# negocio (zona horaria del tenant), nunca con la hora del servidor.
+
+def rango_mes_actual(tenant_id: str) -> tuple[date, date]:
+    """[primer día del mes contable actual, primer día del mes siguiente)."""
+    hoy = hoy_negocio(tenant_id)
+    inicio = hoy.replace(day=1)
+    if hoy.month == 12:
+        siguiente = date(hoy.year + 1, 1, 1)
+    else:
+        siguiente = date(hoy.year, hoy.month + 1, 1)
+    return inicio, siguiente
+
+
+def resolver_rango_q(
+    tenant_id: str,
+    desde: str | None,
+    hasta: str | None,
+) -> tuple[date | None, date | None]:
+    """
+    Resuelve los query params ?desde/?hasta ('YYYY-MM-DD') a un rango de días
+    contables [inicio, fin_exclusiva). Si no llega ninguno de los dos, usa el
+    mes contable actual. Lanza ValueError con formato inválido (el router lo
+    traduce a HTTP 422).
+    """
+    if not desde and not hasta:
+        return rango_mes_actual(tenant_id)
+    try:
+        d_desde = date.fromisoformat(desde) if desde else None
+        d_hasta = date.fromisoformat(hasta) if hasta else None
+    except ValueError:
+        raise ValueError("Fechas inválidas: usa formato YYYY-MM-DD en 'desde' y 'hasta'")
+    if d_hasta is not None:
+        d_hasta = d_hasta + timedelta(days=1)  # 'hasta' completo incluido
+    return d_desde, d_hasta
+
+
+def ventana_ts_de_rango(
+    tenant_id: str,
+    desde: date | None,
+    hasta: date | None,
+) -> tuple[datetime | None, datetime | None]:
+    """
+    Convierte límites de día contable [desde, hasta) a instantes tz-aware para
+    filtrar columnas TIMESTAMPTZ (ventas.fecha_ts, ordenes.fecha_ts) usando
+    los índices (tenant_id, fecha_ts). None = límite abierto.
+    """
+    tz = zona_tenant(tenant_id)
+    d_desde = datetime.combine(desde, datetime.min.time(), tzinfo=tz) if desde else None
+    d_hasta = datetime.combine(hasta, datetime.min.time(), tzinfo=tz) if hasta else None
+    return d_desde, d_hasta
 
 
 def _q(conn, sql: str, params: tuple = ()) -> list[dict]:

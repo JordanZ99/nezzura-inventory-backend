@@ -3,6 +3,8 @@
 # CRUD sobre la tabla gastos.
 # ==============================================================================
 
+from datetime import date
+
 from database.conexion import query, execute
 from database.helpers import fecha_negocio_de
 
@@ -105,13 +107,30 @@ def eliminar_categoria_gasto(nombre: str, tenant_id: str) -> dict:
     return {"ok": True, "categoria_eliminada": nombre}
 
 
-def get_gastos(tenant_id: str) -> list[dict]:
-    """Lee todos los gastos ordenados por fecha descendente."""
-    return query(
+def get_gastos(
+    tenant_id: str,
+    desde: date | None = None,
+    hasta: date | None = None,
+) -> list[dict]:
+    """
+    Gastos ordenados por día contable descendente. desde/hasta acotan la
+    ventana [inclusive, exclusiva) sobre fecha_negocio (día contable canónico,
+    NOT NULL con índice idx_gastos_tenant_fecha_negocio); None = abierto.
+    Sin filtros el router pasa el mes contable actual.
+    """
+    sql = (
         "SELECT id, Fecha, Categoria, Descripcion, Monto, Estado, Gasto_Programado_ID "
-        "FROM gastos WHERE Tenant_ID = %s ORDER BY Fecha DESC",
-        (tenant_id,)
+        "FROM gastos WHERE Tenant_ID = %s"
     )
+    params: list = [tenant_id]
+    if desde is not None:
+        sql += " AND fecha_negocio >= %s"
+        params.append(desde)
+    if hasta is not None:
+        sql += " AND fecha_negocio < %s"
+        params.append(hasta)
+    sql += " ORDER BY fecha_negocio DESC, id DESC"
+    return query(sql, tuple(params))
 
 
 def insertar_gasto(

@@ -11,6 +11,7 @@ from database.ventas import (
 )
 from database.conexion import query          # Necesario para leer la venta actual al procesar un PATCH parcial
 from dependencies import get_tenant_id  # <--- Importación segura
+from database.helpers import resolver_rango_q, ventana_ts_de_rango
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from typing import Optional
@@ -55,18 +56,44 @@ class ActualizarOrden(BaseModel):
     fecha: str  # 'YYYY-MM-DD' — nuevo día contable del ticket (conserva la hora)
 
 @router.get("/")
-def listar_ventas(limit: int = 500, tenant_id: str = Depends(get_tenant_id)):
-    resultado = get_ventas(tenant_id, limit)
+def listar_ventas(
+    limit: int = 500,
+    desde: Optional[str] = None,
+    hasta: Optional[str] = None,
+    tenant_id: str = Depends(get_tenant_id),
+):
+    """
+    Renglones de venta en la ventana contable pedida (?desde/?hasta, 'YYYY-MM-DD').
+    Sin ?desde ni ?hasta devuelve SOLO el mes contable actual (zona horaria del
+    negocio) para no transportar todo el historial en cada carga.
+    """
+    try:
+        d_desde, d_hasta = resolver_rango_q(tenant_id, desde, hasta)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    desde_ts, hasta_ts = ventana_ts_de_rango(tenant_id, d_desde, d_hasta)
+    resultado = get_ventas(tenant_id, limit, desde_ts, hasta_ts)
     return resultado
 
 @router.get("/ordenes")
-def listar_ordenes(limit: int = 500, tenant_id: str = Depends(get_tenant_id)):
+def listar_ordenes(
+    limit: int = 500,
+    desde: Optional[str] = None,
+    hasta: Optional[str] = None,
+    tenant_id: str = Depends(get_tenant_id),
+):
     """
     Tickets (órdenes) con sus renglones anidados, más recientes primero.
     Cada orden: id, n_ticket (folio), fecha (ISO con zona), total, ganancia,
     cantidad_items (unidades), estado y ventas[] (renglones de la venta).
+    Sin ?desde ni ?hasta devuelve SOLO el mes contable actual.
     """
-    return get_ordenes(tenant_id, limit)
+    try:
+        d_desde, d_hasta = resolver_rango_q(tenant_id, desde, hasta)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    desde_ts, hasta_ts = ventana_ts_de_rango(tenant_id, d_desde, d_hasta)
+    return get_ordenes(tenant_id, limit, desde_ts, hasta_ts)
 
 @router.patch("/ordenes/{orden_id}")
 def editar_orden(orden_id: str, data: ActualizarOrden, tenant_id: str = Depends(get_tenant_id)):
