@@ -9,7 +9,7 @@
 #   - variaciones.py    → CRUD de variaciones
 #   - recetas.py        → recetas (BOM) de compuestos
 #   - categorias.py     → CRUD de categorías
-#   - helpers.py        → helpers compartidos (_q, _e, _TZ, categorías, ...)
+#   - helpers.py        → helpers compartidos (_q, _e, zona horaria del negocio, categorías, ...)
 #
 # Refactor Fase 3: descontar_stock_peps se dividió en _registro_venta,
 # _crear_lote_virtual y _consumir_lotes_peps (misma lógica, sin duplicación
@@ -17,9 +17,8 @@
 # ==============================================================================
 
 import uuid
-import datetime
 from database.conexion import query, execute
-from database.helpers import _TZ, _q, _e, _obtener_categorias_subquery, _sincronizar_categorias, _resolver_producto_id
+from database.helpers import _q, _e, _obtener_categorias_subquery, _sincronizar_categorias, _resolver_producto_id, ahora_negocio, _parsear_ts
 
 
 def get_lotes(tenant_id: str) -> list[dict]:
@@ -29,6 +28,7 @@ def get_lotes(tenant_id: str) -> list[dict]:
         SELECT 
             l.id as id,
             l.id_lote as id_lote,
+            l.producto_id as producto_id,
             l.producto as producto,
             l.costo as costo,
             l.precio_venta as precio_venta,
@@ -43,7 +43,7 @@ def get_lotes(tenant_id: str) -> list[dict]:
             p.visible_en_catalogo as visible_en_catalogo,
             {cat_subquery}
         FROM lotes l
-        LEFT JOIN productos p ON l.Producto = p.Producto AND l.tenant_id = p.tenant_id
+        JOIN productos p ON p.id = l.producto_id AND p.tenant_id = l.tenant_id
         LEFT JOIN producto_variaciones v ON v.id = l.variacion_id
         WHERE l.Estado = 'Activo' AND l.tenant_id = %s
         ORDER BY l.Producto, l.Fecha_Entrada ASC
@@ -55,14 +55,17 @@ def get_detalle_lotes(producto: str, tenant_id: str) -> list[dict]:
     a la que pertenece cada lote (None = stock base del producto)."""
     return query("""
         SELECT 
-            l.id, l.id_lote, l.producto, l.costo, l.precio_venta, l.stock_lote,
+            l.id, l.id_lote, l.producto_id, l.producto, l.costo, l.precio_venta, l.stock_lote,
             l.fecha_entrada, l.estado, l.etiqueta,
             l.variacion_id, v.nombre AS variacion
         FROM lotes l
         LEFT JOIN producto_variaciones v ON v.id = l.variacion_id
-        WHERE l.Producto = %s AND l.Estado = 'Activo' AND l.tenant_id = %s
+        WHERE l.producto_id = (
+            SELECT p.id FROM productos p
+            WHERE p.Producto = %s AND p.tenant_id = %s
+        ) AND l.Estado = 'Activo' AND l.tenant_id = %s
         ORDER BY l.Fecha_Entrada DESC
-    """, (producto, tenant_id))
+    """, (producto, tenant_id, tenant_id))
 
 
 def agregar_lote(
@@ -189,11 +192,11 @@ def agregar_lote(
     # (evita que la etiqueta se pierda al restockear al mismo precio).
     existente = query("""
         SELECT id_lote FROM lotes
-        WHERE Producto=%s AND Costo=%s AND Precio_Venta=%s AND Estado='Activo' AND tenant_id = %s
+        WHERE producto_id=%s AND Costo=%s AND Precio_Venta=%s AND Estado='Activo' AND tenant_id = %s
           AND (%s = '' OR COALESCE(etiqueta, '') = %s)
           AND variacion_id IS NOT DISTINCT FROM %s
         LIMIT 1
-    """, (producto, costo, precio_venta, tenant_id, etiqueta_limpia, etiqueta_limpia, variacion_id))
+    """, (product_id, costo, precio_venta, tenant_id, etiqueta_limpia, etiqueta_limpia, variacion_id))
 
     if existente:
         execute(
@@ -203,12 +206,12 @@ def agregar_lote(
         return {"accion": "stock_sumado", "producto": producto, "cantidad": stock}
     else:
         id_lote = str(uuid.uuid4())[:12]
-        fecha   = str(datetime.datetime.now(_TZ))
+        fecha   = str(ahora_negocio(tenant_id))
         execute("""
-            INSERT INTO lotes (ID_Lote, Producto, Costo, Precio_Venta,
-                               Stock_Lote, Fecha_Entrada, Estado, tenant_id, etiqueta, variacion_id)
-            VALUES (%s, %s, %s, %s, %s, %s, 'Activo', %s, %s, %s)
-        """, (id_lote, producto, costo, precio_venta, stock, fecha, tenant_id, etiqueta_limpia, variacion_id))
+            INSERT INTO lotes (ID_Lote, Producto, producto_id, Costo, Precio_Venta,
+                               Stock_Lote, Fecha_Entrada, fecha_entrada_ts, Estado, tenant_id, etiqueta, variacion_id)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'Activo', %s, %s, %s)
+        """, (id_lote, producto, product_id, costo, precio_venta, stock, fecha, _parsear_ts(fecha), tenant_id, etiqueta_limpia, variacion_id))
         return {"accion": "lote_creado", "producto": producto, "id_lote": id_lote}
 
 
@@ -283,6 +286,10 @@ def eliminar_lote(id_lote: str, tenant_id: str) -> dict:
         return {"ok": False, "mensaje": "Lote no encontrado"}
 
     producto = info[0]["producto"]
+    producto_id = query(
+        "SELECT producto_id FROM lotes WHERE ID_Lote = %s AND tenant_id = %s",
+        (id_lote, tenant_id)
+    )[0]["producto_id"]
 
     # Marcar el lote como Inactivo y stock en 0
     execute(
@@ -293,16 +300,16 @@ def eliminar_lote(id_lote: str, tenant_id: str) -> dict:
     # Verificar si quedan lotes activos para este producto
     # (descontando el lote que acabamos de desactivar)
     activos_restantes = query(
-        "SELECT COUNT(*) as total FROM lotes WHERE Producto = %s AND Estado = 'Activo' AND tenant_id = %s",
-        (producto, tenant_id)
+        "SELECT COUNT(*) as total FROM lotes WHERE producto_id = %s AND Estado = 'Activo' AND tenant_id = %s",
+        (producto_id, tenant_id)
     )
     producto_desactivado = False
 
     if activos_restantes and activos_restantes[0]["total"] == 0:
         # No quedan lotes activos → desactivar el producto también
         execute(
-            "UPDATE productos SET Estado = 'Inactivo' WHERE Producto = %s AND tenant_id = %s",
-            (producto, tenant_id)
+            "UPDATE productos SET Estado = 'Inactivo' WHERE id = %s AND tenant_id = %s",
+            (producto_id, tenant_id)
         )
         producto_desactivado = True
 
@@ -327,10 +334,11 @@ def _registro_venta(
     precio_real: float,
     costo_unitario: float,
     id_lote: str,
+    tenant_id: str,
     fecha: str | None = None,
 ) -> dict:
     """Construye el registro de venta que devuelve descontar_stock_peps."""
-    fecha = fecha or str(datetime.datetime.now(_TZ))
+    fecha = fecha or str(ahora_negocio(tenant_id))
     return {
         "fecha"          : fecha,
         "producto"       : producto,
@@ -350,11 +358,18 @@ def _crear_lote_virtual(conn, producto: str, precio_real: float, cantidad: float
     y devuelve (id_lote, fecha). La fecha se reutiliza en el registro de venta.
     """
     nuevo_id = str(uuid.uuid4())[:12]
-    fecha = fecha or str(datetime.datetime.now(_TZ))
+    fecha = fecha or str(ahora_negocio(tenant_id))
+    producto_row = _q(conn,
+        "SELECT id FROM productos WHERE Producto = %s AND tenant_id = %s",
+        (producto, tenant_id)
+    )
+    if not producto_row:
+        raise ValueError(f"Producto no encontrado: {producto}")
+    producto_id = producto_row[0]["id"]
     _e(conn,
-        "INSERT INTO lotes (ID_Lote, Producto, Costo, Precio_Venta, Stock_Lote, Fecha_Entrada, Estado, tenant_id, variacion_id) "
-        "VALUES (%s, %s, %s, %s, %s, %s, 'Activo', %s, %s)",
-        (nuevo_id, producto, 0, precio_real, -cantidad, fecha, tenant_id, variacion_id)
+        "INSERT INTO lotes (ID_Lote, Producto, producto_id, Costo, Precio_Venta, Stock_Lote, Fecha_Entrada, fecha_entrada_ts, Estado, tenant_id, variacion_id) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'Activo', %s, %s)",
+        (nuevo_id, producto, producto_id, 0, precio_real, -cantidad, fecha, _parsear_ts(fecha), tenant_id, variacion_id)
     )
     return nuevo_id, fecha
 
@@ -388,7 +403,7 @@ def _consumir_lotes_peps(conn, lotes: list[dict], producto: str, cantidad_total:
         lote["stock_lote"] = nuevo_stock
 
         ventas_generadas.append(_registro_venta(
-            producto, consumir, lote["precio_venta"], precio_real, lote["costo"], lote["id_lote"]
+            producto, consumir, lote["precio_venta"], precio_real, lote["costo"], lote["id_lote"], tenant_id
         ))
         restante -= consumir
 
@@ -434,15 +449,16 @@ def descontar_stock_peps(
     if id_lote is not None:
         lotes = _q(conn, """
             SELECT * FROM lotes
-            WHERE ID_Lote=%s AND Producto=%s AND Estado='Activo' AND tenant_id = %s
+            WHERE ID_Lote=%s AND producto_id=(SELECT id FROM productos WHERE Producto=%s AND tenant_id=%s)
+              AND Estado='Activo' AND tenant_id = %s
             FOR UPDATE
-        """, (id_lote, producto, tenant_id))
+        """, (id_lote, producto, tenant_id, tenant_id))
 
         if not lotes:
             # Si no existe el lote, crear uno virtual con stock negativo
             # (comportamiento consistente con el PEPS normal)
             nuevo_id, fecha = _crear_lote_virtual(conn, producto, precio_real, cantidad_total, tenant_id, variacion_id)
-            return [_registro_venta(producto, cantidad_total, precio_real, precio_real, 0, nuevo_id, fecha=fecha)]
+            return [_registro_venta(producto, cantidad_total, precio_real, precio_real, 0, nuevo_id, tenant_id, fecha=fecha)]
 
         lote = lotes[0]
         nuevo_stock = round(float(lote["stock_lote"]) - cantidad_total, 3)
@@ -452,19 +468,27 @@ def descontar_stock_peps(
         )
 
         return [_registro_venta(
-            producto, cantidad_total, lote["precio_venta"], precio_real, lote["costo"], lote["id_lote"]
+            producto, cantidad_total, lote["precio_venta"], precio_real, lote["costo"], lote["id_lote"], tenant_id
         )]
 
     # ── PEPS normal (sin lote específico) ──
     # Obtenemos TODOS los lotes activos de esa variación (o base si no se
     # indica), incluso con stock 0 o negativo para seguir el orden PEPS.
+    producto_row = _q(conn,
+        "SELECT id FROM productos WHERE Producto = %s AND tenant_id = %s",
+        (producto, tenant_id)
+    )
+    if not producto_row:
+        raise ValueError(f"Producto no encontrado: {producto}")
+    producto_id = producto_row[0]["id"]
+
     lotes = _q(conn, """
         SELECT * FROM lotes
-        WHERE Producto=%s AND Estado='Activo' AND tenant_id = %s
+        WHERE producto_id=%s AND Estado='Activo' AND tenant_id = %s
           AND variacion_id IS NOT DISTINCT FROM %s
         ORDER BY Fecha_Entrada ASC
         FOR UPDATE
-    """, (producto, tenant_id, variacion_id))
+    """, (producto_id, tenant_id, variacion_id))
 
     # --- Primera pasada: consumir stock de lotes con inventario positivo ---
     ventas_generadas, restante = _consumir_lotes_peps(conn, lotes, producto, cantidad_total, precio_real, tenant_id)
@@ -482,11 +506,11 @@ def descontar_stock_peps(
             )
 
             ventas_generadas.append(_registro_venta(
-                producto, restante, lote_destino["precio_venta"], precio_real, lote_destino["costo"], lote_destino["id_lote"]
+                producto, restante, lote_destino["precio_venta"], precio_real, lote_destino["costo"], lote_destino["id_lote"], tenant_id
             ))
         else:
             # No existe ningún lote para este producto — creamos uno virtual con stock negativo
             nuevo_id_l, fecha = _crear_lote_virtual(conn, producto, precio_real, restante, tenant_id, variacion_id)
-            ventas_generadas.append(_registro_venta(producto, restante, precio_real, precio_real, 0, nuevo_id_l, fecha=fecha))
+            ventas_generadas.append(_registro_venta(producto, restante, precio_real, precio_real, 0, nuevo_id_l, tenant_id, fecha=fecha))
 
     return ventas_generadas

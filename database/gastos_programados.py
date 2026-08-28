@@ -3,38 +3,34 @@
 # CRUD sobre la tabla gastos_programados + motor de verificación automática.
 #
 # Bugs corregidos en esta versión:
-#   1. Zona horaria: ultima_ejecucion ahora usa zona Cancún, no UTC del servidor
+#   1. Zona horaria: se usa la zona IANA del TENANT (migración 031), no UTC ni
+#      una zona hardcodeada. El día contable del corte se deriva con la zona del negocio.
 #   2. Automático ya no inserta gastos de $0 (solo avanza fecha)
-#   4. fin_periodo unificado a _hoy() en ambos caminos (manual y automático)
+#   4. fin_periodo unificado a _hoy(tenant_id) en ambos caminos (manual y automático)
 #   5. Avance de fecha unificado a _avanzar_fecha() en Python en ambos caminos
 #   8. Idempotencia: no se puede ejecutar si proxima_fecha > hoy
 #   9. Categoría consistente: siempre "Gasto Programado"
 # ==============================================================================
 
 import calendar
-from zoneinfo import ZoneInfo
-from database.conexion import execute, get_conn, release_conn, query
-from psycopg2.extras import RealDictCursor
 from datetime import date, datetime, timedelta
+from database.conexion import execute, get_conn, release_conn, query
+from database.helpers import ahora_negocio, fecha_negocio_de, hoy_negocio
+from psycopg2.extras import RealDictCursor
 
 
-# ── Zona horaria del negocio (Cancún, UTC-5) ──
-_TZ = ZoneInfo("America/Cancun")
+def _hoy(tenant_id: str) -> date:
+    """Retorna la fecha contable actual en la zona horaria del negocio."""
+    return hoy_negocio(tenant_id)
 
 
-def _hoy() -> date:
-    """Retorna la fecha actual en la zona horaria de Cancún."""
-    return datetime.now(_TZ).date()
-
-
-def _ahora_cancun_str() -> str:
+def _ts_ejecucion(tenant_id: str) -> datetime:
     """
-    Retorna el timestamp actual en zona Cancún como string ISO.
-    Se usa para ultima_ejecucion en vez de CURRENT_TIMESTAMP (que usa UTC
-    del servidor de Supabase). Esto evita el desfase de un día entero
-    cuando se ejecutan gastos cerca de medianoche hora Cancún.
+    Instante de ejecución tz-aware en la zona del negocio. Se guarda en
+    ultima_ejecucion (TIMESTAMPTZ) como datetime aware: Postgres lo interpreta
+    como instante absoluto, sin ambigüedad de zona del servidor.
     """
-    return datetime.now(_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    return ahora_negocio(tenant_id)
 
 
 def crear_gasto_programado(
@@ -133,7 +129,7 @@ def _calcular_monto_porcentaje(tenant_id: str, regla: dict, cur) -> float:
     inicio = _calcular_inicio_periodo(
         ue_raw, tenant_id, cur, _aplicar_formato_fecha(regla["proxima_fecha"])
     )
-    fin = _hoy().isoformat()
+    fin = _hoy(tenant_id).isoformat()
 
     # 1. SUM(ganancia_bruta) de ventas activas en el período
     cur.execute(
@@ -199,20 +195,20 @@ def ejecutar_gasto_programado(regla_id: str, tenant_id: str) -> dict:
             else:  # porcentaje
                 monto = _calcular_monto_porcentaje(tenant_id, regla, cur)
 
-            # ── Calcular próxima fecha (en Python, zona Cancún) ──
+            # ── Calcular próxima fecha (en Python, zona del negocio) ──
             pf_str = _aplicar_formato_fecha(regla["proxima_fecha"])
-            pf_date = date.fromisoformat(pf_str) if pf_str else _hoy()
+            pf_date = date.fromisoformat(pf_str) if pf_str else _hoy(tenant_id)
             nueva_proxima = _avanzar_fecha(pf_date, regla["frecuencia"])
             nueva_proxima_str = nueva_proxima.isoformat()
 
-            # ── Timestamp de ejecución en zona Cancún (no UTC del servidor) ──
-            ts_ejecucion = _ahora_cancun_str()
+            # ── Timestamp de ejecución en zona del negocio (instante absoluto) ──
+            ts_ejecucion = _ts_ejecucion(tenant_id)
 
             # ── Si monto <= 0, solo actualizar fechas sin insertar gasto ──
             if monto <= 0:
                 cur.execute(
                     "UPDATE gastos_programados "
-                    "SET ultima_ejecucion = %s::timestamp, "
+                    "SET ultima_ejecucion = %s, "
                     "    proxima_fecha = %s::date "
                     "WHERE id = %s",
                     (ts_ejecucion, nueva_proxima_str, rid)
@@ -226,19 +222,19 @@ def ejecutar_gasto_programado(regla_id: str, tenant_id: str) -> dict:
                 }
 
             # ── Insertar gasto como 'pagado' ──
-            fecha_hoy = _hoy().isoformat()
+            fecha_hoy = _hoy(tenant_id).isoformat()
             cur.execute(
                 "INSERT INTO gastos "
-                "(Fecha, Categoria, Descripcion, Monto, Tenant_ID, Estado, Gasto_Programado_ID) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s)",
-                (fecha_hoy, "Gasto Programado", f"Pago: {nombre}",
+                "(Fecha, fecha_negocio, Categoria, Descripcion, Monto, Tenant_ID, Estado, Gasto_Programado_ID) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                (fecha_hoy, fecha_negocio_de(fecha_hoy, tenant_id), "Gasto Programado", f"Pago: {nombre}",
                  monto, tenant_id, "pagado", rid)
             )
 
             # ── Actualizar la regla ──
             cur.execute(
                 "UPDATE gastos_programados "
-                "SET ultima_ejecucion = %s::timestamp, "
+                "SET ultima_ejecucion = %s, "
                 "    proxima_fecha = %s::date "
                 "WHERE id = %s",
                 (ts_ejecucion, nueva_proxima_str, rid)
@@ -281,7 +277,7 @@ def verificar_y_generar_gastos_programados(tenant_id: str) -> dict:
                 "FROM gastos_programados "
                 "WHERE tenant_id = %s "
                 "AND proxima_fecha::date <= %s::date",
-                (tenant_id, _hoy().isoformat())
+                (tenant_id, _hoy(tenant_id).isoformat())
             )
             reglas = cur.fetchall()
 
@@ -289,7 +285,7 @@ def verificar_y_generar_gastos_programados(tenant_id: str) -> dict:
                 return {"ok": True, "generados": 0, "mensaje": "Sin reglas vencidas"}
 
             generados = 0
-            ts_ejecucion = _ahora_cancun_str()
+            ts_ejecucion = _ts_ejecucion(tenant_id)
 
             for regla in reglas:
                 rid = regla["id"]
@@ -303,22 +299,22 @@ def verificar_y_generar_gastos_programados(tenant_id: str) -> dict:
                 else:  # porcentaje
                     monto = _calcular_monto_porcentaje(tenant_id, regla, cur)
 
-                # ── Paso C: Avanzar próxima fecha (Python, zona Cancún) ──
+                # ── Paso C: Avanzar próxima fecha (Python, zona del negocio) ──
                 pf_str = _aplicar_formato_fecha(regla["proxima_fecha"])
-                pf_date = date.fromisoformat(pf_str) if pf_str else _hoy()
+                pf_date = date.fromisoformat(pf_str) if pf_str else _hoy(tenant_id)
                 nueva_proxima = _avanzar_fecha(pf_date, frecuencia)
                 nueva_proxima_str = nueva_proxima.isoformat()
 
                 # ── Paso D: Insertar gasto SOLO si monto > 0 ──
                 if monto > 0:
                     descripcion_auto = f"{nombre} ({frecuencia.capitalize()} - Automático)"
-                    fecha_hoy = _hoy().isoformat()
+                    fecha_hoy = _hoy(tenant_id).isoformat()
 
                     cur.execute(
                         "INSERT INTO gastos "
-                        "(Fecha, Categoria, Descripcion, Monto, Tenant_ID, Estado, Gasto_Programado_ID) "
-                        "VALUES (%s, %s, %s, %s, %s, %s, %s)",
-                        (fecha_hoy, "Gasto Programado", descripcion_auto,
+                        "(Fecha, fecha_negocio, Categoria, Descripcion, Monto, Tenant_ID, Estado, Gasto_Programado_ID) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                        (fecha_hoy, fecha_negocio_de(fecha_hoy, tenant_id), "Gasto Programado", descripcion_auto,
                          monto, tenant_id, "pendiente", rid)
                     )
                     generados += 1
@@ -327,7 +323,7 @@ def verificar_y_generar_gastos_programados(tenant_id: str) -> dict:
                 cur.execute(
                     "UPDATE gastos_programados "
                     "SET proxima_fecha = %s::date, "
-                    "    ultima_ejecucion = %s::timestamp "
+                    "    ultima_ejecucion = %s "
                     "WHERE id = %s AND tenant_id = %s",
                     (nueva_proxima_str, ts_ejecucion, rid, tenant_id)
                 )
@@ -467,7 +463,7 @@ def estimar_monto(regla_id: str, tenant_id: str) -> dict:
             inicio = _calcular_inicio_periodo(
                 ue_raw, tenant_id, cur, _aplicar_formato_fecha(regla["proxima_fecha"])
             )
-            fin = _hoy().isoformat()
+            fin = _hoy(tenant_id).isoformat()
 
             cur.execute(
                 "SELECT COALESCE(SUM(ganancia_bruta), 0) AS total FROM ventas "

@@ -85,7 +85,7 @@ def obtener_catalogo_publico(slug: str, response: Response):
                  ELSE COALESCE(SUM(l.Stock_Lote), 0) END          AS stock_total,
             {cat_subquery}
         FROM productos p
-        LEFT JOIN lotes l ON l.Producto = p.Producto AND l.tenant_id = p.tenant_id AND l.Estado = 'Activo'
+        LEFT JOIN lotes l ON l.producto_id = p.id AND l.tenant_id = p.tenant_id AND l.Estado = 'Activo'
         WHERE p.Estado = 'Activo' AND p.tenant_id = %s
         AND p.visible_en_catalogo = true
         GROUP BY p.Producto, p.Descripcion, p.Imagen, p.sufijo_precio, p.tipo_producto, p.precio_servicio, p.id

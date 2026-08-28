@@ -9,10 +9,9 @@
 # ==============================================================================
 
 import uuid
-import datetime
 from psycopg2.errors import UniqueViolation
 from database.conexion import query
-from database.helpers import _TZ, _resolver_producto_id
+from database.helpers import _resolver_producto_id, ahora_negocio, _parsear_ts
 
 
 def _adjuntar_variaciones(filas: list[dict], tenant_id: str) -> None:
@@ -27,7 +26,7 @@ def _adjuntar_variaciones(filas: list[dict], tenant_id: str) -> None:
     if not filas:
         return
     variaciones = query("""
-        SELECT p.Producto AS producto, v.id, v.nombre, v.precio, v.foto
+        SELECT p.Producto AS producto, v.producto_id, v.id, v.nombre, v.precio, v.foto
         FROM producto_variaciones v
         JOIN productos p ON p.id = v.producto_id
         WHERE p.tenant_id = %s
@@ -36,15 +35,15 @@ def _adjuntar_variaciones(filas: list[dict], tenant_id: str) -> None:
     # Suma el stock de los lotes ligados a cada variación (cada variación
     # lleva su propio inventario).
     stocks = query("""
-        SELECT l.Producto AS producto, l.variacion_id AS variacion_id,
+        SELECT l.producto_id AS producto_id, l.variacion_id AS variacion_id,
                SUM(l.Stock_Lote) AS stock
         FROM lotes l
         WHERE l.tenant_id = %s AND l.Estado = 'Activo' AND l.variacion_id IS NOT NULL
-        GROUP BY l.Producto, l.variacion_id
+        GROUP BY l.producto_id, l.variacion_id
     """, (tenant_id,))
     stock_por_var: dict = {}
     for s in stocks:
-        stock_por_var[(s["producto"], s["variacion_id"])] = float(s["stock"] or 0)
+        stock_por_var[(s["producto_id"], s["variacion_id"])] = float(s["stock"] or 0)
     por_producto: dict = {}
     for v in variaciones:
         por_producto.setdefault(v["producto"], []).append({
@@ -52,7 +51,7 @@ def _adjuntar_variaciones(filas: list[dict], tenant_id: str) -> None:
             "nombre": v["nombre"],
             "precio": float(v["precio"] or 0),
             "foto": v.get("foto") or "",
-            "stock": stock_por_var.get((v["producto"], v["id"]), 0),
+            "stock": stock_por_var.get((v["producto_id"], v["id"]), 0),
         })
     for f in filas:
         f["variaciones"] = por_producto.get(f["producto"], [])
@@ -114,12 +113,13 @@ def crear_variacion(producto: str, nombre: str, precio: float, tenant_id: str, f
         if es_stock:
             stock_final = float(stock_inicial)
             costo_lote = float(costo or 0) or 0
+            fecha_var = str(ahora_negocio(tenant_id))
             query("""
-                INSERT INTO lotes (ID_Lote, Producto, Costo, Precio_Venta,
-                                   Stock_Lote, Fecha_Entrada, Estado, tenant_id, variacion_id)
-                VALUES (%s, %s, %s, %s, %s, %s, 'Activo', %s, %s)
-            """, (str(uuid.uuid4())[:12], producto, costo_lote, float(precio or 0),
-                  stock_final, str(datetime.datetime.now(_TZ)), tenant_id, v["id"]))
+                INSERT INTO lotes (ID_Lote, Producto, producto_id, Costo, Precio_Venta,
+                                   Stock_Lote, Fecha_Entrada, fecha_entrada_ts, Estado, tenant_id, variacion_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'Activo', %s, %s)
+            """, (str(uuid.uuid4())[:12], producto, pid, costo_lote, float(precio or 0),
+                  stock_final, fecha_var, _parsear_ts(fecha_var), tenant_id, v["id"]))
     return {"ok": True, "variacion": {"id": v["id"], "nombre": v["nombre"], "precio": float(v["precio"] or 0), "foto": v.get("foto") or "", "stock": stock_final}}
 
 

@@ -11,11 +11,10 @@
 # ==============================================================================
 
 import uuid
-import datetime
 import json
 from psycopg2.errors import UniqueViolation
 from database.conexion import query, execute
-from database.helpers import _TZ, _q, _e, _obtener_categorias_subquery, _sincronizar_categorias
+from database.helpers import _q, _e, _obtener_categorias_subquery, _sincronizar_categorias, ahora_negocio, _parsear_ts
 from database.variaciones import _adjuntar_variaciones
 from database.recetas import _adjuntar_recetas, _calcular_disponibilidad_compuestos
 
@@ -101,7 +100,7 @@ def get_inventario_consolidado(tenant_id: str) -> list[dict]:
             COALESCE(MAX(CASE WHEN l.Stock_Lote > 0 THEN l.Precio_Venta END), MAX(l.Precio_Venta), p.precio_servicio, 0) AS precio_max,
             COALESCE(SUM(l.Costo * l.Stock_Lote) / NULLIF(SUM(l.Stock_Lote), 0), p.costo_servicio, 0) AS costo_promedio
         FROM productos p
-        LEFT JOIN lotes l ON l.Producto = p.Producto AND l.Tenant_ID = p.Tenant_ID AND l.Estado = 'Activo'
+        LEFT JOIN lotes l ON l.producto_id = p.id AND l.Tenant_ID = p.Tenant_ID AND l.Estado = 'Activo'
         WHERE p.Tenant_ID = %s AND p.Estado = 'Activo'
         GROUP BY p.Producto, p.Descripcion, p.Imagen, p.Estado, p.id, p.codigo_interno, p.codigo_barras, p.ubicacion, p.visible_en_catalogo, p.sufijo_precio, p.fraccionable, p.tipo_producto, p.costo_servicio, p.precio_servicio, p.post_override
         ORDER BY p.Producto ASC
@@ -211,6 +210,7 @@ def _crear_lote_inicial(
     stock: float,
     tenant_id: str,
     etiqueta_limpia: str,
+    product_id: int,
 ) -> str:
     """
     Crea el lote inicial de un producto tipo 'stock' sin variaciones: si ya
@@ -219,22 +219,22 @@ def _crear_lote_inicial(
     """
     existente = _q(conn, """
         SELECT id_lote FROM lotes
-        WHERE Producto=%s AND Costo=%s AND Precio_Venta=%s AND Estado='Activo' AND tenant_id = %s
+        WHERE producto_id=%s AND Costo=%s AND Precio_Venta=%s AND Estado='Activo' AND tenant_id = %s
           AND (%s = '' OR COALESCE(etiqueta, '') = %s)
         LIMIT 1
-    """, (producto, costo, precio_venta, tenant_id, etiqueta_limpia, etiqueta_limpia))
+    """, (product_id, costo, precio_venta, tenant_id, etiqueta_limpia, etiqueta_limpia))
     if existente:
         _e(conn,
             "UPDATE lotes SET Stock_Lote = Stock_Lote + %s WHERE ID_Lote = %s AND tenant_id = %s",
             (stock, existente[0]["id_lote"], tenant_id))
         return "stock_sumado"
     id_lote = str(uuid.uuid4())[:12]
-    fecha = str(datetime.datetime.now(_TZ))
+    fecha = str(ahora_negocio(tenant_id))
     _e(conn, """
-        INSERT INTO lotes (ID_Lote, Producto, Costo, Precio_Venta,
-                           Stock_Lote, Fecha_Entrada, Estado, tenant_id, etiqueta)
-        VALUES (%s, %s, %s, %s, %s, %s, 'Activo', %s, %s)
-    """, (id_lote, producto, costo, precio_venta, stock, fecha, tenant_id, etiqueta_limpia))
+        INSERT INTO lotes (ID_Lote, Producto, producto_id, Costo, Precio_Venta,
+                           Stock_Lote, Fecha_Entrada, fecha_entrada_ts, Estado, tenant_id, etiqueta)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'Activo', %s, %s)
+    """, (id_lote, producto, product_id, costo, precio_venta, stock, fecha, _parsear_ts(fecha), tenant_id, etiqueta_limpia))
     return "lote_creado"
 
 
@@ -274,13 +274,13 @@ def _crear_variaciones_y_lotes(
         if tipo == "stock" and float(vstock or 0) > 0:
             vcosto = float(v.get("costo") or 0) or costo
             vid = r_var[0]["id"]
-            vfecha = str(datetime.datetime.now(_TZ))
+            vfecha = str(ahora_negocio(tenant_id))
             _e(conn, """
-                INSERT INTO lotes (ID_Lote, Producto, Costo, Precio_Venta,
-                                   Stock_Lote, Fecha_Entrada, Estado, tenant_id, variacion_id)
-                VALUES (%s, %s, %s, %s, %s, %s, 'Activo', %s, %s)
-            """, (str(uuid.uuid4())[:12], producto, vcosto, vprecio,
-                   float(vstock), vfecha, tenant_id, vid))
+                INSERT INTO lotes (ID_Lote, Producto, producto_id, Costo, Precio_Venta,
+                                   Stock_Lote, Fecha_Entrada, fecha_entrada_ts, Estado, tenant_id, variacion_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'Activo', %s, %s)
+            """, (str(uuid.uuid4())[:12], producto, product_id, vcosto, vprecio,
+                   float(vstock), vfecha, _parsear_ts(vfecha), tenant_id, vid))
     return None
 
 
@@ -413,6 +413,7 @@ def crear_producto_completo(
             accion = _crear_lote_inicial(
                 conn, producto=producto, costo=costo, precio_venta=precio_venta,
                 stock=stock, tenant_id=tenant_id, etiqueta_limpia=etiqueta_limpia,
+                product_id=product_id,
             )
         elif tipo == "servicio":
             accion = "servicio_creado"
@@ -481,6 +482,13 @@ def actualizar_producto(
     tipo_producto/costo_servicio/precio_servicio aplican a productos de servicio (sin stock).
     """
     nombre_final = producto
+    producto_id_actual = None
+    if nuevo_producto is not None:
+        fila_producto = query(
+            "SELECT id FROM productos WHERE Producto=%s AND tenant_id=%s",
+            (producto, tenant_id)
+        )
+        producto_id_actual = fila_producto[0]["id"] if fila_producto else None
     if nuevo_producto is not None:
         nombre_final = nuevo_producto.strip()
         if nombre_final and nombre_final != producto:
@@ -503,13 +511,12 @@ def actualizar_producto(
             )
             # Renombrar en lotes
             execute(
-                "UPDATE lotes SET Producto=%s WHERE Producto=%s AND tenant_id=%s",
-                (nombre_final, producto, tenant_id)
+                "UPDATE lotes SET Producto=%s WHERE producto_id=%s AND tenant_id=%s",
+                (nombre_final, producto_id_actual, tenant_id)
             )
-            # Renombrar en ventas
             execute(
-                "UPDATE ventas SET Producto=%s WHERE Producto=%s AND tenant_id=%s",
-                (nombre_final, producto, tenant_id)
+                "UPDATE ventas SET Producto=%s WHERE producto_id=%s AND tenant_id=%s",
+                (nombre_final, producto_id_actual, tenant_id)
             )
             # Usar el nuevo nombre para el resto de operaciones
             producto = nombre_final
@@ -558,19 +565,22 @@ def actualizar_producto(
     # Actualizar costo y/o precio de venta en todos los lotes activos
     if costo is not None:
         execute(
-            "UPDATE lotes SET Costo=%s WHERE Producto=%s AND Estado='Activo' AND tenant_id=%s",
-            (costo, producto, tenant_id)
+            "UPDATE lotes SET Costo=%s WHERE producto_id = "
+            "(SELECT id FROM productos WHERE Producto=%s AND tenant_id=%s) AND Estado='Activo' AND tenant_id=%s",
+            (costo, producto, tenant_id, tenant_id)
         )
     if precio_venta is not None:
         execute(
-            "UPDATE lotes SET Precio_Venta=%s WHERE Producto=%s AND Estado='Activo' AND tenant_id=%s",
-            (precio_venta, producto, tenant_id)
+            "UPDATE lotes SET Precio_Venta=%s WHERE producto_id = "
+            "(SELECT id FROM productos WHERE Producto=%s AND tenant_id=%s) AND Estado='Activo' AND tenant_id=%s",
+            (precio_venta, producto, tenant_id, tenant_id)
         )
 
     if estado == "Inactivo":
         execute(
-            "UPDATE lotes SET Estado='Inactivo' WHERE Producto=%s AND tenant_id = %s",
-            (producto, tenant_id)
+            "UPDATE lotes SET Estado='Inactivo' WHERE producto_id = "
+            "(SELECT id FROM productos WHERE Producto=%s AND tenant_id=%s) AND tenant_id = %s",
+            (producto, tenant_id, tenant_id)
         )
 
     return {"ok": True, "producto": producto, "estado": estado}
