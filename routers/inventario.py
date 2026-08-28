@@ -153,6 +153,8 @@ class ActualizarMaterialReceta(BaseModel):
 class ActualizarPerfil(BaseModel):
     modo_precio_sugerido: Optional[str] = None  # 'antiguo' | 'maximo' | 'reciente'
     zona_horaria: Optional[str] = None          # nombre IANA (ej. 'America/Cancun')
+    metodo_pago_default: Optional[str] = None   # 'efectivo' | 'tarjeta_debito' | 'tarjeta_credito'
+    gasto_comision_automatico: Optional[bool] = None  # registra comisiones como gasto al cobrar
 
 class ActualizarPostOverride(BaseModel):
     """Override de la tarjeta de post para UN producto (Posts Automáticos, Fase 1).
@@ -164,14 +166,17 @@ class ActualizarPostOverride(BaseModel):
 # --- Endpoints ---
 
 def _leer_config_perfil(tenant_id: str) -> dict:
-    """Lee modo_precio_sugerido y zona_horaria del tenant con defaults seguros."""
+    """Lee modo_precio_sugerido, zona_horaria, metodo_pago_default y flag de comisiones."""
     fila = query(
-        "SELECT modo_precio_sugerido, zona_horaria FROM tenants WHERE id = %s",
+        "SELECT modo_precio_sugerido, zona_horaria, metodo_pago_default, gasto_comision_automatico "
+        "FROM tenants WHERE id = %s",
         (tenant_id,)
     )
     return {
         "modo_precio_sugerido": (fila[0].get("modo_precio_sugerido") if fila else None) or "antiguo",
         "zona_horaria": (fila[0].get("zona_horaria") if fila else None) or "America/Cancun",
+        "metodo_pago_default": (fila[0].get("metodo_pago_default") if fila else None) or "efectivo",
+        "gasto_comision_automatico": bool(fila[0]["gasto_comision_automatico"]) if fila else False,
     }
 
 
@@ -194,11 +199,27 @@ def actualizar_mi_perfil(data: ActualizarPerfil, tenant_id: str = Depends(get_te
     - zona_horaria: nombre IANA del negocio; define el día contable de
       ventas, gastos y cortes de caja (migración 031).
     """
-    if data.modo_precio_sugerido is None and data.zona_horaria is None:
+    if (data.modo_precio_sugerido is None and data.zona_horaria is None
+            and data.metodo_pago_default is None and data.gasto_comision_automatico is None):
         # Sin cambios: devolver el valor actual persistido
         return {"ok": True, **_leer_config_perfil(tenant_id)}
 
     respuesta = {"ok": True}
+
+    if data.gasto_comision_automatico is not None:
+        execute("UPDATE tenants SET gasto_comision_automatico = %s WHERE id = %s",
+                (bool(data.gasto_comision_automatico), tenant_id))
+        respuesta["gasto_comision_automatico"] = bool(data.gasto_comision_automatico)
+
+    if data.metodo_pago_default is not None:
+        metodo = data.metodo_pago_default.strip().lower()
+        if metodo not in ("efectivo", "tarjeta_debito", "tarjeta_credito"):
+            raise HTTPException(
+                status_code=400,
+                detail="metodo_pago_default debe ser 'efectivo', 'tarjeta_debito' o 'tarjeta_credito'",
+            )
+        execute("UPDATE tenants SET metodo_pago_default = %s WHERE id = %s", (metodo, tenant_id))
+        respuesta["metodo_pago_default"] = metodo
 
     if data.modo_precio_sugerido is not None:
         modo = data.modo_precio_sugerido.strip().lower()

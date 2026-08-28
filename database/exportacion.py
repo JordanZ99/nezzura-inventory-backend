@@ -165,7 +165,8 @@ def get_datos_tenant(tenant_id: str) -> dict:
     # ── Órdenes (tickets; cabecera de cada cobro) ──
     if "ordenes" in tablas:
         data["ordenes"] = query(
-            "SELECT id, tenant_id, n_ticket, fecha_ts, total, ganancia, cantidad_items, estado "
+            "SELECT id, tenant_id, n_ticket, fecha_ts, total, ganancia, cantidad_items, estado, "
+            "       metodo_pago, pagos, propina, monto_recibido, cambio, comision_total "
             "FROM ordenes WHERE tenant_id = %s ORDER BY fecha_ts DESC",
             (tenant_id,)
         )
@@ -327,6 +328,11 @@ def _filas_para_xlsx(data: dict) -> dict[str, list[dict]]:
             "Total": o.get("total") or 0,
             "Ganancia": o.get("ganancia") or 0,
             "Unidades": o.get("cantidad_items") or 0,
+            "Metodo": o.get("metodo_pago") or "",
+            "Propina": o.get("propina") or 0,
+            "Recibido": o.get("monto_recibido") if o.get("monto_recibido") is not None else "",
+            "Cambio": o.get("cambio") if o.get("cambio") is not None else "",
+            "Pagos": json.dumps(o.get("pagos"), ensure_ascii=False) if o.get("pagos") else "",
             "Estado": o.get("estado") or "",
         }
         for o in data.get("ordenes", [])
