@@ -1,14 +1,9 @@
 import psycopg2.extras
-import datetime
 import json
 import uuid
-from zoneinfo import ZoneInfo
 from database.conexion import query, execute, get_conn, release_conn
 from database.lotes import descontar_stock_peps
-
-
-# ── Zona horaria del negocio (Cancún, UTC-5) ──
-_TZ = ZoneInfo("America/Cancun")
+from database.helpers import ahora_negocio, _parsear_ts
 
 def get_ventas(tenant_id: str, limit: int = 500) -> list[dict]:
     """Lee ventas del usuario ordenadas por fecha descendente."""
@@ -26,16 +21,31 @@ def insertar_venta(venta: dict, tenant_id: str, conn=None) -> None:
     si no se pasa, usa la conexión del pool global.
     """
     p_name = str(venta.get("producto", "")).strip()
+    if conn is not None:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT id FROM productos WHERE Producto=%s AND tenant_id=%s", (p_name, tenant_id))
+            producto_row = cur.fetchone()
+    else:
+        producto_rows = query("SELECT id FROM productos WHERE Producto=%s AND tenant_id=%s", (p_name, tenant_id))
+        producto_row = producto_rows[0] if producto_rows else None
+    if not producto_row:
+        raise ValueError(f"Producto no encontrado: {p_name}")
+
+    # Dual-write (migración 031): fecha TEXT = copia de display legada;
+    # fecha_ts = instante canónico TIMESTAMPTZ.
+    fecha_ts = _parsear_ts(venta["fecha"])
     sql = """
         INSERT INTO ventas
-            (Fecha, Producto, Cantidad, Precio_Lista,
+            (Fecha, fecha_ts, Producto, producto_id, Cantidad, Precio_Lista,
              Precio_Real, Costo_Unitario, Total_Venta, Ganancia_Bruta, Estado, ID_Lote, tenant_id,
              tipo_producto, variacion, consumo)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'Activo', %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'Activo', %s, %s, %s, %s, %s)
     """
     params = (
         venta["fecha"],
+        fecha_ts,
         p_name,
+        producto_row["id"],
         venta["cantidad"],
         venta["precio_lista"],
         venta["precio_real"],
@@ -175,13 +185,13 @@ def _revertir_consumo(cur, consumo: list[dict] | None, tenant_id: str) -> None:
         # hay otros lotes del mismo producto, tomamos el máximo; si no, cae al
         # costo (no inventar un precio).
         nuevo_id = str(uuid.uuid4())[:12]
-        fe = str(datetime.datetime.now(_TZ))
+        fe = str(ahora_negocio(tenant_id))
         precio_recreado = costo
         try:
             cur.execute(
                 "SELECT MAX(Precio_Venta) AS pv FROM lotes "
-                "WHERE Producto = %s AND tenant_id = %s",
-                (material, tenant_id)
+                "WHERE producto_id = (SELECT id FROM productos WHERE Producto = %s AND tenant_id = %s) AND tenant_id = %s",
+                (material, tenant_id, tenant_id)
             )
             fila_pv = cur.fetchone()
             if fila_pv and fila_pv.get("pv"):
@@ -189,9 +199,9 @@ def _revertir_consumo(cur, consumo: list[dict] | None, tenant_id: str) -> None:
         except Exception:
             pass
         cur.execute(
-            "INSERT INTO lotes (ID_Lote, Producto, Costo, Precio_Venta, Stock_Lote, Fecha_Entrada, Estado, tenant_id) "
-            "VALUES (%s, %s, %s, %s, %s, %s, 'Activo', %s)",
-            (nuevo_id, material, costo, precio_recreado, cantidad, fe, tenant_id)
+            "INSERT INTO lotes (ID_Lote, Producto, producto_id, Costo, Precio_Venta, Stock_Lote, Fecha_Entrada, fecha_entrada_ts, Estado, tenant_id) "
+            "VALUES (%s, %s, (SELECT id FROM productos WHERE Producto=%s AND tenant_id=%s), %s, %s, %s, %s, %s, 'Activo', %s)",
+            (nuevo_id, material, material, tenant_id, costo, precio_recreado, cantidad, fe, _parsear_ts(fe), tenant_id)
         )
 
 
@@ -273,10 +283,10 @@ def actualizar_venta(venta_id: int, fecha: str, cantidad: float, precio_real: fl
 
                 # 2c. Guardar el nuevo consumo en la venta
                 cur.execute(
-                    "UPDATE ventas SET Fecha=%s, Cantidad=%s, Precio_Real=%s, Costo_Unitario=%s, "
+                    "UPDATE ventas SET Fecha=%s, fecha_ts=%s, Cantidad=%s, Precio_Real=%s, Costo_Unitario=%s, "
                     "Total_Venta=%s, Ganancia_Bruta=%s, consumo=%s "
                     "WHERE id=%s AND tenant_id=%s",
-                    (fecha, cantidad, precio_real, costo_unitario, total_venta,
+                    (fecha, _parsear_ts(fecha), cantidad, precio_real, costo_unitario, total_venta,
                      ganancia_bruta, psycopg2.extras.Json(consumo_nuevo or None),
                      venta_id, tenant_id)
                 )
@@ -285,7 +295,7 @@ def actualizar_venta(venta_id: int, fecha: str, cantidad: float, precio_real: fl
             elif dif > 0:
                 # Stock por variación: descuenta solo de los lotes de ESA variación
                 vid = _resolver_variacion_venta(cur, v, tenant_id)
-                cur.execute("SELECT * FROM lotes WHERE Producto=%s AND Estado='Activo' AND tenant_id=%s AND variacion_id IS NOT DISTINCT FROM %s ORDER BY Fecha_Entrada ASC FOR UPDATE", (v["producto"], tenant_id, vid))
+                cur.execute("SELECT * FROM lotes WHERE producto_id=%s AND Estado='Activo' AND tenant_id=%s AND variacion_id IS NOT DISTINCT FROM %s ORDER BY Fecha_Entrada ASC FOR UPDATE", (v["producto_id"], tenant_id, vid))
                 lotes = [dict(row) for row in cur.fetchall()]
                 restante = dif
                 for lote in lotes:
@@ -303,21 +313,21 @@ def actualizar_venta(venta_id: int, fecha: str, cantidad: float, precio_real: fl
                 restaurar = abs(dif)
                 # Stock por variación: restaurar al lote de ESA variación
                 vid = _resolver_variacion_venta(cur, v, tenant_id)
-                cur.execute("SELECT id_lote, stock_lote FROM lotes WHERE Producto=%s AND Costo=%s AND Precio_Venta=%s AND Estado='Activo' AND tenant_id=%s AND variacion_id IS NOT DISTINCT FROM %s FOR UPDATE LIMIT 1", (v["producto"], v["costo_unitario"], v["precio_lista"], tenant_id, vid))
+                cur.execute("SELECT id_lote, stock_lote FROM lotes WHERE producto_id=%s AND Costo=%s AND Precio_Venta=%s AND Estado='Activo' AND tenant_id=%s AND variacion_id IS NOT DISTINCT FROM %s FOR UPDATE LIMIT 1", (v["producto_id"], v["costo_unitario"], v["precio_lista"], tenant_id, vid))
                 lote_exist = cur.fetchone()
                 if lote_exist:
                     cur.execute("UPDATE lotes SET Stock_Lote = Stock_Lote + %s WHERE ID_Lote = %s AND tenant_id=%s", (restaurar, lote_exist["id_lote"], tenant_id))
                 else:
                     id_l = str(uuid.uuid4())[:12]
-                    fe = str(datetime.datetime.now(_TZ))
-                    cur.execute("INSERT INTO lotes (ID_Lote, Producto, Costo, Precio_Venta, Stock_Lote, Fecha_Entrada, Estado, tenant_id, variacion_id) VALUES (%s, %s, %s, %s, %s, %s, 'Activo', %s, %s)", (id_l, v["producto"], v["costo_unitario"], v["precio_lista"], restaurar, fe, tenant_id, vid))
+                    fe = str(ahora_negocio(tenant_id))
+                    cur.execute("INSERT INTO lotes (ID_Lote, Producto, producto_id, Costo, Precio_Venta, Stock_Lote, Fecha_Entrada, fecha_entrada_ts, Estado, tenant_id, variacion_id) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'Activo', %s, %s)", (id_l, v["producto"], v["producto_id"], v["costo_unitario"], v["precio_lista"], restaurar, fe, _parsear_ts(fe), tenant_id, vid))
 
             # 3. Guardar cambios en la venta
             cur.execute("""
                 UPDATE ventas
-                SET Fecha=%s, Cantidad=%s, Precio_Real=%s, Costo_Unitario=%s, Total_Venta=%s, Ganancia_Bruta=%s
+                SET Fecha=%s, fecha_ts=%s, Cantidad=%s, Precio_Real=%s, Costo_Unitario=%s, Total_Venta=%s, Ganancia_Bruta=%s
                 WHERE id=%s AND tenant_id=%s
-            """, (fecha, cantidad, precio_real, costo_unitario, total_venta, ganancia_bruta, venta_id, tenant_id))
+            """, (fecha, _parsear_ts(fecha), cantidad, precio_real, costo_unitario, total_venta, ganancia_bruta, venta_id, tenant_id))
             conn.commit()
             return {"ok": True, "id": venta_id}
     except Exception as e:
@@ -379,13 +389,14 @@ def eliminar_venta(venta_id: int, tenant_id: str) -> dict:
                     else:
                         # El lote fue eliminado: recrearlo con costo y precio de
                         # la venta original (no con precio = costo).
+                        fe_recreacion = str(ahora_negocio(tenant_id))
                         cur.execute(
-                            "INSERT INTO lotes (ID_Lote, Producto, Costo, Precio_Venta, "
-                            "Stock_Lote, Fecha_Entrada, Estado, tenant_id) "
-                            "VALUES (%s, %s, %s, %s, %s, %s, 'Activo', %s)",
-                            (id_lote, v["producto"], v.get("costo_unitario") or 0,
+                            "INSERT INTO lotes (ID_Lote, Producto, producto_id, Costo, Precio_Venta, "
+                            "Stock_Lote, Fecha_Entrada, fecha_entrada_ts, Estado, tenant_id) "
+                            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'Activo', %s)",
+                            (id_lote, v["producto"], v["producto_id"], v.get("costo_unitario") or 0,
                              v.get("precio_lista") or 0, cantidad,
-                             str(datetime.datetime.now(_TZ)), tenant_id)
+                             fe_recreacion, _parsear_ts(fe_recreacion), tenant_id)
                         )
                     stock_restaurado = v["cantidad"]
                 else:
@@ -396,9 +407,9 @@ def eliminar_venta(venta_id: int, tenant_id: str) -> dict:
                     # auto-commit aparte y reintroduciría el Bug #3).
                     cur.execute(
                         "SELECT ID_Lote FROM lotes "
-                        "WHERE Producto=%s AND Costo=%s AND Precio_Venta=%s "
+                        "WHERE producto_id=%s AND Costo=%s AND Precio_Venta=%s "
                         "AND Estado='Activo' AND tenant_id=%s LIMIT 1",
-                        (v["producto"], v.get("costo_unitario") or 0,
+                        (v["producto_id"], v.get("costo_unitario") or 0,
                          v.get("precio_lista") or 0, tenant_id)
                     )
                     fila_lote = cur.fetchone()
@@ -410,13 +421,13 @@ def eliminar_venta(venta_id: int, tenant_id: str) -> dict:
                         )
                     else:
                         nuevo_id = str(uuid.uuid4())[:12]
-                        fe = str(datetime.datetime.now(_TZ))
+                        fe = str(ahora_negocio(tenant_id))
                         cur.execute(
-                            "INSERT INTO lotes (ID_Lote, Producto, Costo, Precio_Venta, "
-                            "Stock_Lote, Fecha_Entrada, Estado, tenant_id) "
-                            "VALUES (%s, %s, %s, %s, %s, %s, 'Activo', %s)",
-                            (nuevo_id, v["producto"], v.get("costo_unitario") or 0,
-                             v.get("precio_lista") or 0, cantidad, fe, tenant_id)
+                            "INSERT INTO lotes (ID_Lote, Producto, producto_id, Costo, Precio_Venta, "
+                            "Stock_Lote, Fecha_Entrada, fecha_entrada_ts, Estado, tenant_id) "
+                            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'Activo', %s)",
+                            (nuevo_id, v["producto"], v["producto_id"], v.get("costo_unitario") or 0,
+                             v.get("precio_lista") or 0, cantidad, fe, _parsear_ts(fe), tenant_id)
                         )
                     stock_restaurado = v["cantidad"]
 
@@ -542,7 +553,7 @@ def cobrar_carrito(items: list[dict], tenant_id: str) -> dict:
 
                 costo_unitario = costo_total / cant_comp if cant_comp else 0.0
                 ventas_a_guardar.append({
-                    "fecha"         : str(datetime.datetime.now(_TZ)),
+                    "fecha"         : str(ahora_negocio(tenant_id)),
                     "producto"      : item["producto"],
                     "cantidad"      : cant_comp,
                     "precio_lista"  : precio_srv,      # precio de venta del compuesto
@@ -561,7 +572,7 @@ def cobrar_carrito(items: list[dict], tenant_id: str) -> dict:
                 # ── Servicio: no tiene inventario ──
                 # Se vende infinito; se registra la venta con el costo/precio del
                 # servicio. Nada se descuenta de lotes.
-                fecha = str(datetime.datetime.now(_TZ))
+                fecha = str(ahora_negocio(tenant_id))
                 cant = float(item["cantidad"])
                 precio_real = float(item["precio_real"])
                 ventas_a_guardar.append({

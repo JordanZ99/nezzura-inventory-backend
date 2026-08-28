@@ -143,7 +143,7 @@ def get_datos_tenant(tenant_id: str) -> dict:
     # ── Lotes ──
     if "lotes" in tablas:
         data["lotes"] = query(
-            "SELECT id, ID_Lote, Producto, Costo, Precio_Venta, Stock_Lote, "
+            "SELECT id, ID_Lote, Producto, producto_id, Costo, Precio_Venta, Stock_Lote, "
             "       Fecha_Entrada, Estado, etiqueta, variacion_id "
             "FROM lotes WHERE tenant_id = %s ORDER BY Producto ASC, Fecha_Entrada ASC",
             (tenant_id,)
@@ -152,7 +152,7 @@ def get_datos_tenant(tenant_id: str) -> dict:
     # ── Ventas (consumo JSONB se convierte a objeto) ──
     if "ventas" in tablas:
         ventas = query(
-            "SELECT id, n_ticket, Fecha, Producto, Cantidad, Precio_Lista, "
+            "SELECT id, n_ticket, Fecha, Producto, producto_id, Cantidad, Precio_Lista, "
             "       Precio_Real, Costo_Unitario, Total_Venta, Ganancia_Bruta, "
             "       Estado, ID_Lote, tipo_producto, variacion, consumo "
             "FROM ventas WHERE tenant_id = %s ORDER BY Fecha DESC",
@@ -205,7 +205,7 @@ def get_datos_tenant(tenant_id: str) -> dict:
     # ── Configuración del negocio (tenant) ──
     if "tenants" in tablas:
         filas = query(
-            "SELECT id, logo, modo_precio_sugerido FROM tenants WHERE id = %s",
+            "SELECT id, logo, modo_precio_sugerido, zona_horaria FROM tenants WHERE id = %s",
             (tenant_id,)
         )
         data["configuracion"] = filas[0] if filas else None

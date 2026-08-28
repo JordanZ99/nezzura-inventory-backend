@@ -90,12 +90,21 @@ def _calcular_disponibilidad_compuestos(filas: list[dict], tenant_id: str) -> No
         return
 
     stocks = query(
-        "SELECT Producto AS producto, SUM(Stock_Lote) AS stock FROM lotes "
-        "WHERE tenant_id = %s AND Estado = 'Activo' AND Producto = ANY(%s) "
-        "GROUP BY Producto",
+        "SELECT l.producto_id, SUM(l.Stock_Lote) AS stock "
+        "FROM lotes l JOIN productos p ON p.id = l.producto_id "
+        "WHERE l.tenant_id = %s AND l.Estado = 'Activo' AND p.Producto = ANY(%s) "
+        "GROUP BY l.producto_id",
         (tenant_id, nombres)
     )
-    stock_map = {r["producto"]: float(r["stock"] or 0) for r in stocks}
+    nombres_por_id = {
+        r["id"]: r["producto"]
+        for r in query(
+            "SELECT id, Producto AS producto FROM productos "
+            "WHERE tenant_id = %s AND Producto = ANY(%s)",
+            (tenant_id, nombres)
+        )
+    }
+    stock_map = {nombres_por_id.get(r["producto_id"]): float(r["stock"] or 0) for r in stocks}
 
     for f in compuestos:
         recetas = recetas_por_compuesto.get(f["producto"]) or []

@@ -4,6 +4,7 @@
 # ==============================================================================
 
 from database.conexion import query, execute
+from database.helpers import fecha_negocio_de
 
 
 # ==============================================================================
@@ -125,10 +126,12 @@ def insertar_gasto(
     """Inserta un nuevo gasto."""
     cat = categoria.strip()
     desc = descripcion.strip()
+    # Dual-write (migración 031): fecha TEXT = copia legada;
+    # fecha_negocio DATE = día contable canónico en la zona del negocio.
     execute(
-        "INSERT INTO gastos (Fecha, Categoria, Descripcion, Monto, Tenant_ID, Estado, Gasto_Programado_ID) "
-        "VALUES (%s, %s, %s, %s, %s, %s, %s)",
-        (fecha, cat, desc, monto, tenant_id, estado, gasto_programado_id)
+        "INSERT INTO gastos (Fecha, fecha_negocio, Categoria, Descripcion, Monto, Tenant_ID, Estado, Gasto_Programado_ID) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+        (fecha, fecha_negocio_de(fecha, tenant_id), cat, desc, monto, tenant_id, estado, gasto_programado_id)
     )
     return {"ok": True}
 

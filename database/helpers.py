@@ -6,13 +6,91 @@
 # ==============================================================================
 
 import re
-from zoneinfo import ZoneInfo
+import time
+from datetime import date, datetime, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from psycopg2.extras import RealDictCursor
 from database.conexion import query, execute
 
 
 # ── Zona horaria del negocio (Cancún, UTC-5) ──
 _TZ = ZoneInfo("America/Cancun")
+
+# ── Zona horaria POR TENANT (migración 031) ──
+# El instante real vive en columnas TIMESTAMPTZ; el "día de negocio" se deriva
+# con la zona IANA configurada del tenant. Cache con TTL corta: si el dueño
+# cambia la zona vía Supabase directo, el backend se sincroniza solo.
+_ZONA_DEFAULT = _TZ
+_ZONA_TTL_SEGUNDOS = 300.0
+_zonas_cache: dict[str, tuple[ZoneInfo, float]] = {}
+
+
+def zona_tenant(tenant_id: str) -> ZoneInfo:
+    """Zona horaria IANA del negocio; cachea 5 min para no consultar en cada write."""
+    if not tenant_id:
+        return _ZONA_DEFAULT
+    entrada = _zonas_cache.get(tenant_id)
+    if entrada and (time.monotonic() - entrada[1]) < _ZONA_TTL_SEGUNDOS:
+        return entrada[0]
+    try:
+        filas = query("SELECT zona_horaria FROM tenants WHERE id = %s", (tenant_id,))
+        nombre = (filas[0]["zona_horaria"] if filas else "") or "America/Cancun"
+    except Exception:
+        nombre = "America/Cancun"
+    try:
+        tz = ZoneInfo(nombre)
+    except (ZoneInfoNotFoundError, ValueError, KeyError):
+        tz = _ZONA_DEFAULT
+    _zonas_cache[tenant_id] = (tz, time.monotonic())
+    return tz
+
+
+def invalidar_zona_tenant(tenant_id: str) -> None:
+    """Fuerza relectura de la zona (lo llama PATCH /me tras actualizarla)."""
+    _zonas_cache.pop(tenant_id, None)
+
+
+def ahora_negocio(tenant_id: str) -> datetime:
+    """Instante actual en la zona del negocio (tz-aware, listo para TIMESTAMPTZ)."""
+    return datetime.now(zona_tenant(tenant_id))
+
+
+def hoy_negocio(tenant_id: str) -> date:
+    """Día contable actual según la zona del negocio."""
+    return ahora_negocio(tenant_id).date()
+
+
+def _parsear_ts(valor) -> datetime:
+    """
+    Convierte cualquier representación legada de fecha a un instante tz-aware.
+    - datetime → se respeta; si es naive se asume UTC (era la hora del servidor)
+    - TEXT con offset o Z → se parsea como instante
+    - TEXT naive ('2026-03-29 12:49:18.125243') → se asume UTC
+    """
+    if isinstance(valor, datetime):
+        return valor if valor.tzinfo else valor.replace(tzinfo=timezone.utc)
+    s = str(valor).strip()
+    if not s:
+        raise ValueError("Fecha vacía")
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        dt = datetime.strptime(s[:19], "%Y-%m-%d %H:%M:%S")
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def fecha_negocio_de(valor, tenant_id: str) -> date:
+    """
+    Día contable de un valor de fecha:
+    - 'YYYY-MM-DD' (fecha capturada por humano) → tal cual
+    - cualquier timestamp/TEXT con hora → instante → día en la zona del negocio
+    """
+    s = str(valor).strip()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
+        return date.fromisoformat(s)
+    return _parsear_ts(s).astimezone(zona_tenant(tenant_id)).date()
 
 
 def _q(conn, sql: str, params: tuple = ()) -> list[dict]:

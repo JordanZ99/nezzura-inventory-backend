@@ -43,6 +43,7 @@ from database.recetas import (
     eliminar_material_receta,
 )
 from database.conexion import query, execute
+from database.helpers import invalidar_zona_tenant
 from pydantic import Field
 from dependencies import validar_sesion
 
@@ -151,6 +152,7 @@ class ActualizarMaterialReceta(BaseModel):
 
 class ActualizarPerfil(BaseModel):
     modo_precio_sugerido: Optional[str] = None  # 'antiguo' | 'maximo' | 'reciente'
+    zona_horaria: Optional[str] = None          # nombre IANA (ej. 'America/Cancun')
 
 class ActualizarPostOverride(BaseModel):
     """Override de la tarjeta de post para UN producto (Posts Automáticos, Fase 1).
@@ -161,29 +163,43 @@ class ActualizarPostOverride(BaseModel):
 
 # --- Endpoints ---
 
+def _leer_config_perfil(tenant_id: str) -> dict:
+    """Lee modo_precio_sugerido y zona_horaria del tenant con defaults seguros."""
+    fila = query(
+        "SELECT modo_precio_sugerido, zona_horaria FROM tenants WHERE id = %s",
+        (tenant_id,)
+    )
+    return {
+        "modo_precio_sugerido": (fila[0].get("modo_precio_sugerido") if fila else None) or "antiguo",
+        "zona_horaria": (fila[0].get("zona_horaria") if fila else None) or "America/Cancun",
+    }
+
+
 @router.get("/me")
 def obtener_mi_perfil(tenant_id: str = Depends(get_tenant_id)):
     """
-    Este endpoint está protegido. 
+    Este endpoint está protegido.
     Lee el JWT del Header, lo decodifica y devuelve el ID del usuario
-    junto con su configuración de perfil (modo de precio sugerido del POS).
+    junto con su configuración de perfil (modo de precio sugerido del POS
+    y zona horaria del negocio).
     """
-    modo = "antiguo"
-    try:
-        fila = query("SELECT modo_precio_sugerido FROM tenants WHERE id = %s", (tenant_id,))
-        if fila and fila[0].get("modo_precio_sugerido"):
-            modo = fila[0]["modo_precio_sugerido"]
-    except Exception:
-        pass
-    return {"tenant_id": tenant_id, "modo_precio_sugerido": modo}
+    return {"tenant_id": tenant_id, **_leer_config_perfil(tenant_id)}
 
 
 @router.patch("/me")
 def actualizar_mi_perfil(data: ActualizarPerfil, tenant_id: str = Depends(get_tenant_id)):
     """
-    Actualiza la configuración del perfil del tenant.
-    Por ahora solo gestiona modo_precio_sugerido (cómo el POS sugiere el precio).
+    Actualiza la configuración del perfil del tenant:
+    - modo_precio_sugerido: cómo el POS sugiere el precio.
+    - zona_horaria: nombre IANA del negocio; define el día contable de
+      ventas, gastos y cortes de caja (migración 031).
     """
+    if data.modo_precio_sugerido is None and data.zona_horaria is None:
+        # Sin cambios: devolver el valor actual persistido
+        return {"ok": True, **_leer_config_perfil(tenant_id)}
+
+    respuesta = {"ok": True}
+
     if data.modo_precio_sugerido is not None:
         modo = data.modo_precio_sugerido.strip().lower()
         if modo not in ("antiguo", "maximo", "reciente"):
@@ -192,16 +208,26 @@ def actualizar_mi_perfil(data: ActualizarPerfil, tenant_id: str = Depends(get_te
                 detail="modo_precio_sugerido debe ser 'antiguo', 'maximo' o 'reciente'",
             )
         execute("UPDATE tenants SET modo_precio_sugerido = %s WHERE id = %s", (modo, tenant_id))
-        return {"ok": True, "modo_precio_sugerido": modo}
-    # Sin cambios: devolver el valor actual persistido
-    modo_actual = "antiguo"
-    try:
-        fila = query("SELECT modo_precio_sugerido FROM tenants WHERE id = %s", (tenant_id,))
-        if fila and fila[0].get("modo_precio_sugerido"):
-            modo_actual = fila[0]["modo_precio_sugerido"]
-    except Exception:
-        pass
-    return {"ok": True, "modo_precio_sugerido": modo_actual}
+        respuesta["modo_precio_sugerido"] = modo
+
+    if data.zona_horaria is not None:
+        zona = data.zona_horaria.strip()
+        try:
+            from zoneinfo import ZoneInfo
+            ZoneInfo(zona)
+        except Exception:
+            raise HTTPException(
+                status_code=400,
+                detail=f"'{zona}' no es una zona horaria IANA válida (ej. 'America/Cancun')",
+            )
+        execute("UPDATE tenants SET zona_horaria = %s WHERE id = %s", (zona, tenant_id))
+        # El backend cachea la zona 5 min: invalidarla para que el cambio
+        # surta efecto de inmediato en ventas/gastos/cortes.
+        invalidar_zona_tenant(tenant_id)
+        respuesta["zona_horaria"] = zona
+
+    respuesta.update(_leer_config_perfil(tenant_id))
+    return respuesta
 
 
 @router.get("/")
