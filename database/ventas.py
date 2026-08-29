@@ -181,7 +181,9 @@ def get_ordenes_paginadas(
         f"ORDER BY {orden_sql} LIMIT %s OFFSET %s",
         tuple(params) + (por_pagina, (pagina - 1) * por_pagina)
     )
-    ordenes = [dict(o) for o in filas]
+    # `fecha` = alias de fecha_ts para el contrato del frontend (ISO con zona),
+    # igual que en get_ordenes; sin esto el historial muestra "Invalid Date".
+    ordenes = [dict(o, fecha=o["fecha_ts"]) for o in filas]
     if ordenes:
         _anidar_renglones(tenant_id, ordenes)
 
