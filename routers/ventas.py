@@ -126,6 +126,8 @@ def cobrar_carrito(carrito: Carrito, tenant_id: str = Depends(get_tenant_id)):
             "precio_real": item.precio_real,
             "id_lote": item.id_lote,
             "variacion": item.variacion,
+            "descripcion": item.descripcion,
+            "costo": item.costo,
         }
         for item in carrito.items
     ]
