@@ -11,50 +11,15 @@ from database.ventas import (
     cobrar_carrito as cobrar_carrito_atomico,
 )
 from database.conexion import query          # Necesario para leer la venta actual al procesar un PATCH parcial
-from dependencies import get_tenant_id  # <--- Importación segura
+from dependencies import get_tenant_id
 from database.helpers import resolver_rango_q, ventana_ts_de_rango
 from fastapi import APIRouter, HTTPException, Depends
-from pydantic import BaseModel
 from typing import Optional
+from schemas.ventas import (
+    ItemCarrito, PagoItem, PagoCarrito, Carrito, ActualizarVenta, ActualizarOrden
+)
 
 router = APIRouter(prefix="/ventas", tags=["Ventas"])
-
-class ItemCarrito(BaseModel):
-    producto   : str
-    cantidad   : float  # REAL desde la Fase 5: permite vender 0.5 kg, 150g, etc.
-    precio_real: float
-    id_lote    : Optional[str] = None
-    variacion  : Optional[str] = None  # Nombre de la variación vendida (ej. "Doble", "S")
-
-class PagoItem(BaseModel):
-    metodo    : str          # 'efectivo' | 'tarjeta_debito' | 'tarjeta_credito'
-    monto     : float
-    referencia: Optional[str] = None  # útlimos 4 dígitos / folio de voucher (opcional)
-
-class PagoCarrito(BaseModel):
-    metodo        : str                      # 'efectivo' | 'tarjeta_*' | 'mixto'
-    propina       : float = 0.0
-    pagos         : Optional[list[PagoItem]] = None  # obligatorio en mixto
-    monto_recibido: Optional[float] = None           # solo efectivo (cálculo de cambio)
-
-class Carrito(BaseModel):
-    items: list[ItemCarrito]
-    pago : Optional[PagoCarrito] = None      # None = cobro legado sin registrar método
-
-class ActualizarVenta(BaseModel):
-    # Todos los campos son opcionales para soportar PATCH parcial.
-    # El router se encarga de rellenar los campos ausentes con los valores
-    # actuales de la venta antes de delegar a la lógica de negocio, evitando
-    # el error 422 que ocurría cuando el frontend enviaba solo los campos modificados.
-    fecha         : Optional[str]   = None
-    cantidad      : Optional[float] = None  # REAL desde la Fase 5 (0.5 kg, etc.)
-    precio_real   : Optional[float] = None
-    costo_unitario: Optional[float] = None
-    total_venta   : Optional[float] = None
-    ganancia_bruta: Optional[float] = None
-
-class ActualizarOrden(BaseModel):
-    fecha: str  # 'YYYY-MM-DD' — nuevo día contable del ticket (conserva la hora)
 
 @router.get("/")
 def listar_ventas(

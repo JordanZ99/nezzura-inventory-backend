@@ -17,53 +17,16 @@
 import json
 import re
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
-from typing import Optional, Literal
-from enum import Enum
 from dependencies import get_tenant_id
 from database.conexion import query, execute
+from schemas.catalogo import TemplateEnum, ActualizarCatalogo, ActualizarPostConfig
 
 router = APIRouter(prefix="/catalogo_gestion", tags=["Gestión de Catálogo"])
-
-
-class TemplateEnum(str, Enum):
-    """Enum de templates disponibles para el catálogo público.
-    FastAPI rechaza automáticamente cualquier valor que no esté en esta lista (HTTP 422).
-    Añadir aquí los nuevos templates a medida que se implementen."""
-    grid_clasico = "grid-clasico"
-    menu_carta   = "menu-carta"
-
 
 # Valores permitidos para la config de posts (Fase 1 — Posts Automáticos)
 TEMPLATES_POST = ("marco", "overlay")  # 'tarjeta' se eliminó (el render la trata como Marco)
 FUENTES_POST = ("moderna", "elegante", "redondeada")
 POSICIONES_POST = ("arriba", "abajo")
-
-
-class ActualizarCatalogo(BaseModel):
-    """Modelo para actualizar la configuración del catálogo. PATCH parcial."""
-    activo: Optional[bool] = None
-    tema: Optional[str] = None        # 'default' | 'midnightBlack' | 'strawberry' | 'cozyYellow'
-    template: Optional[TemplateEnum] = None  # Validado por el Enum
-    titulo: Optional[str] = None
-    subtitulo: Optional[str] = None
-    mostrar_precios: Optional[bool] = None
-    mostrar_stock: Optional[bool] = None
-    mostrar_categorias: Optional[bool] = None
-    agrupar_por_categoria: Optional[bool] = None  # Separar productos por secciones de categoría
-    columnas_movil: Optional[Literal[1, 2]] = None  # 1 o 2 productos por fila en móvil (422 si es inválido)
-    relacion_imagen: Optional[str] = None  # '1:1' | '4:5' — relación global de las fotos de producto (catálogo, POS, gestor y crops)
-    permitir_descarga: Optional[bool] = None  # Permitir a los clientes descargar las fotos del catálogo
-    ocultar_agotados: Optional[bool] = None  # Ocultar los productos sin stock del catálogo público
-    # Hero + Anuncios (006_catalogo_hero_anuncios.sql)
-    banner_url: Optional[str] = None      # URL de la imagen de banner/hero (Cloudinary)
-    banner_url_movil: Optional[str] = None  # URL del banner específico para móviles (Cloudinary)
-    hero_estilo: Optional[str] = None     # 'gradiente' | 'imagen'
-    banner_texto_color: Optional[str] = None  # Color del título/subtítulo sobre el banner en modo imagen (hex)
-    banner_mostrar_texto: Optional[bool] = None  # Mostrar título/subtítulo sobre el banner en modo imagen
-    banner_mostrar_logo: Optional[bool] = None  # Mostrar el logo del negocio sobre el banner (hero)
-    anuncio_texto: Optional[str] = None   # texto de la barra de anuncios (vacío = oculta)
-
 
 @router.get("")
 def obtener_config_catalogo(tenant_id: str = Depends(get_tenant_id)):
@@ -202,16 +165,6 @@ def actualizar_config_catalogo(
 # La configuración en cascada: post_config (defaults) + productos.post_override.
 # Un producto sin override usa estos defaults; el override vive por producto.
 # =============================================================================
-
-class ActualizarPostConfig(BaseModel):
-    """Modelo para actualizar los defaults de posts del negocio. PATCH parcial."""
-    template_default: Optional[str] = None  # 'marco' | 'overlay'
-    font: Optional[str] = None             # 'moderna' | 'elegante' | 'redondeada'
-    posicion: Optional[str] = None         # 'arriba' | 'abajo' (solo Overlay, Fase 2)
-    mostrar: Optional[dict] = None         # {nombre: bool, precio: bool, negocio: bool}
-    color_primario: Optional[str] = None   # Color del NOMBRE + NEGOCIO (hex #RRGGBB o '' = automático por plantilla)
-    color_secundario: Optional[str] = None # Color del PRECIO (hex #RRGGBB o '' = azul por defecto)
-
 
 def _crear_post_config_default(tenant_id: str) -> None:
     """Crea la fila de post_config con los defaults si aún no existe."""

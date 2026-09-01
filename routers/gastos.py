@@ -3,6 +3,9 @@
 # Endpoints de gastos del negocio.
 # ==============================================================================
 
+from typing import Optional
+from fastapi import APIRouter, HTTPException, Depends
+
 from database.gastos import (
     get_gastos, insertar_gasto, eliminar_gasto, confirmar_gasto,
     descartar_gasto, actualizar_gasto,
@@ -12,33 +15,11 @@ from database.gastos import (
 from database.gastos_programados import verificar_y_generar_gastos_programados
 from database.helpers import resolver_rango_q
 from dependencies import get_tenant_id
-from fastapi import APIRouter, HTTPException, Depends
-from typing import Optional
-from pydantic import BaseModel, Field
+from schemas.gastos import (
+    NuevoGasto, ActualizarGasto, CrearCategoriaGasto, RenombrarCategoriaGasto
+)
 
 router = APIRouter(prefix="/gastos", tags=["Gastos"])
-
-
-class NuevoGasto(BaseModel):
-    fecha               : str
-    categoria           : str
-    descripcion         : str
-    monto               : float
-    estado              : Optional[str] = "pagado"
-    gasto_programado_id : Optional[str] = None
-
-
-class ActualizarGasto(BaseModel):
-    """
-    Modelo dedicado para la edición de gastos.
-    A diferencia de NuevoGasto, no exige 'fecha' ni 'estado' porque la lógica
-    de actualizar_gasto solo modifica monto, categoría y descripción.
-    Esto elimina el workaround del frontend que enviaba fecha="" para engañar
-    la validación de NuevoGasto reutilizado.
-    """
-    monto      : float
-    categoria  : str
-    descripcion: str
 
 
 @router.get("/")
@@ -49,10 +30,7 @@ def listar_gastos(
 ):
     """
     Gastos en la ventana contable pedida (?desde/?hasta, 'YYYY-MM-DD').
-    Sin ?desde ni ?hasta devuelve SOLO el mes contable actual (antes traía
-    el historial completo sin límite).
-    Antes de retornar, ejecuta el motor de verificación de gastos programados
-    para generar automáticamente los gastos cuya proxima_fecha ya venció.
+    Sin ?desde ni ?hasta devuelve SOLO el mes contable actual.
     """
     verificar_y_generar_gastos_programados(tenant_id)
     try:
@@ -91,11 +69,7 @@ def descartar_gasto_endpoint(gasto_id: int, tenant_id: str = Depends(get_tenant_
 
 @router.put("/{gasto_id}")
 def editar_gasto(gasto_id: int, data: ActualizarGasto, tenant_id: str = Depends(get_tenant_id)):
-    """
-    Actualiza monto, categoría y descripción de un gasto existente.
-    Ahora usa el modelo ActualizarGasto dedicado en lugar de reutilizar
-    NuevoGasto, que exigía campos irrelevantes para la edición (fecha, estado).
-    """
+    """Actualiza monto, categoría y descripción de un gasto existente."""
     return actualizar_gasto(
         gasto_id=gasto_id,
         monto=data.monto,
@@ -114,15 +88,6 @@ def borrar_gasto(gasto_id: int, tenant_id: str = Depends(get_tenant_id)):
 # =============================================================================
 # Endpoints para categorías de gasto editables
 # =============================================================================
-
-
-class CrearCategoriaGasto(BaseModel):
-    nombre: str = Field(..., min_length=1, description="Nombre de la categoría")
-
-
-class RenombrarCategoriaGasto(BaseModel):
-    nuevo_nombre: str = Field(..., min_length=1, description="Nuevo nombre para la categoría")
-
 
 @router.get("/categorias")
 def obtener_categorias_gasto(tenant_id: str = Depends(get_tenant_id)):
