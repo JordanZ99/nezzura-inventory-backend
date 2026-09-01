@@ -39,7 +39,7 @@ def get_productos_meta(tenant_id: str) -> list[dict]:
             precio_servicio,
             {cat_subquery}
         FROM productos 
-        WHERE Tenant_ID = %s
+        WHERE Tenant_ID = %s AND es_generico IS NOT TRUE
         ORDER BY Producto ASC
     """,  (tenant_id,))
     _adjuntar_variaciones(filas, tenant_id)
@@ -101,7 +101,7 @@ def get_inventario_consolidado(tenant_id: str) -> list[dict]:
             COALESCE(SUM(l.Costo * l.Stock_Lote) / NULLIF(SUM(l.Stock_Lote), 0), p.costo_servicio, 0) AS costo_promedio
         FROM productos p
         LEFT JOIN lotes l ON l.producto_id = p.id AND l.Tenant_ID = p.Tenant_ID AND l.Estado = 'Activo'
-        WHERE p.Tenant_ID = %s AND p.Estado = 'Activo'
+        WHERE p.Tenant_ID = %s AND p.Estado = 'Activo' AND p.es_generico IS NOT TRUE
         GROUP BY p.Producto, p.Descripcion, p.Imagen, p.Estado, p.id, p.codigo_interno, p.codigo_barras, p.ubicacion, p.visible_en_catalogo, p.sufijo_precio, p.fraccionable, p.tipo_producto, p.costo_servicio, p.precio_servicio, p.post_override
         ORDER BY p.Producto ASC
     """, (tenant_id,))

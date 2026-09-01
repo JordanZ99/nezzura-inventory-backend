@@ -20,7 +20,7 @@ def get_ventas(
     pasa el mes contable actual, evitando transportar todo el historial.
     """
     sql = (
-        "SELECT id, n_ticket, fecha, producto, cantidad, precio_lista, precio_real, "
+        "SELECT id, n_ticket, fecha, producto, descripcion, cantidad, precio_lista, precio_real, "
         "costo_unitario, total_venta, ganancia_bruta, estado, tipo_producto, variacion, consumo, orden_id "
         "FROM ventas WHERE tenant_id = %s"
     )
@@ -101,7 +101,7 @@ def get_ordenes(
                 return []
             ids = [o["id"] for o in ordenes]
             cur.execute(
-                "SELECT id, n_ticket, fecha, producto, cantidad, precio_lista, precio_real, "
+                "SELECT id, n_ticket, fecha, producto, descripcion, cantidad, precio_lista, precio_real, "
                 "       costo_unitario, total_venta, ganancia_bruta, estado, tipo_producto, "
                 "       variacion, consumo, orden_id "
                 "FROM ventas WHERE tenant_id = %s AND orden_id = ANY(%s::uuid[]) "
@@ -202,7 +202,7 @@ def _anidar_renglones(tenant_id: str, ordenes: list[dict]) -> None:
         return
     ids = [o["id"] for o in ordenes]
     renglones = query(
-        "SELECT id, n_ticket, fecha, producto, cantidad, precio_lista, precio_real, "
+        "SELECT id, n_ticket, fecha, producto, descripcion, cantidad, precio_lista, precio_real, "
         "       costo_unitario, total_venta, ganancia_bruta, estado, tipo_producto, "
         "       variacion, consumo, orden_id "
         "FROM ventas WHERE tenant_id = %s AND orden_id = ANY(%s::uuid[]) "
@@ -243,8 +243,8 @@ def insertar_venta(venta: dict, tenant_id: str, conn=None) -> None:
         INSERT INTO ventas
             (Fecha, fecha_ts, Producto, producto_id, Cantidad, Precio_Lista,
              Precio_Real, Costo_Unitario, Total_Venta, Ganancia_Bruta, Estado, ID_Lote, tenant_id,
-             tipo_producto, variacion, consumo, orden_id, n_ticket)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'Activo', %s, %s, %s, %s, %s, %s, %s)
+             tipo_producto, variacion, consumo, orden_id, n_ticket, descripcion)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'Activo', %s, %s, %s, %s, %s, %s, %s, %s)
     """
     params = (
         venta["fecha"],
@@ -264,6 +264,7 @@ def insertar_venta(venta: dict, tenant_id: str, conn=None) -> None:
         psycopg2.extras.Json(venta.get("consumo") or None),
         venta.get("orden_id"),
         venta.get("n_ticket"),
+        (str(venta["descripcion"]).strip() or None) if venta.get("descripcion") else None,
     )
     if conn is not None:
         with conn.cursor() as cur:
@@ -898,7 +899,7 @@ def cobrar_carrito(items: list[dict], tenant_id: str, pago: dict | None = None) 
             fraccionable = False
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(
-                    "SELECT tipo_producto, costo_servicio, precio_servicio, fraccionable "
+                    "SELECT tipo_producto, costo_servicio, precio_servicio, fraccionable, es_generico "
                     "FROM productos WHERE Producto = %s AND tenant_id = %s",
                     (item["producto"], tenant_id)
                 )
@@ -908,6 +909,9 @@ def cobrar_carrito(items: list[dict], tenant_id: str, pago: dict | None = None) 
                     costo_srv = float(fila.get("costo_servicio") or 0)
                     precio_srv = float(fila.get("precio_servicio") or 0)
                     fraccionable = bool(fila.get("fraccionable"))
+                    es_generico = bool(fila.get("es_generico"))
+                else:
+                    es_generico = False
 
             variacion = str(item.get("variacion") or "").strip()
 
@@ -991,21 +995,30 @@ def cobrar_carrito(items: list[dict], tenant_id: str, pago: dict | None = None) 
                 # ── Servicio: no tiene inventario ──
                 # Se vende infinito; se registra la venta con el costo/precio del
                 # servicio. Nada se descuenta de lotes.
+                #
+                # EXCEPCIÓN — Venta libre (migración 036): el producto genérico
+                # 'Venta libre' es un servicio comodín cuyo costo/precio se
+                # capturan EN LA VENTA (no en el producto): costo = item.costo
+                # (default 0) y precio_lista = precio_real (cada venta cuesta lo
+                # que se cobró; el producto no tiene "precio de lista").
                 fecha = str(ahora_negocio(tenant_id))
                 cant = float(item["cantidad"])
                 precio_real = float(item["precio_real"])
+                costo_unit = float(item.get("costo") or 0) if es_generico else costo_srv
+                precio_lista = precio_real if es_generico else precio_srv
                 ventas_a_guardar.append({
                     "fecha"         : fecha,
                     "producto"      : item["producto"],
                     "cantidad"      : cant,
-                    "precio_lista"  : precio_srv,
+                    "precio_lista"  : precio_lista,
                     "precio_real"   : precio_real,
-                    "costo_unitario": costo_srv,
+                    "costo_unitario": costo_unit,
                     "total_venta"   : precio_real * cant,
-                    "ganancia_bruta": (precio_real - costo_srv) * cant,
+                    "ganancia_bruta": (precio_real - costo_unit) * cant,
                     "id_lote"       : None,
                     "tipo_producto" : "servicio",
                     "variacion"     : variacion,
+                    "descripcion"   : (str(item.get("descripcion")).strip() or None) if item.get("descripcion") else None,
                 })
                 continue
 

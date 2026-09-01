@@ -8,6 +8,11 @@ class ItemCarrito(BaseModel):
     precio_real: float
     id_lote    : Optional[str] = None
     variacion  : Optional[str] = None
+    # Venta libre (migración 036): renglón del producto genérico 'Venta libre'.
+    # descripcion = texto libre para el ticket ("Cereal", "Silla usada");
+    # costo = costo opcional capturado en el POS (default 0 → ganancia = precio).
+    descripcion: Optional[str] = None
+    costo      : Optional[float] = None
 
 
 class PagoItem(BaseModel):
