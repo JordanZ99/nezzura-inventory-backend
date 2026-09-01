@@ -31,6 +31,9 @@ class PagoCarrito(BaseModel):
 class Carrito(BaseModel):
     items: list[ItemCarrito]
     pago : Optional[PagoCarrito] = None
+    # Cobro de mesa (Fase 2, migración 037): si viene, el backend convierte
+    # estos items en el ticket de ESA mesa y la libera en la misma transacción.
+    mesa_id: Optional[str] = None
 
 
 class ActualizarVenta(BaseModel):
