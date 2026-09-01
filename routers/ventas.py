@@ -144,7 +144,7 @@ def cobrar_carrito(carrito: Carrito, tenant_id: str = Depends(get_tenant_id)):
             "monto_recibido": carrito.pago.monto_recibido,
         }
 
-    resultado = cobrar_carrito_atomico(items, tenant_id, pago=pago)
+    resultado = cobrar_carrito_atomico(items, tenant_id, pago=pago, mesa_id=carrito.mesa_id)
     if not resultado.get("ok"):
         # Errores de regla de negocio (ej. compuesto sin receta) → 422;
         # errores internos/db → 500.

@@ -83,7 +83,8 @@ def get_ordenes(
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             sql = (
                 "SELECT id, n_ticket, fecha_ts, total, ganancia, cantidad_items, estado, "
-                "       metodo_pago, pagos, propina, monto_recibido, cambio, comision_total, turno_id "
+                "       metodo_pago, pagos, propina, monto_recibido, cambio, comision_total, turno_id, "
+                "       mesa_id, mesa_nombre "
                 "FROM ordenes WHERE tenant_id = %s"
             )
             params: list = [tenant_id]
@@ -176,7 +177,8 @@ def get_ordenes_paginadas(
 
     filas = query(
         "SELECT o.id, o.n_ticket, o.fecha_ts, o.total, o.ganancia, o.cantidad_items, o.estado, "
-        "o.metodo_pago, o.pagos, o.propina, o.monto_recibido, o.cambio, o.comision_total, o.turno_id "
+        "o.metodo_pago, o.pagos, o.propina, o.monto_recibido, o.cambio, o.comision_total, o.turno_id, "
+        "o.mesa_id, o.mesa_nombre "
         f"FROM ordenes o WHERE {where} "
         f"ORDER BY {orden_sql} LIMIT %s OFFSET %s",
         tuple(params) + (por_pagina, (pagina - 1) * por_pagina)
@@ -865,7 +867,7 @@ def _procesar_pago(pago: dict | None, total_venta: float, terminales_map: dict |
             "comision_total": round(comision_total, 2)}
 
 
-def cobrar_carrito(items: list[dict], tenant_id: str, pago: dict | None = None) -> dict:
+def cobrar_carrito(items: list[dict], tenant_id: str, pago: dict | None = None, mesa_id: str | None = None) -> dict:
     """
     Cobra un carrito completo de forma ATÓMICA (todo en una sola transacción).
 
@@ -889,6 +891,23 @@ def cobrar_carrito(items: list[dict], tenant_id: str, pago: dict | None = None) 
     """
     conn = get_conn()
     try:
+        # ── Cobro de mesa (Fase 2, migración 037) ──
+        # Si el carrito viene de una mesa, se bloquea y se registra su nombre
+        # (snapshot para trazabilidad). La liberación real (borrar mesa_items +
+        # estado Libre) ocurre AL FINAL de ESTA misma transacción: si el cobro
+        # falla (stock, receta, pago inválido), la orden abierta queda intacta.
+        mesa_nombre = None
+        if mesa_id:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT id, nombre, estado FROM mesas WHERE id = %s::uuid AND tenant_id = %s FOR UPDATE",
+                    (mesa_id, tenant_id)
+                )
+                fila_mesa = cur.fetchone()
+                if not fila_mesa:
+                    raise ValueError("La mesa no existe o ya no está disponible")
+                mesa_nombre = fila_mesa["nombre"]
+
         ventas_a_guardar = []
         for item in items:
             # Consultar el tipo del producto DENTRO de la transacción, para
@@ -1050,6 +1069,8 @@ def cobrar_carrito(items: list[dict], tenant_id: str, pago: dict | None = None) 
         # tenant, concurrente-seguro). Los agregados salen de los renglones.
         orden_id = None
         n_ticket = None
+        if mesa_id and not ventas_a_guardar:
+            raise ValueError("La mesa no tiene artículos que cobrar")
         if ventas_a_guardar:
             fecha_orden = ventas_a_guardar[0]["fecha"]
             # Pago (Fase A/B): método, propina, mixto, cambio, comisiones de terminal.
@@ -1074,8 +1095,8 @@ def cobrar_carrito(items: list[dict], tenant_id: str, pago: dict | None = None) 
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(
                     "INSERT INTO ordenes (tenant_id, n_ticket, fecha_ts, total, ganancia, cantidad_items, estado, "
-                    "metodo_pago, pagos, propina, monto_recibido, cambio, comision_total, turno_id) "
-                    "VALUES (%s, NULL, %s, %s, %s, %s, 'Activa', %s, %s, %s, %s, %s, %s, %s) "
+                    "metodo_pago, pagos, propina, monto_recibido, cambio, comision_total, turno_id, mesa_id, mesa_nombre) "
+                    "VALUES (%s, NULL, %s, %s, %s, %s, 'Activa', %s, %s, %s, %s, %s, %s, %s, %s, %s) "
                     "RETURNING id, n_ticket",
                     (
                         tenant_id,
@@ -1090,6 +1111,8 @@ def cobrar_carrito(items: list[dict], tenant_id: str, pago: dict | None = None) 
                         pago_cols["cambio"],
                         pago_cols["comision_total"],
                         turno_id,
+                        mesa_id,
+                        mesa_nombre,
                     )
                 )
                 fila_orden = cur.fetchone()
@@ -1119,6 +1142,22 @@ def cobrar_carrito(items: list[dict], tenant_id: str, pago: dict | None = None) 
             venta["n_ticket"] = n_ticket
             insertar_venta(venta, tenant_id, conn=conn)
 
+        # ── Liberar la mesa (misma transacción) ──
+        # Solo si el cobro fue EXITOSO hasta aquí: borramos sus renglones
+        # abiertos y la dejamos Libre. Si algo de arriba falló, el rollback
+        # también revierte esto (la orden abierta sobrevive para reintentar).
+        if mesa_id and ventas_a_guardar:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM mesa_items WHERE mesa_id = %s::uuid AND tenant_id = %s",
+                    (mesa_id, tenant_id)
+                )
+                cur.execute(
+                    "UPDATE mesas SET estado = 'Libre', abierta_en = NULL "
+                    "WHERE id = %s::uuid AND tenant_id = %s",
+                    (mesa_id, tenant_id)
+                )
+
         total = sum(v["total_venta"] for v in ventas_a_guardar)
 
         # Commit AL FINAL: así nada puede fallar después del commit y provocar
@@ -1134,6 +1173,8 @@ def cobrar_carrito(items: list[dict], tenant_id: str, pago: dict | None = None) 
             "metodo_pago": pago_cols["metodo_pago"] if ventas_a_guardar else None,
             "propina": pago_cols["propina"] if ventas_a_guardar else 0,
             "cambio": pago_cols["cambio"] if ventas_a_guardar else None,
+            "mesa_id": mesa_id,
+            "mesa_nombre": mesa_nombre,
         }
     except ValueError as e:
         # Error de REGLA DE NEGOCIO (ej. compuesto sin receta): se distingue de
