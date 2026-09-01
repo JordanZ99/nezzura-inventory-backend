@@ -4,24 +4,13 @@
 # y cerrar (contando el cajón contra el efectivo esperado).
 # ==============================================================================
 
-from typing import Optional
-
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
 
 from dependencies import get_tenant_id
+from schemas.turnos import AbrirTurno, CerrarTurno
 from database.turnos import abrir_turno, cerrar_turno, listar_turnos
 
 router = APIRouter(prefix="/turnos", tags=["Turnos"])
-
-
-class AbrirTurno(BaseModel):
-    monto_apertura: float = Field(0, ge=0, description="Fondo de caja con el que inicia el turno")
-
-
-class CerrarTurno(BaseModel):
-    efectivo_contado: float = Field(..., ge=0, description="Efectivo contado en el cajón")
-    notas: Optional[str] = None
 
 
 @router.get("/")

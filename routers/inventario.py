@@ -44,124 +44,27 @@ from database.recetas import (
 )
 from database.conexion import query, execute
 from database.helpers import invalidar_zona_tenant
-from pydantic import Field
 from dependencies import validar_sesion
+from schemas.inventario import (
+    VariacionAlta,
+    RecetaAlta,
+    NuevoProducto,
+    Restock,
+    ActualizarProducto,
+    ActualizarLote,
+    CrearCategoria,
+    RenombrarCategoria,
+    BorrarImagen,
+    NuevaVariacion,
+    ActualizarVariacion,
+    NuevoMaterialReceta,
+    ActualizarMaterialReceta,
+    ActualizarPerfil,
+    ActualizarPostOverride,
+    ReordenarImagenes,
+)
 
 router = APIRouter(prefix="/inventario", tags=["Inventario"])
-
-# --- Modelos Pydantic (validan los datos que llegan) ---
-
-class VariacionAlta(BaseModel):
-    """Variación a crear en el ALTA de un producto (nombre + precio propio).
-    stock_inicial/costo: opcionales — si se da stock, se crea el lote de ESA
-    variación y el producto pasa a manejar stock por variación (Fase 6)."""
-    nombre: str = Field(..., description="Nombre de la variación (ej. 'Doble', 'S')")
-    precio: float = Field(0, description="Precio propio de la variación")
-    stock_inicial: Optional[float] = Field(None, description="Stock inicial propio de esta variación (crea su lote)")
-    costo: Optional[float] = Field(None, description="Costo del lote inicial de esta variación (si se omite, usa el costo del producto)")
-
-class RecetaAlta(BaseModel):
-    """Material de la receta a crear en el ALTA de un compuesto."""
-    material: str = Field(..., description="Nombre del material (producto de stock ya existente)")
-    cantidad: float = Field(1, description="Cantidad por unidad (permite 0.5, 150, etc.)")
-
-class NuevoProducto(BaseModel):
-    producto       : str
-    descripcion    : str  = ""
-    costo          : float
-    precio_venta   : float
-    stock          : float
-    imagen         : str  = "No hay foto"
-    categoria      : list[str]  = ["General"]
-    codigo_interno : Optional[str] = None
-    codigo_barras  : Optional[str] = None
-    ubicacion      : Optional[str] = None
-    etiqueta       : Optional[str] = None  # Presentación del lote inicial (ej. "20cm", "Premium")
-    sufijo_precio  : Optional[str] = None  # Sufijo del precio en el catálogo ("c/u", "por kilo", libre)
-    fraccionable   : Optional[bool] = None # Si true, se puede vender por fracciones (0.5 kg, 1.5 lt...)
-    tipo_producto  : str = "stock"        # 'stock' (normal) | 'servicio' | 'compuesto'
-    costo_servicio : Optional[float] = None
-    precio_servicio: Optional[float] = None
-    visible_en_catalogo : Optional[bool] = None  # Solo aplica si el producto es NUEVO
-    variaciones   : Optional[list[VariacionAlta]] = None  # Se crean en la misma transacción
-    recetas       : Optional[list[RecetaAlta]] = None     # Solo para compuestos
-
-class Restock(BaseModel):
-    producto    : str
-    costo       : float
-    precio_venta: float
-    stock       : float
-    etiqueta    : Optional[str] = None  # Presentación del nuevo lote (ej. "20cm", "Premium")
-    variacion   : Optional[str] = None  # Variación a la que llega el stock (obligatoria si el producto maneja stock por variación)
-
-class ActualizarProducto(BaseModel):
-    descripcion         : str
-    imagen              : str
-    estado              : str
-    categoria           : list[str]
-    costo               : Optional[float] = None
-    precio_venta        : Optional[float] = None
-    producto            : Optional[str] = None
-    codigo_interno      : Optional[str] = None
-    codigo_barras       : Optional[str] = None
-    ubicacion           : Optional[str] = None
-    visible_en_catalogo : Optional[bool] = None
-    sufijo_precio       : Optional[str] = None  # Sufijo del precio en el catálogo ("c/u", "por kilo", libre)
-    fraccionable        : Optional[bool] = None  # Si true, se puede vender por fracciones (0.5 kg, 1.5 lt...)
-    tipo_producto       : Optional[str] = None  # 'stock' | 'servicio'
-    costo_servicio      : Optional[float] = None
-    precio_servicio     : Optional[float] = None
-
-class ActualizarLote(BaseModel):
-    costo       : float
-    precio_venta: float
-    stock       : float
-    etiqueta    : Optional[str] = None  # Presentación del lote (opcional)
-    variacion   : Optional[str] = None  # Reasignar/desvincular la variación del lote ('' = base)
-
-class CrearCategoria(BaseModel):
-    nombre: str = Field(..., min_length=1, description="Nombre de la categoría a crear")
-
-class RenombrarCategoria(BaseModel):
-    nuevo_nombre: str = Field(..., min_length=1, description="Nuevo nombre para la categoría")
-
-class BorrarImagen(BaseModel):
-    url: str = Field(..., description="URL de Cloudinary a borrar (imagen reemplazada o eliminada)")
-
-class NuevaVariacion(BaseModel):
-    producto: str = Field(..., description="Nombre del producto al que pertenece la variación")
-    nombre  : str = Field(..., description="Nombre de la variación (ej. 'Doble', 'S', 'Premium')")
-    precio  : float = Field(0, description="Precio propio de la variación")
-    foto    : str = Field("", description="URL de Cloudinary de la foto propia de la variación (opcional)")
-    stock_inicial: Optional[float] = Field(None, description="Stock inicial propio de esta variación (crea su lote y activa stock por variación)")
-    costo   : Optional[float] = Field(None, description="Costo del lote inicial (si se omite, usa 0)")
-
-class ActualizarVariacion(BaseModel):
-    nombre : str = Field(..., description="Nuevo nombre de la variación")
-    precio : float = Field(0, description="Nuevo precio de la variación")
-    foto   : Optional[str] = Field(None, description="URL de la foto; None = conservar, '' = quitar")
-
-class NuevoMaterialReceta(BaseModel):
-    producto : str = Field(..., description="Nombre del producto compuesto (el que se vende)")
-    material : str = Field(..., description="Nombre del material que consume (producto de stock)")
-    cantidad : float = Field(1, description="Cantidad de material por unidad del compuesto (permite 0.5, 150, etc.)")
-    variacion_id : Optional[int] = Field(None, description="Id de la variación a la que pertenece esta receta; None = receta base")
-
-class ActualizarMaterialReceta(BaseModel):
-    cantidad : float = Field(..., description="Nueva cantidad de material por unidad")
-
-class ActualizarPerfil(BaseModel):
-    modo_precio_sugerido: Optional[str] = None  # 'antiguo' | 'maximo' | 'reciente'
-    zona_horaria: Optional[str] = None          # nombre IANA (ej. 'America/Cancun')
-    metodo_pago_default: Optional[str] = None   # 'efectivo' | 'tarjeta_debito' | 'tarjeta_credito'
-    gasto_comision_automatico: Optional[bool] = None  # registra comisiones como gasto al cobrar
-
-class ActualizarPostOverride(BaseModel):
-    """Override de la tarjeta de post para UN producto (Posts Automáticos, Fase 1).
-    post_override: dict parcial tipo {"template":"marco","color":"strawberry",...}
-    o null para quitar el override (el producto vuelve a usar los defaults del negocio)."""
-    post_override: Optional[dict] = None
-
 
 # --- Endpoints ---
 
@@ -703,12 +606,6 @@ def eliminar_imagen_extra(imagen_id: int, tenant_id: str = Depends(get_tenant_id
     if not resultado.get("ok"):
         raise HTTPException(status_code=resultado["status"], detail=resultado["mensaje"])
     return resultado
-
-
-class ReordenarImagenes(BaseModel):
-    """Modelo para reordenar imágenes de la galería de un producto.
-    Recibe un array de IDs en el nuevo orden deseado (primero = orden 1 = principal)."""
-    ids: list[int] = Field(..., description="Array de IDs de imágenes en el nuevo orden")
 
 
 @router.patch("/imagenes/{producto}/reordenar")
