@@ -1,3 +1,4 @@
+import logging
 import psycopg2.extras
 import json
 import re
@@ -6,6 +7,8 @@ from datetime import date, datetime
 from database.conexion import query, execute, get_conn, release_conn
 from database.lotes import descontar_stock_peps
 from database.helpers import ahora_negocio, _parsear_ts, zona_tenant, hoy_negocio
+
+logger = logging.getLogger(__name__)
 
 def get_ventas(
     tenant_id: str,
@@ -143,7 +146,18 @@ def _sincronizar_pagos(cur, orden_id, tenant_id: str) -> None:
         delta = round(esperado - suma, 2)
         ultimo = float(pagos[-1].get("monto") or 0) + delta
         if ultimo <= 0:
-            return  # no se puede repartir el delta sin dejar montos ≤ 0
+            # Sin reparación silenciosa: el desglose mixto no se puede
+            # reajustar sin dejar montos ≤ 0. Se dejan los pagos desfasados
+            # Y se avisa (el aviso es la señal, la edición manual del cobro
+            # es la ruta de reparación).
+            logger.warning(
+                "Pagos desfasados en orden %s (tenant %s): esperado=%.2f, "
+                "registrado=%.2f, mixto sin reparto posible (el último pago "
+                "quedaría ≤ %.2f). 'Cobros del Periodo' seguirá mostrando el "
+                "desglose original hasta corregir el cobro manualmente.",
+                orden_id, tenant_id, esperado, suma, ultimo
+            )
+            return
         pagos[-1]["monto"] = round(ultimo, 2)
     comision_total = _comision_de_pagos(cur, tenant_id, pagos)
     recibido = fila["monto_recibido"]
@@ -893,7 +907,7 @@ def actualizar_pago_orden(orden_id: str, metodo: str, pagos_in: list[dict] | Non
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
-                "SELECT total, propina, estado FROM ordenes "
+                "SELECT total, propina, estado, metodo_pago, monto_recibido, pagos FROM ordenes "
                 "WHERE id = %s::uuid AND tenant_id = %s FOR UPDATE",
                 (orden_id, tenant_id)
             )
@@ -909,6 +923,7 @@ def actualizar_pago_orden(orden_id: str, metodo: str, pagos_in: list[dict] | Non
             if propina < 0:
                 return {"ok": False, "tipo": "validacion", "mensaje": "La propina no puede ser negativa"}
             esperado = round(total + propina, 2)
+            pagos_actuales = orden["pagos"]
 
             if pagos_in:
                 pagos: list[dict] = []
@@ -934,13 +949,44 @@ def actualizar_pago_orden(orden_id: str, metodo: str, pagos_in: list[dict] | Non
             elif metodo in METODOS_PAGO:
                 metodo_orden = metodo
                 pagos = [{"metodo": metodo, "monto": esperado, "referencia": None, "terminal_id": None}]
+            elif propina_nueva is not None:
+                # Edición de SOLO propina: conserva el cobro actual y reajusta
+                # sus montos a total + propina (misma regla de _sincronizar_pagos).
+                metodo_orden = orden.get("metodo_pago")
+                if not pagos_actuales:
+                    # Legado sin pagos: solo cambia la propina registrada.
+                    cur.execute(
+                        "UPDATE ordenes SET propina = %s WHERE id = %s::uuid AND tenant_id = %s",
+                        (propina, orden_id, tenant_id)
+                    )
+                    conn.commit()
+                    return {"ok": True, "metodo_pago": metodo_orden}
+                pagos = [dict(p) for p in pagos_actuales]
+                if len(pagos) == 1:
+                    pagos[0]["monto"] = esperado
+                else:
+                    suma = round(sum(float(p.get("monto") or 0) for p in pagos), 2)
+                    ultimo = float(pagos[-1].get("monto") or 0) + round(esperado - suma, 2)
+                    if ultimo <= 0:
+                        return {"ok": False, "tipo": "validacion",
+                                "mensaje": "El desglose mixto actual no permite subir la propina (un pago quedaría ≤ 0). Edita el pago completo con 'pagos'"}
+                    pagos[-1]["monto"] = round(ultimo, 2)
             else:
                 return {"ok": False, "tipo": "validacion", "mensaje": f"Método de pago inválido: '{metodo}'"}
 
             comision_total = _comision_de_pagos(cur, tenant_id, pagos)
-            # Efectivo simple: se asume que recibió exactamente el total (sin
-            # datos de recibo manual); tarjetas/mixto no registran recibido.
-            if metodo_orden == "efectivo":
+            # Reglas de monto_recibido/cambio: en la edición de SOLO propina
+            # se conserva el efectivo que se recibió (dinero entrado a caja;
+            # el cambio se reconsidera contra el monto nuevo). En el resto de
+            # ediciones se reconstruye el cobro: efectivo simple asume recibido
+            # exacto; tarjetas/mixto no registran recibido.
+            solo_propina = (propina_nueva is not None and not pagos_in and metodo not in METODOS_PAGO)
+            if solo_propina and orden.get("monto_recibido") is not None:
+                recibido_n = float(orden["monto_recibido"])
+                if recibido_n < esperado:
+                    recibido_n = esperado
+                cambio_n = round(recibido_n - esperado, 2)
+            elif metodo_orden == "efectivo":
                 recibido_n, cambio_n = esperado, 0.0
             else:
                 recibido_n, cambio_n = None, None
@@ -959,6 +1005,79 @@ def actualizar_pago_orden(orden_id: str, metodo: str, pagos_in: list[dict] | Non
         return {"ok": False, "mensaje": f"Error al editar el pago: {str(e)}"}
     finally:
         release_conn(conn)
+
+
+def reparar_pagos_desfasados() -> dict:
+    """
+    Backfill idempotente (corre en el arranque, tras las migraciones): los
+    tickets editados/anulados ANTES de que existiera _sincronizar_pagos
+    quedaron con pagos desfasados del total, y lo seguirán hasta que alguien
+    los re-edite (backlog invisible en 'Cobros del Periodo').
+
+    Repara en bulk las ordenes ACTIVAS con exactamente 1 pago desfasado:
+    monto = total + propina (conservando terminal/referencia del pago),
+    comision recalculada con la config viva de la terminal y cambio
+    reconsiderado. Las MIXTAS desfasadas NO se reparan (el reparto correcto
+    no se puede inferir) y se reportan en el log como pendientes manuales.
+    Se ejecuta en cada boot: solo toca filas desfasadas, así que después de
+    la primera pasada no vuelve a reparar nada.
+    """
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT id::text AS id_str, tenant_id, total, propina, pagos, monto_recibido "
+                "FROM ordenes WHERE estado = 'Activa' AND pagos IS NOT NULL "
+                "AND jsonb_array_length(pagos) = 1 "
+                "AND abs(COALESCE(pagos->0->>'monto', '0')::numeric "
+                "        - (total + COALESCE(propina, 0))) > 0.01 "
+                "FOR UPDATE"
+            )
+            filas = cur.fetchall()
+            reparadas = 0
+            for fila in filas:
+                esperado = round(float(fila["total"] or 0) + float(fila["propina"] or 0), 2)
+                pagos = [dict(fila["pagos"][0])]
+                pagos[0]["monto"] = esperado
+                comision_total = _comision_de_pagos(cur, str(fila["tenant_id"]), pagos)
+                recibido = fila["monto_recibido"]
+                cambio = None
+                if recibido is not None:
+                    recibido = float(recibido)
+                    if recibido < esperado:
+                        recibido = esperado
+                    cambio = round(recibido - esperado, 2)
+                cur.execute(
+                    "UPDATE ordenes SET pagos = %s, comision_total = %s, monto_recibido = %s, cambio = %s "
+                    "WHERE id = %s::uuid AND tenant_id = %s",
+                    (psycopg2.extras.Json(pagos), comision_total, recibido, cambio,
+                     fila["id_str"], str(fila["tenant_id"]))
+                )
+                reparadas += 1
+
+            cur.execute(
+                "SELECT id, total, propina FROM ordenes WHERE estado = 'Activa' "
+                "AND pagos IS NOT NULL AND jsonb_array_length(pagos) > 1 "
+                "AND abs(COALESCE((SELECT SUM((p->>'monto')::numeric) "
+                "                  FROM jsonb_array_elements(pagos) p), 0) "
+                "        - (total + COALESCE(propina, 0))) > 0.01"
+            )
+            mixtos = cur.fetchall()
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logger.warning("Backfill de pagos desfasados falló (no bloquea el arranque): %s", e)
+        return {"ok": False, "mensaje": str(e)}
+    finally:
+        release_conn(conn)
+    for fila in mixtos:
+        logger.warning(
+            "Ticket MIXTO desfasado pendiente de corrección manual: orden %s "
+            "(total+propina=%.2f). 'Cobros del Periodo' sigue mostrando el "
+            "desglose original.", fila["id"],
+            float(fila["total"] or 0) + float(fila["propina"] or 0)
+        )
+    return {"ok": True, "reparadas": reparadas, "mixtos_pendientes": len(mixtos)}
 
 
 def _procesar_pago(pago: dict | None, total_venta: float, terminales_map: dict | None = None) -> dict:

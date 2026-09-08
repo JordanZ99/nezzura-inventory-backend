@@ -51,6 +51,17 @@ app.add_middleware(
 @app.on_event("startup")
 def startup():
     inicializar_db()
+    # Backfill idempotente: repara los tickets históricos con pagos desfasados
+    # de _sincronizar_pagos (que solo corrige al editar de ahora en adelante).
+    # Nunca bloquea el arranque.
+    try:
+        from database.ventas import reparar_pagos_desfasados
+        r = reparar_pagos_desfasados()
+        if r.get("ok") and (r.get("reparadas") or r.get("mixtos_pendientes")):
+            print(f"Backfill de pagos: {r.get('reparadas')} reparadas, "
+                  f"{r.get('mixtos_pendientes')} mixtas pendientes manuales")
+    except Exception as e:
+        print(f"Backfill de pagos desfasados: {e}")
 
 
 # SQLSTATE 42P01 (tabla inexistente) → 503 con marcador explícito.
