@@ -8,6 +8,7 @@ from database.ventas import (
     eliminar_venta,
     anular_orden,
     actualizar_orden,
+    actualizar_pago_orden,
     cobrar_carrito as cobrar_carrito_atomico,
 )
 from database.conexion import query          # Necesario para leer la venta actual al procesar un PATCH parcial
@@ -96,14 +97,36 @@ def listar_ordenes_paginadas(
 
 @router.patch("/ordenes/{orden_id}")
 def editar_orden(orden_id: str, data: ActualizarOrden, tenant_id: str = Depends(get_tenant_id)):
-    """Edita la fecha de un ticket (cascada a todos sus renglones)."""
-    resultado = actualizar_orden(orden_id, data.fecha, tenant_id)
-    if not resultado.get("ok"):
-        raise HTTPException(
-            status_code=422 if resultado.get("tipo") == "validacion" else 400,
-            detail=resultado.get("mensaje"),
+    """
+    Edita la FECHA y/o el COBRO de un ticket.
+    - fecha: cambia el día contable del ticket y de todos sus renglones.
+    - metodo_pago / pagos / propina: edita el pago; el total no se toca
+      (la suma de pagos se valida contra total + propina).
+    """
+    respuesta: dict = {"ok": True}
+    if data.fecha:
+        respuesta = actualizar_orden(orden_id, data.fecha, tenant_id)
+        if not respuesta.get("ok"):
+            raise HTTPException(
+                status_code=422 if respuesta.get("tipo") == "validacion" else 400,
+                detail=respuesta.get("mensaje"),
+            )
+    if data.metodo_pago or data.pagos or data.propina is not None:
+        respuesta = actualizar_pago_orden(
+            orden_id,
+            data.metodo_pago or "",
+            [p.model_dump() for p in data.pagos] if data.pagos else None,
+            data.propina,
+            tenant_id,
         )
-    return resultado
+        if not respuesta.get("ok"):
+            raise HTTPException(
+                status_code=422 if respuesta.get("tipo") == "validacion" else 400,
+                detail=respuesta.get("mensaje"),
+            )
+    if respuesta == {"ok": True}:
+        raise HTTPException(status_code=422, detail="Nada que actualizar: envía fecha, metodo_pago, pagos o propina")
+    return respuesta
 
 @router.delete("/ordenes/{orden_id}")
 def anular_ticket(orden_id: str, tenant_id: str = Depends(get_tenant_id)):
