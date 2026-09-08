@@ -9,3 +9,11 @@ class AbrirTurno(BaseModel):
 class CerrarTurno(BaseModel):
     efectivo_contado: float = Field(..., ge=0, description="Efectivo contado en el cajón")
     notas: Optional[str] = None
+
+
+class ActualizarTurno(BaseModel):
+    """Edición AMABLE del turno: fondo del abierto, contado/notas del cerrado.
+    El esperado de un cerrado NUNCA se recalcula (snapshot del cierre)."""
+    monto_apertura: Optional[float] = Field(None, ge=0)
+    efectivo_contado: Optional[float] = Field(None, ge=0)
+    notas: Optional[str] = None

@@ -105,6 +105,97 @@ def cerrar_turno(turno_id: str, tenant_id: str, efectivo_contado: float, notas: 
         release_conn(conn)
 
 
+def editar_turno(
+    turno_id: str,
+    tenant_id: str,
+    monto_apertura: float | None = None,
+    efectivo_contado: float | None = None,
+    notas: str | None = None,
+) -> dict:
+    """
+    Editar un turno de forma amable:
+
+    - turno ABIERTO: `monto_apertura` (typo al abrir; el esperado EN VIVO se
+      recalcula solo al listar) y/o `notas`.
+    - turno CERRADO (CORRECCIÓN DE ARQUEO): `efectivo_contado` re-computa
+      `diferencia` contra el `efectivo_esperado` SNAPSHOTEADO al cierre (el
+      esperado NUNCA se recalcula — es la foto del cierre). Se marca en las
+      notas con "Arqueo corregido". `monto_apertura` NO se edita en cerrados
+      (rompería el arqueo ya firmado).
+    """
+    if monto_apertura is None and efectivo_contado is None and notas is None:
+        return {"ok": False, "tipo": "validacion",
+                "mensaje": "Nada que actualizar: envía monto_apertura, efectivo_contado y/o notas"}
+    if monto_apertura is not None and round(float(monto_apertura), 2) < 0:
+        return {"ok": False, "tipo": "validacion", "mensaje": "El fondo de caja no puede ser negativo"}
+    if efectivo_contado is not None and round(float(efectivo_contado), 2) < 0:
+        return {"ok": False, "tipo": "validacion", "mensaje": "El efectivo contado no puede ser negativo"}
+
+    MARCA = "Arqueo corregido"
+    conn = get_conn()
+    try: 
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "SELECT id, estado, monto_apertura, efectivo_esperado, efectivo_contado, notas "
+                "FROM turnos WHERE id = %s::uuid AND tenant_id = %s FOR UPDATE",
+                (turno_id, tenant_id)
+            )
+            turno = cur.fetchone()
+            if not turno:
+                return {"ok": False, "mensaje": "Turno no encontrado"}
+            estado = turno["estado"]
+
+            if estado not in ("Abierto", "Cerrado"):
+                return {"ok": False, "tipo": "validacion", "mensaje": f"Estado de turno no editable: '{estado}'"}
+
+            if estado == "Cerrado":
+                # Cerrado: el fondo NO se toca (rompería el arqueo firmado)
+                if monto_apertura is not None:
+                    return {"ok": False, "tipo": "validacion",
+                            "mensaje": "El fondo de caja de un turno cerrado no se puede editar"}
+                # Corrección de arqueo: nueva diferencia contra el snapshot
+                esperado = round(float(turno["efectivo_esperado"] or 0), 2)
+                contado = round(float(efectivo_contado), 2) if efectivo_contado is not None \
+                    else round(float(turno["efectivo_contado"] or 0), 2)
+                diferencia = round(contado - esperado, 2)
+                notas_nuevas = (notas or turno["notas"] or "").strip() or None
+                # Marca de auditoría: solo si el contado realmente cambió
+                if efectivo_contado is not None and abs(contado - round(float(turno["efectivo_contado"] or 0), 2)) > 0.01:
+                    base = (notas_nuevas or "").strip()
+                    notas_nuevas = f"{base} · {MARCA}".strip(" ·") if MARCA not in base else base
+                cur.execute(
+                    "UPDATE turnos SET efectivo_contado = %s, diferencia = %s, notas = %s "
+                    "WHERE id = %s::uuid AND tenant_id = %s",
+                    (contado, diferencia, notas_nuevas, turno_id, tenant_id)
+                )
+                conn.commit()
+                return {"ok": True, "efectivo_contado": contado,
+                        "efectivo_esperado": esperado, "diferencia": diferencia}
+
+            # Turno ABIERTO: fondo y notas; el contado se registra al cerrar
+            if efectivo_contado is not None:
+                return {"ok": False, "tipo": "validacion",
+                        "mensaje": "El contado se cuenta al cerrar el turno, no antes"}
+            sets: list[str] = []
+            params: list = []
+            if monto_apertura is not None:
+                sets.append("monto_apertura = %s")
+                params.append(round(float(monto_apertura), 2))
+            if notas is not None:
+                sets.append("notas = %s")
+                params.append((notas or "").strip() or None)
+            if sets:
+                params.extend([turno_id, tenant_id])
+                cur.execute(f"UPDATE turnos SET {', '.join(sets)} WHERE id = %s::uuid AND tenant_id = %s", tuple(params))
+            conn.commit()
+            return {"ok": True, "mensaje": "Turno actualizado"}
+    except Exception as e:
+        conn.rollback()
+        return {"ok": False, "mensaje": f"Error al editar el turno: {e}"}
+    finally:
+        release_conn(conn)
+
+
 def listar_turnos(tenant_id: str, limit: int = 50) -> list[dict]:
     """
     Historial de turnos con sus agregados. Para los abiertos, el efectivo
