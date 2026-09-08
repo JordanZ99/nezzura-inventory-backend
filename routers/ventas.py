@@ -14,6 +14,7 @@ from database.conexion import query          # Necesario para leer la venta actu
 from dependencies import get_tenant_id
 from database.helpers import resolver_rango_q, ventana_ts_de_rango
 from fastapi import APIRouter, HTTPException, Depends
+from datetime import date
 from typing import Optional
 from schemas.ventas import (
     ItemCarrito, PagoItem, PagoCarrito, Carrito, ActualizarVenta, ActualizarOrden
@@ -66,6 +67,7 @@ def listar_ordenes(
 def listar_ordenes_paginadas(
     desde: Optional[str] = None,
     hasta: Optional[str] = None,
+    todo: bool = False,
     pagina: int = 1,
     por_pagina: int = 10,
     busqueda: Optional[str] = None,
@@ -75,12 +77,16 @@ def listar_ordenes_paginadas(
     """
     Historial de tickets paginado en servidor (una página por request).
     ?busqueda busca por folio o producto; ?orden: fecha-desc|fecha-asc|
-    monto-desc|monto-asc|ganancia-desc. Sin ?desde/?hasta usa el mes contable.
+    monto-desc|monto-asc|ganancia-desc. Sin ?desde/?hasta usa el mes contable;
+    con ?todo=true abre el histórico completo.
     """
-    try:
-        d_desde, d_hasta = resolver_rango_q(tenant_id, desde, hasta)
-    except ValueError as e:
-        raise HTTPException(status_code=422, detail=str(e))
+    if todo:
+        d_desde, d_hasta = date(1970, 1, 1), None
+    else:
+        try:
+            d_desde, d_hasta = resolver_rango_q(tenant_id, desde, hasta)
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e))
     desde_ts, hasta_ts = ventana_ts_de_rango(tenant_id, d_desde, d_hasta)
     return get_ordenes_paginadas(
         tenant_id, desde_ts, hasta_ts,
