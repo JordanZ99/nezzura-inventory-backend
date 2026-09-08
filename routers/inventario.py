@@ -44,6 +44,7 @@ from database.recetas import (
 )
 from database.conexion import query, execute
 from database.helpers import invalidar_zona_tenant
+from database.clientes import normalizar_campos_cliente
 from dependencies import validar_sesion
 from schemas.inventario import (
     VariacionAlta,
@@ -69,17 +70,31 @@ router = APIRouter(prefix="/inventario", tags=["Inventario"])
 # --- Endpoints ---
 
 def _leer_config_perfil(tenant_id: str) -> dict:
-    """Lee modo_precio_sugerido, zona_horaria, metodo_pago_default y flag de comisiones."""
+    """Lee modo_precio_sugerido, zona horaria, método de pago, flag de comisiones
+    y la config de la cartera de clientes + sistema de puntos (migraciones 038/039)."""
     fila = query(
-        "SELECT modo_precio_sugerido, zona_horaria, metodo_pago_default, gasto_comision_automatico "
+        "SELECT modo_precio_sugerido, zona_horaria, metodo_pago_default, gasto_comision_automatico, "
+        "clientes_activos, cliente_campos, puntos_activos, puntos_valor_punto, puntos_modo, "
+        "puntos_gasto_monto, puntos_gasto_pts, puntos_fijos "
         "FROM tenants WHERE id = %s",
         (tenant_id,)
     )
+    f = fila[0] if fila else {}
     return {
-        "modo_precio_sugerido": (fila[0].get("modo_precio_sugerido") if fila else None) or "antiguo",
-        "zona_horaria": (fila[0].get("zona_horaria") if fila else None) or "America/Cancun",
-        "metodo_pago_default": (fila[0].get("metodo_pago_default") if fila else None) or "efectivo",
-        "gasto_comision_automatico": bool(fila[0]["gasto_comision_automatico"]) if fila else False,
+        "modo_precio_sugerido": (f.get("modo_precio_sugerido") if fila else None) or "antiguo",
+        "zona_horaria": (f.get("zona_horaria") if fila else None) or "America/Cancun",
+        "metodo_pago_default": (f.get("metodo_pago_default") if fila else None) or "efectivo",
+        "gasto_comision_automatico": bool(f["gasto_comision_automatico"]) if fila else False,
+        # ── Cartera de clientes (038) ──
+        "clientes_activos": bool(f.get("clientes_activos")) if fila else False,
+        "cliente_campos": normalizar_campos_cliente(f.get("cliente_campos")),
+        # ── Sistema de puntos (039) ──
+        "puntos_activos": bool(f.get("puntos_activos")) if fila else False,
+        "puntos_valor_punto": float(f.get("puntos_valor_punto") or 1) if fila else 1.0,
+        "puntos_modo": (f.get("puntos_modo") or "por_gasto") if fila else "por_gasto",
+        "puntos_gasto_monto": float(f.get("puntos_gasto_monto") or 10) if fila else 10.0,
+        "puntos_gasto_pts": int(f.get("puntos_gasto_pts") or 1) if fila else 1,
+        "puntos_fijos": (int(f["puntos_fijos"]) if f.get("puntos_fijos") is not None else None) if fila else None,
     }
 
 
@@ -101,9 +116,15 @@ def actualizar_mi_perfil(data: ActualizarPerfil, tenant_id: str = Depends(get_te
     - modo_precio_sugerido: cómo el POS sugiere el precio.
     - zona_horaria: nombre IANA del negocio; define el día contable de
       ventas, gastos y cortes de caja (migración 031).
+    - clientes_* / puntos_*: cartera de clientes y sistema de puntos
+      (migraciones 038/039, doc sistemaPuntos.md).
     """
     if (data.modo_precio_sugerido is None and data.zona_horaria is None
-            and data.metodo_pago_default is None and data.gasto_comision_automatico is None):
+            and data.metodo_pago_default is None and data.gasto_comision_automatico is None
+            and data.clientes_activos is None and data.cliente_campos is None
+            and data.puntos_activos is None and data.puntos_valor_punto is None
+            and data.puntos_modo is None and data.puntos_gasto_monto is None
+            and data.puntos_gasto_pts is None and data.puntos_fijos is None):
         # Sin cambios: devolver el valor actual persistido
         return {"ok": True, **_leer_config_perfil(tenant_id)}
 
@@ -149,6 +170,62 @@ def actualizar_mi_perfil(data: ActualizarPerfil, tenant_id: str = Depends(get_te
         # surta efecto de inmediato en ventas/gastos/cortes.
         invalidar_zona_tenant(tenant_id)
         respuesta["zona_horaria"] = zona
+
+    # ── Cartera de clientes (038) ──
+    if data.clientes_activos is not None:
+        execute("UPDATE tenants SET clientes_activos = %s WHERE id = %s",
+                (bool(data.clientes_activos), tenant_id))
+        respuesta["clientes_activos"] = bool(data.clientes_activos)
+
+    if data.cliente_campos is not None:
+        try:
+            campos = normalizar_campos_cliente(data.cliente_campos)
+        except Exception:
+            raise HTTPException(status_code=422, detail="cliente_campos debe ser un objeto")
+        execute("UPDATE tenants SET cliente_campos = %s::jsonb WHERE id = %s",
+                (json.dumps(campos), tenant_id))
+        respuesta["cliente_campos"] = campos
+
+    # ── Sistema de puntos (039) ──
+    if data.puntos_activos is not None:
+        execute("UPDATE tenants SET puntos_activos = %s WHERE id = %s",
+                (bool(data.puntos_activos), tenant_id))
+        respuesta["puntos_activos"] = bool(data.puntos_activos)
+
+    if data.puntos_valor_punto is not None:
+        valor = float(data.puntos_valor_punto)
+        if valor <= 0:
+            raise HTTPException(status_code=422, detail="puntos_valor_punto debe ser mayor a 0 (ej. 1 = '1 punto vale $1'; 0.01 = '100 puntos valen $1')")
+        execute("UPDATE tenants SET puntos_valor_punto = %s WHERE id = %s", (valor, tenant_id))
+        respuesta["puntos_valor_punto"] = valor
+
+    if data.puntos_modo is not None:
+        modo = data.puntos_modo.strip().lower()
+        if modo not in ("por_gasto", "fijo"):
+            raise HTTPException(status_code=422, detail="puntos_modo debe ser 'por_gasto' o 'fijo'")
+        execute("UPDATE tenants SET puntos_modo = %s WHERE id = %s", (modo, tenant_id))
+        respuesta["puntos_modo"] = modo
+
+    if data.puntos_gasto_monto is not None:
+        monto = float(data.puntos_gasto_monto)
+        if monto <= 0:
+            raise HTTPException(status_code=422, detail="puntos_gasto_monto debe ser mayor a 0 (ej. 10 en '1 punto por cada $10')")
+        execute("UPDATE tenants SET puntos_gasto_monto = %s WHERE id = %s", (monto, tenant_id))
+        respuesta["puntos_gasto_monto"] = monto
+
+    if data.puntos_gasto_pts is not None:
+        pts = int(data.puntos_gasto_pts)
+        if pts < 1:
+            raise HTTPException(status_code=422, detail="puntos_gasto_pts debe ser al menos 1")
+        execute("UPDATE tenants SET puntos_gasto_pts = %s WHERE id = %s", (pts, tenant_id))
+        respuesta["puntos_gasto_pts"] = pts
+
+    if data.puntos_fijos is not None:
+        fijos = int(data.puntos_fijos)
+        if fijos < 0:
+            raise HTTPException(status_code=422, detail="puntos_fijos no puede ser negativo")
+        execute("UPDATE tenants SET puntos_fijos = %s WHERE id = %s", (fijos, tenant_id))
+        respuesta["puntos_fijos"] = fijos
 
     respuesta.update(_leer_config_perfil(tenant_id))
     return respuesta

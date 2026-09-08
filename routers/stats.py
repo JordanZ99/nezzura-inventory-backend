@@ -103,3 +103,20 @@ def ventas_de_producto(
     d, h = _rango_o_todo(tenant_id, desde, hasta, todo)
     desde_ts, hasta_ts = ventana_ts_de_rango(tenant_id, d, h)
     return stats.ventas_producto_periodo(tenant_id, producto, desde_ts, hasta_ts)
+
+
+@router.get("/clientes")
+def resumen_clientes(
+    desde: Optional[str] = None,
+    hasta: Optional[str] = None,
+    todo: bool = False,
+    granularidad: str = "auto",
+    tenant_id: str = Depends(get_tenant_id),
+):
+    """KPIs de la cartera de clientes + programa de puntos (tab "Clientes"):
+    incluye sala de honor (top_clientes) y serie temporal de cómo influye en
+    las ventas (granularidad 'auto' según el ancho del rango)."""
+    d, h = _rango_o_todo(tenant_id, desde, hasta, todo)
+    g = _granularidad(tenant_id, d, h, granularidad)
+    desde_ts, hasta_ts = ventana_ts_de_rango(tenant_id, d, h)
+    return stats.resumen_clientes(tenant_id, desde_ts, hasta_ts, granularidad=g)

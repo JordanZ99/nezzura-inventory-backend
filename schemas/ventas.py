@@ -34,6 +34,17 @@ class Carrito(BaseModel):
     # Cobro de mesa (Fase 2, migración 037): si viene, el backend convierte
     # estos items en el ticket de ESA mesa y la libera en la misma transacción.
     mesa_id: Optional[str] = None
+    # ── Cliente + puntos (migraciones 038/039, Fase B) ──
+    # cliente_id: liga el ticket al cliente de la cartera.
+    # puntos_usados: pagar con puntos (canje) — se valida contra el saldo del
+    # ledger, se convierten a dinero con el valor del punto vigente y reducen
+    # lo que queda por pagar en dinero.
+    # ajuste_puntos (+/− con ajuste_concepto): dar/quitar puntos manualmente en
+    # el mismo ticket (ej. promo especial del 50% aplicada a mano).
+    cliente_id     : Optional[str] = None
+    puntos_usados  : int = 0
+    ajuste_puntos  : int = 0
+    ajuste_concepto: Optional[str] = None
 
 
 class ActualizarVenta(BaseModel):

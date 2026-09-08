@@ -7,6 +7,7 @@ from datetime import date, datetime
 from database.conexion import query, execute, get_conn, release_conn
 from database.lotes import descontar_stock_peps
 from database.helpers import ahora_negocio, _parsear_ts, zona_tenant, hoy_negocio
+from database.puntos import registrar_movimiento
 
 logger = logging.getLogger(__name__)
 
@@ -144,7 +145,11 @@ def _sincronizar_pagos(cur, orden_id, tenant_id: str) -> None:
         pagos[0]["monto"] = esperado
     else:
         delta = round(esperado - suma, 2)
-        ultimo = float(pagos[-1].get("monto") or 0) + delta
+        # El canje de puntos NO se re-ajusta (los puntos ya se consumieron):
+        # el delta va al ÚLTIMO pago de dinero (no 'puntos').
+        idx_delta = max((i for i, p in enumerate(pagos) if p.get("metodo") != "puntos"),
+                        default=len(pagos) - 1)
+        ultimo = float(pagos[idx_delta].get("monto") or 0) + delta
         if ultimo <= 0:
             # Sin reparación silenciosa: el desglose mixto no se puede
             # reajustar sin dejar montos ≤ 0. Se dejan los pagos desfasados
@@ -158,7 +163,7 @@ def _sincronizar_pagos(cur, orden_id, tenant_id: str) -> None:
                 orden_id, tenant_id, esperado, suma, ultimo
             )
             return
-        pagos[-1]["monto"] = round(ultimo, 2)
+        pagos[idx_delta]["monto"] = round(ultimo, 2)
     comision_total = _comision_de_pagos(cur, tenant_id, pagos)
     recibido = fila["monto_recibido"]
     cambio = None
@@ -819,6 +824,24 @@ def anular_orden(orden_id: str, tenant_id: str) -> dict:
 
             # Recalcula agregados (total/ganancia/unidades = 0) y pone estado 'Anulada'
             _recalcular_orden(cur, orden_id, tenant_id)
+
+            # ── Reversa de movimientos de puntos (ledger, migraciones 038/039) ──
+            # Nunca se edita ni borra un movimiento previo: se escribe el
+            # movimiento espejo (tipo 'ajuste') para que el saldo quede exacto.
+            cur.execute(
+                "SELECT cliente_id, tipo, puntos FROM puntos_movimientos "
+                "WHERE orden_id = %s::uuid AND tenant_id = %s",
+                (orden_id, tenant_id)
+            )
+            movs = cur.fetchall()
+            if movs:
+                cliente_id_rev = movs[0]["cliente_id"]
+                for m in movs:
+                    registrar_movimiento(
+                        tenant_id, str(cliente_id_rev), "ajuste", -int(m["puntos"] or 0),
+                        concepto=f"Reversa por anulación del ticket #{orden.get('n_ticket')}",
+                        orden_id=orden_id, conn=conn,
+                    )
         conn.commit()
         return {
             "ok": True,
@@ -890,7 +913,7 @@ def actualizar_orden(orden_id: str, fecha: str, tenant_id: str) -> dict:
 # Métodos de pago (Fase A de cobro). En las órdenes 'mixto' también existe;
 # en cada pago individual solo los métodos reales.
 METODOS_PAGO = ("efectivo", "tarjeta_debito", "tarjeta_credito")
-METODOS_ORDEN = METODOS_PAGO + ("mixto",)
+METODOS_ORDEN = METODOS_PAGO + ("mixto", "puntos")  # 'puntos' = canje cubre todo el ticket
 
 
 def actualizar_pago_orden(orden_id: str, metodo: str, pagos_in: list[dict] | None, propina_nueva: float | None, tenant_id: str) -> dict:
@@ -1080,22 +1103,37 @@ def reparar_pagos_desfasados() -> dict:
     return {"ok": True, "reparadas": reparadas, "mixtos_pendientes": len(mixtos)}
 
 
-def _procesar_pago(pago: dict | None, total_venta: float, terminales_map: dict | None = None) -> dict:
+def _procesar_pago(
+    pago: dict | None,
+    total_venta: float,
+    terminales_map: dict | None = None,
+    pago_puntos: dict | None = None,
+) -> dict:
     """
     Valida y normaliza el pago de un carrito; devuelve las columnas para ordenes.
 
     Reglas:
       - Sin pago (API legada) → metodo_pago/pagos NULL, propina 0.
-      - total_a_pagar = total_venta (productos) + propina.
-      - Método simple: se genera UN pago por el total_a_pagar; en efectivo
-        monto_recibido >= total_a_pagar y cambio = recibido - total_a_pagar.
-      - Mixto: lista de pagos reales cuya suma debe cuadrar (±1 centavo).
+      - total_a_pagar = total_venta (productos) + propina − canje de puntos.
+        El canje entra como SU PROPIO pago (metodo 'puntos') al inicio de `pagos`,
+        así se conserva el invariante sum(pagos) == total + propina y los
+        "Cobros del Periodo" muestran cuánto se pagó con puntos.
+      - Método simple: se genera UN pago DENTERO por el total_a_pagar; en
+        efectivo monto_recibido >= total_a_pagar y cambio = recibido - total_a_pagar.
+      - Mixto: lista de pagos reales cuya suma (dinero) debe cuadrar (±1 centavo).
       - Pagos con tarjeta pueden llevar terminal_id: la comisión se calcula con
         la tarifa de ESA terminal (pct débito/crédito + cuota fija) y queda
         dentro de cada pago + comision_total de la orden (Fase B).
+      - Canje total (sin dinero): metodo "puntos" con pagos = [pago_puntos].
     Errores de regla de negocio → ValueError (el router responde 422).
     """
+    valor_canje = round(float(pago_puntos["monto"]), 2) if pago_puntos else 0.0
+
     if not pago:
+        if valor_canje > 0:
+            # Todo el ticket se cubre con puntos (no hay método extra elegido)
+            return {"metodo_pago": "puntos", "pagos": [pago_puntos], "propina": 0.0,
+                    "monto_recibido": None, "cambio": None, "comision_total": 0.0}
         return {"metodo_pago": None, "pagos": None, "propina": 0.0,
                 "monto_recibido": None, "cambio": None, "comision_total": 0.0}
 
@@ -1106,11 +1144,22 @@ def _procesar_pago(pago: dict | None, total_venta: float, terminales_map: dict |
     propina = round(float(pago.get("propina") or 0), 2)
     if propina < 0:
         raise ValueError("La propina no puede ser negativa")
-    total_a_pagar = round(total_venta + propina, 2)
+
     recibido = None
     cambio = None
 
-    if metodo == "mixto":
+    if metodo == "puntos":
+        # Canje cubre todo: solo válido si no queda dinero pendiente
+        total_a_pagar = round(total_venta + propina - valor_canje, 2)
+        if abs(total_a_pagar) > 0.01:
+            raise ValueError(
+                f"Pagar solo con puntos requiere que el canje (${valor_canje:.2f}) "
+                f"cubra todo el ticket (${total_a_pagar + valor_canje:.2f})"
+            )
+        pagos = [pago_puntos]
+    elif metodo == "mixto":
+        propina_ok = round(propina, 2)
+        total_a_pagar = round(total_venta + propina_ok - valor_canje, 2)
         pagos_in = pago.get("pagos") or []
         if len(pagos_in) < 2:
             raise ValueError("El pago mixto requiere al menos dos pagos")
@@ -1128,20 +1177,27 @@ def _procesar_pago(pago: dict | None, total_venta: float, terminales_map: dict |
         if abs(sum(p["monto"] for p in pagos) - total_a_pagar) > 0.01:
             raise ValueError(
                 f"La suma de los pagos (${sum(p['monto'] for p in pagos):.2f}) "
-                f"no coincide con el total a pagar (${total_a_pagar:.2f})"
+                f"no coincide con el total a pagar en dinero (${total_a_pagar:.2f})"
             )
     else:
         if metodo == "efectivo":
             recibido_raw = pago.get("monto_recibido")
+            total_a_pagar = round(total_venta + propina - valor_canje, 2)
             recibido = round(float(recibido_raw), 2) if recibido_raw is not None else total_a_pagar
             if recibido < total_a_pagar:
                 raise ValueError(
-                    f"El monto recibido (${recibido:.2f}) es menor al total a pagar (${total_a_pagar:.2f})"
+                    f"El monto recibido (${recibido:.2f}) es menor al total a pagar en dinero (${total_a_pagar:.2f})"
                 )
             cambio = round(recibido - total_a_pagar, 2)
+        else:
+            total_a_pagar = round(total_venta + propina - valor_canje, 2)
         pagos = [{"metodo": metodo, "monto": total_a_pagar, "referencia":
-                  (str(pago.get("referencia")) or "").strip() or None,
+                  ((pago.get("referencia") and str(pago.get("referencia")).strip()) or None),
                   "terminal_id": pago.get("terminal_id") or None}]
+
+    # El canje entra SIEMPRE al frente de los pagos (invariante sum(pagos) == total + propina)
+    if valor_canje > 0 and metodo != "puntos":
+        pagos.insert(0, pago_puntos)
 
     # ── Comisiones de terminal (Fase B) ──
     comision_total = 0.0
@@ -1162,7 +1218,50 @@ def _procesar_pago(pago: dict | None, total_venta: float, terminales_map: dict |
             "comision_total": round(comision_total, 2)}
 
 
-def cobrar_carrito(items: list[dict], tenant_id: str, pago: dict | None = None, mesa_id: str | None = None) -> dict:
+def _reservar_cliente_puntos(cur, tenant_id: str, cliente_id: str | None) -> tuple[dict, dict, int]:
+    """
+    Bloquea al cliente (FOR UPDATE) dentro de la transacción del cobro, lee su
+    saldo REAL del ledger y la config del programa de puntos del tenant.
+    Devuelve (cliente, config, saldo). Pasa ValueError si el cliente no existe,
+    está de baja o el sistema de puntos está mal configurado.
+    """
+    if not cliente_id:
+        return {}, {}, 0
+    cur.execute(
+        "SELECT id, nombre, activo FROM clientes WHERE id = %s::uuid AND tenant_id = %s FOR UPDATE",
+        (cliente_id, tenant_id)
+    )
+    cliente = cur.fetchone()
+    if not cliente:
+        raise ValueError("El cliente seleccionado no existe en tu cartera")
+    if not cliente["activo"]:
+        raise ValueError(f"El cliente '{cliente['nombre']}' está dado de baja")
+
+    cur.execute(
+        "SELECT puntos_activos, puntos_valor_punto, puntos_modo, "
+        "puntos_gasto_monto, puntos_gasto_pts, puntos_fijos "
+        "FROM tenants WHERE id = %s", (tenant_id,)
+    )
+    config = cur.fetchone() or {}
+    cur.execute(
+        "SELECT COALESCE(SUM(puntos), 0) AS saldo FROM puntos_movimientos "
+        "WHERE tenant_id = %s AND cliente_id = %s::uuid",
+        (tenant_id, cliente_id)
+    )
+    saldo = int(cur.fetchone()["saldo"] or 0)
+    return dict(cliente), dict(config), saldo
+
+
+def cobrar_carrito(
+    items: list[dict],
+    tenant_id: str,
+    pago: dict | None = None,
+    mesa_id: str | None = None,
+    cliente_id: str | None = None,
+    puntos_usados: int = 0,
+    ajuste_puntos: int = 0,
+    ajuste_concepto: str | None = None,
+) -> dict:
     """
     Cobra un carrito completo de forma ATÓMICA (todo en una sola transacción).
 
@@ -1364,6 +1463,16 @@ def cobrar_carrito(items: list[dict], tenant_id: str, pago: dict | None = None, 
         # tenant, concurrente-seguro). Los agregados salen de los renglones.
         orden_id = None
         n_ticket = None
+        # ── Estado del bloque cliente/puntos (coeficientes de la venta) ──
+        cliente_fila: dict = {}
+        config_puntos: dict = {}
+        saldo_cliente = 0
+        saldo_cliente_final = 0
+        valor_canje = 0.0
+        puntos_canjeados = 0
+        puntos_ganados = 0
+        valor_punto = 0.0
+        ajuste = int(ajuste_puntos or 0)
         if mesa_id and not ventas_a_guardar:
             raise ValueError("La mesa no tiene artículos que cobrar")
         if ventas_a_guardar:
@@ -1376,7 +1485,64 @@ def cobrar_carrito(items: list[dict], tenant_id: str, pago: dict | None = None, 
                     "FROM terminales WHERE tenant_id = %s AND activo = true", (tenant_id,)
                 )
                 terminales_map = {str(t["id"]): t for t in cur.fetchall()}
-            pago_cols = _procesar_pago(pago, total_productos, terminales_map)
+
+            # ── Cliente + canje de puntos (migraciones 038/039, Fase B) ──
+            # Todo dentro de la MISMA transacción: bloquea al cliente, valida el
+            # saldo del ledger, calcula canje/ganancia según la regla del tenant.
+            if cliente_id:
+                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                    cliente_fila, config_puntos, saldo_cliente = _reservar_cliente_puntos(cur, tenant_id, cliente_id)
+
+                valor_punto = float(config_puntos.get("puntos_valor_punto") or 1.0)
+                if valor_punto <= 0:
+                    valor_punto = 1.0
+
+                if puntos_usados and puntos_usados > 0:
+                    if not config_puntos.get("puntos_activos"):
+                        raise ValueError("El sistema de puntos está desactivado — actívalo en Ajustes → Mi Negocio")
+                    tope_dinero = int(total_productos / valor_punto + 1e-9)
+                    tope = min(saldo_cliente, tope_dinero)
+                    if tope <= 0:
+                        raise ValueError(
+                            f"Este ticket no admite canje de puntos (saldo del cliente: {saldo_cliente} pts)"
+                        )
+                    # Clamp silencioso: nunca canjea más que el saldo o más que el total
+                    puntos_canjeados = min(int(puntos_usados), tope)
+                    valor_canje = round(puntos_canjeados * valor_punto, 2)
+
+                # Puntos GANADOS por la regla del negocio, sobre el DINERO pagado
+                # (total de productos − lo que se cubrió con canje). Redondeo al
+                # entero más cercano; decidió el tenant en panel de config.
+                if config_puntos.get("puntos_activos"):
+                    neto_dinero = max(0.0, total_productos - valor_canje)
+                    if config_puntos.get("puntos_modo") == "fijo":
+                        puntos_ganados = int(config_puntos.get("puntos_fijos") or 0)
+                    else:
+                        monto = float(config_puntos.get("puntos_gasto_monto") or 0)
+                        pts_x = int(config_puntos.get("puntos_gasto_pts") or 0)
+                        puntos_ganados = int(round(neto_dinero / monto * pts_x)) if monto > 0 and pts_x > 0 else 0
+                    if puntos_ganados < 0:
+                        puntos_ganados = 0
+
+                # Ajuste manual del ticket (dar ±/− puntos, ej. promo 50% aplicada a mano)
+                if ajuste != 0 and not (ajuste_concepto or "").strip():
+                    raise ValueError("Indica el motivo del ajuste de puntos")
+                saldo_cliente_final = saldo_cliente + puntos_ganados - puntos_canjeados + ajuste
+                if saldo_cliente_final < 0:
+                    raise ValueError(
+                        f"No puedes quitar puntos de más: el saldo de '{cliente_fila['nombre']}' quedaría en {saldo_cliente_final} pts"
+                    )
+
+            pago_puntos_dict = None
+            if puntos_canjeados > 0:
+                pago_puntos_dict = {
+                    "metodo": "puntos",
+                    "monto": valor_canje,
+                    "puntos": puntos_canjeados,
+                    "valor_punto": valor_punto,
+                    "referencia": f"Canje de {cliente_fila.get('nombre', '')}",
+                }
+            pago_cols = _procesar_pago(pago, total_productos, terminales_map, pago_puntos_dict)
 
             # Turno abierto (Fase C): si existe, el ticket se adscribe a él
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -1390,8 +1556,8 @@ def cobrar_carrito(items: list[dict], tenant_id: str, pago: dict | None = None, 
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(
                     "INSERT INTO ordenes (tenant_id, n_ticket, fecha_ts, total, ganancia, cantidad_items, estado, "
-                    "metodo_pago, pagos, propina, monto_recibido, cambio, comision_total, turno_id, mesa_id, mesa_nombre) "
-                    "VALUES (%s, NULL, %s, %s, %s, %s, 'Activa', %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+                    "metodo_pago, pagos, propina, monto_recibido, cambio, comision_total, turno_id, mesa_id, mesa_nombre, cliente_id) "
+                    "VALUES (%s, NULL, %s, %s, %s, %s, 'Activa', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
                     "RETURNING id, n_ticket",
                     (
                         tenant_id,
@@ -1408,11 +1574,34 @@ def cobrar_carrito(items: list[dict], tenant_id: str, pago: dict | None = None, 
                         turno_id,
                         mesa_id,
                         mesa_nombre,
+                        cliente_id,
                     )
                 )
                 fila_orden = cur.fetchone()
                 orden_id = fila_orden["id"]
                 n_ticket = fila_orden["n_ticket"]
+
+            # ── Movimientos del ledger de puntos (misma transacción) ──
+            # canjeados: −pts con snapshot del valor $; ganados: +pts por la regla;
+            # ajuste: ±pts manual con motivo. La anulación del ticket los revierte.
+            if cliente_id:
+                concepto_ticket = f"Ticket #{n_ticket}"
+                if puntos_canjeados > 0:
+                    registrar_movimiento(
+                        tenant_id, cliente_id, "canjeados", -puntos_canjeados,
+                        concepto=concepto_ticket, orden_id=orden_id,
+                        valor_monetario=valor_canje, conn=conn,
+                    )
+                if puntos_ganados > 0:
+                    registrar_movimiento(
+                        tenant_id, cliente_id, "ganados", puntos_ganados,
+                        concepto=concepto_ticket, orden_id=orden_id, conn=conn,
+                    )
+                if ajuste != 0:
+                    registrar_movimiento(
+                        tenant_id, cliente_id, "ajuste", ajuste,
+                        concepto=(ajuste_concepto or "").strip(), orden_id=orden_id, conn=conn,
+                    )
 
             # Gasto automático de comisiones (si el tenant lo activó)
             if pago_cols["comision_total"] > 0:
@@ -1470,6 +1659,12 @@ def cobrar_carrito(items: list[dict], tenant_id: str, pago: dict | None = None, 
             "cambio": pago_cols["cambio"] if ventas_a_guardar else None,
             "mesa_id": mesa_id,
             "mesa_nombre": mesa_nombre,
+            # ── Cliente + puntos (para el toast del POS) ──
+            "cliente_id": cliente_id,
+            "cliente_nombre": cliente_fila.get("nombre"),
+            "puntos_ganados": puntos_ganados,
+            "puntos_canjeados": puntos_canjeados,
+            "saldo_cliente": saldo_cliente_final if cliente_id else None,
         }
     except ValueError as e:
         # Error de REGLA DE NEGOCIO (ej. compuesto sin receta): se distingue de

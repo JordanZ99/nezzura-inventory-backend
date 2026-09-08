@@ -119,6 +119,17 @@ class ActualizarPerfil(BaseModel):
     zona_horaria: Optional[str] = None
     metodo_pago_default: Optional[str] = None
     gasto_comision_automatico: Optional[bool] = None
+    # ── Cartera de clientes (migración 038) ──
+    clientes_activos: Optional[bool] = None
+    # {email | telefono | pin: {activo, requerido}}; 'nombre' es fijo.
+    cliente_campos: Optional[dict] = None
+    # ── Sistema de puntos (migración 039) ──
+    puntos_activos: Optional[bool] = None
+    puntos_valor_punto: Optional[float] = None   # $ que vale 1 punto (1 = "1 pt = $1"; 0.01 = "100 pts = $1")
+    puntos_modo: Optional[str] = None            # 'por_gasto' | 'fijo'
+    puntos_gasto_monto: Optional[float] = None   # Y en "X pts por cada $Y"
+    puntos_gasto_pts: Optional[int] = None       # X en "X pts por cada $Y"
+    puntos_fijos: Optional[int] = None           # pts por venta cuando modo = 'fijo'
 
 
 class ActualizarPostOverride(BaseModel):
