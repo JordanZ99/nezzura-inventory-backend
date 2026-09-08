@@ -46,4 +46,9 @@ class ActualizarVenta(BaseModel):
 
 
 class ActualizarOrden(BaseModel):
-    fecha: str
+    fecha      : Optional[str] = None
+    # Edición del cobro del ticket (Etapas): con solo metodo_pago se reconstruye
+    # 1 pago por el total + propina; con pagos completo se valida la suma.
+    metodo_pago: Optional[str] = None
+    pagos      : Optional[List[PagoItem]] = None
+    propina    : Optional[float] = None

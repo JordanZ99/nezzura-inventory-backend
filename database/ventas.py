@@ -39,9 +39,9 @@ def get_ventas(
 def _recalcular_orden(cur, orden_id, tenant_id: str) -> None:
     """
     Recalcula los agregados de una orden desde SUS RENGLONES activos
-    (total, ganancia, unidades y estado). Se llama tras toda mutación de
-    ventas (editar/anular) para que la cabecera nunca quede desfasada.
-    Con orden_id NULL (venta legada sin orden) no hace nada.
+    (total, ganancia, unidades y estado) y después SINCRONIZA sus pagos.
+    Se llama tras toda mutación de ventas (editar/anular) para que la
+    cabecera nunca quede desfasada. Con orden_id NULL no hace nada.
     """
     if not orden_id:
         return
@@ -63,6 +63,100 @@ def _recalcular_orden(cur, orden_id, tenant_id: str) -> None:
         WHERE o.id = %s AND o.tenant_id = %s
         """,
         (orden_id, tenant_id, orden_id, tenant_id)
+    )
+    _sincronizar_pagos(cur, orden_id, tenant_id)
+
+
+def _comision_de_pagos(cur, tenant_id: str, pagos: list[dict]) -> float:
+    """
+    Recalcula la comisión de cada pago A TERMINAL con los montos actuales
+    (misma fórmula del cobro: monto × pct + fija) y devuelve comision_total.
+    Efectivo siempre 0. Terminal inexistente → comision 0.
+    """
+    terminales: dict[str, dict] = {}
+    for p in pagos:
+        metodo = str(p.get("metodo") or "")
+        monto = round(float(p.get("monto") or 0), 2)
+        if metodo in ("tarjeta_debito", "tarjeta_credito") and p.get("terminal_id"):
+            tid = str(p["terminal_id"])
+            if tid not in terminales:
+                cur.execute(
+                    "SELECT nombre, comision_debito_pct, comision_credito_pct, comision_fija "
+                    "FROM terminales WHERE id = %s AND tenant_id = %s",
+                    (tid, tenant_id)
+                )
+                t = cur.fetchone()
+                terminales[tid] = dict(t) if t else {}
+            t = terminales[tid]
+            if t:
+                pct = t["comision_debito_pct"] if metodo == "tarjeta_debito" else t["comision_credito_pct"]
+                p["comision"] = round(monto * float(pct or 0) / 100.0 + float(t["comision_fija"] or 0), 2)
+                p["terminal_nombre"] = t["nombre"]
+            else:
+                p["comision"] = 0.0
+                p.pop("terminal_nombre", None)
+        else:
+            p["comision"] = 0.0
+    return round(sum(float(p.get("comision") or 0) for p in pagos), 2)
+
+
+def _sincronizar_pagos(cur, orden_id, tenant_id: str) -> None:
+    """
+    Tras recalcular el total de una orden, reajusta los pagos registrados
+    para conservar el invariante sum(pagos) == total + propina (invariante
+    que el cobro mixto valida al vender, ventas.py _procesar_pago).
+
+    ¿Por qué importa? 'Cobros del Periodo' suma pg->>'monto' desde este
+    JSON de pagos: sin esta sincronización, editar/anular un renglón
+    corregiría el total del ticket pero los cobros seguirían mostrando
+    el monto ORIGINAL del POS (p.ej. cobró $200 → corrigió a $185 → el
+    reporte seguiría mostrando $200 en efectivo).
+
+    Reglas: 1 pago → su monto pasa a ser total + propina (mismo significado
+    que al cobrar). Mixto → el delta se aplica al ÚLTIMO pago (si con él
+    algún monto quedaría ≤ 0, no se toca nada). En ambos casos se
+    recalculan las comisiones de terminal con los nuevos montos.
+    Efectivo: monto_recibido se conserva (dinero que entró a caja);
+    el cambio se reconsidera contra el monto nuevo.
+    Órdenes legadas sin pagos: nada que hacer (sus cobros usan o.total,
+    que ya quedó sincronizado por el UPDATE de arriba).
+    """
+    cur.execute(
+        "SELECT total, propina, pagos, monto_recibido FROM ordenes "
+        "WHERE id = %s::uuid AND tenant_id = %s FOR UPDATE",
+        (orden_id, tenant_id)
+    )
+    fila = cur.fetchone()
+    if not fila:
+        return
+    pagos = fila["pagos"]
+    if not pagos:
+        return
+    pagos = [dict(p) for p in pagos]
+    esperado = round(float(fila["total"] or 0) + float(fila["propina"] or 0), 2)
+    suma = round(sum(float(p.get("monto") or 0) for p in pagos), 2)
+    if abs(suma - esperado) <= 0.01:
+        return
+    if len(pagos) == 1:
+        pagos[0]["monto"] = esperado
+    else:
+        delta = round(esperado - suma, 2)
+        ultimo = float(pagos[-1].get("monto") or 0) + delta
+        if ultimo <= 0:
+            return  # no se puede repartir el delta sin dejar montos ≤ 0
+        pagos[-1]["monto"] = round(ultimo, 2)
+    comision_total = _comision_de_pagos(cur, tenant_id, pagos)
+    recibido = fila["monto_recibido"]
+    cambio = None
+    if recibido is not None:
+        recibido = float(recibido)
+        if recibido < esperado:
+            recibido = esperado
+        cambio = round(recibido - esperado, 2)
+    cur.execute(
+        "UPDATE ordenes SET pagos = %s, comision_total = %s, monto_recibido = %s, cambio = %s "
+        "WHERE id = %s::uuid AND tenant_id = %s",
+        (psycopg2.extras.Json(pagos), comision_total, recibido, cambio, orden_id, tenant_id)
     )
 
 
@@ -783,6 +877,88 @@ def actualizar_orden(orden_id: str, fecha: str, tenant_id: str) -> dict:
 # en cada pago individual solo los métodos reales.
 METODOS_PAGO = ("efectivo", "tarjeta_debito", "tarjeta_credito")
 METODOS_ORDEN = METODOS_PAGO + ("mixto",)
+
+
+def actualizar_pago_orden(orden_id: str, metodo: str, pagos_in: list[dict] | None, propina_nueva: float | None, tenant_id: str) -> dict:
+    """
+    Edita el COBRO de un ticket Activo (tipo de pago y/o propina). El total
+    NO se toca: si llega un reparto completo de pagos, se valida contra
+    total + propina; si solo cambia el método, el único pago toma el monto
+    total + propina (mismo significado que al cobrar). Recalcula comisiones
+    de terminal con los nuevos montos. Regla: 'un solo método' reconstruye
+    los pagos desde cero (el terminal anterior se pierde; comisiones
+    recalculadas con el terminal nuevo si pagos_in trae terminal_id).
+    """
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT total, propina, estado FROM ordenes "
+                "WHERE id = %s::uuid AND tenant_id = %s FOR UPDATE",
+                (orden_id, tenant_id)
+            )
+            orden = cur.fetchone()
+            if not orden:
+                return {"ok": False, "mensaje": "Ticket no encontrado"}
+            if orden.get("estado") == "Anulada":
+                return {"ok": False, "tipo": "validacion",
+                        "mensaje": "No se puede editar el pago de un ticket anulado"}
+
+            total = float(orden["total"] or 0)
+            propina = round(float(propina_nueva), 2) if propina_nueva is not None else float(orden["propina"] or 0)
+            if propina < 0:
+                return {"ok": False, "tipo": "validacion", "mensaje": "La propina no puede ser negativa"}
+            esperado = round(total + propina, 2)
+
+            if pagos_in:
+                pagos: list[dict] = []
+                for p in pagos_in:
+                    m = str(p.get("metodo") or "").strip()
+                    if m not in METODOS_PAGO:
+                        return {"ok": False, "tipo": "validacion", "mensaje": f"Método de pago inválido: '{m}'"}
+                    monto = round(float(p.get("monto") or 0), 2)
+                    if monto <= 0:
+                        return {"ok": False, "tipo": "validacion", "mensaje": "Los montos de cada pago deben ser mayores a 0"}
+                    pagos.append({
+                        "metodo": m,
+                        "monto": monto,
+                        "referencia": (str(p.get("referencia")) or "").strip() or None,
+                        "terminal_id": p.get("terminal_id") or None,
+                    })
+                if abs(sum(p["monto"] for p in pagos) - esperado) > 0.01:
+                    return {"ok": False, "tipo": "validacion", "mensaje": (
+                        f"La suma de los pagos (${sum(p['monto'] for p in pagos):.2f}) "
+                        f"no coincide con el total del ticket (${esperado:.2f})"
+                    )}
+                metodo_orden = "mixto" if len(pagos) > 1 else pagos[0]["metodo"]
+            elif metodo in METODOS_PAGO:
+                metodo_orden = metodo
+                pagos = [{"metodo": metodo, "monto": esperado, "referencia": None, "terminal_id": None}]
+            else:
+                return {"ok": False, "tipo": "validacion", "mensaje": f"Método de pago inválido: '{metodo}'"}
+
+            comision_total = _comision_de_pagos(cur, tenant_id, pagos)
+            # Efectivo simple: se asume que recibió exactamente el total (sin
+            # datos de recibo manual); tarjetas/mixto no registran recibido.
+            if metodo_orden == "efectivo":
+                recibido_n, cambio_n = esperado, 0.0
+            else:
+                recibido_n, cambio_n = None, None
+
+            cur.execute(
+                "UPDATE ordenes SET metodo_pago = %s, pagos = %s, propina = %s, "
+                "monto_recibido = %s, cambio = %s, comision_total = %s "
+                "WHERE id = %s::uuid AND tenant_id = %s",
+                (metodo_orden, psycopg2.extras.Json(pagos), propina, recibido_n, cambio_n,
+                 comision_total, orden_id, tenant_id)
+            )
+        conn.commit()
+        return {"ok": True, "metodo_pago": metodo_orden}
+    except Exception as e:
+        conn.rollback()
+        return {"ok": False, "mensaje": f"Error al editar el pago: {str(e)}"}
+    finally:
+        release_conn(conn)
 
 
 def _procesar_pago(pago: dict | None, total_venta: float, terminales_map: dict | None = None) -> dict:
