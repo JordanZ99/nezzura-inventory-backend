@@ -7,8 +7,8 @@
 from fastapi import APIRouter, Depends, HTTPException
 
 from dependencies import get_tenant_id
-from schemas.turnos import AbrirTurno, CerrarTurno
-from database.turnos import abrir_turno, cerrar_turno, listar_turnos
+from schemas.turnos import AbrirTurno, CerrarTurno, ActualizarTurno
+from database.turnos import abrir_turno, cerrar_turno, listar_turnos, editar_turno
 
 router = APIRouter(prefix="/turnos", tags=["Turnos"])
 
@@ -32,4 +32,25 @@ def cerrar(turno_id: str, data: CerrarTurno, tenant_id: str = Depends(get_tenant
     resultado = cerrar_turno(turno_id, tenant_id, data.efectivo_contado, data.notas)
     if not resultado.get("ok"):
         raise HTTPException(status_code=400, detail=resultado.get("mensaje"))
+    return resultado
+
+
+@router.patch("/{turno_id}")
+def editar(turno_id: str, data: ActualizarTurno, tenant_id: str = Depends(get_tenant_id)):
+    """
+    Turno ABIERTO: edita fondo de caja y/o notas.
+    Turno CERRADO: corrección de arqueo — edita contado (recomputa diferencia
+    contra el esperado snapshot) y/o notas; marca "Arqueo corregido".
+    """
+    resultado = editar_turno(
+        turno_id, tenant_id,
+        monto_apertura=data.monto_apertura,
+        efectivo_contado=data.efectivo_contado,
+        notas=data.notas,
+    )
+    if not resultado.get("ok"):
+        raise HTTPException(
+            status_code=422 if resultado.get("tipo") == "validacion" else 400,
+            detail=resultado.get("mensaje"),
+        )
     return resultado
