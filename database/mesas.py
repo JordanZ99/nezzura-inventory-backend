@@ -322,7 +322,10 @@ def quitar_item_mesa(mesa_id: str, item_id: str, tenant_id: str) -> dict:
     """
     conn = get_conn()
     try:
-        with conn.cursor() as cur:
+        # RealDictCursor: el COUNT se lee como fetchone()["c"]; con el cursor
+        # pelado de psycopg2 fetchone() devuelve tuplas y lanzaría TypeError
+        # (bug del mismo origen que cancelar orden).
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
                 "DELETE FROM mesa_items WHERE id = %s::uuid AND mesa_id = %s::uuid AND tenant_id = %s",
                 (item_id, mesa_id, tenant_id)
@@ -400,7 +403,10 @@ def cancelar_orden_mesa(mesa_id: str, tenant_id: str) -> dict:
     """
     conn = get_conn()
     try:
-        with conn.cursor() as cur:
+        # RealDictCursor: fetchone() debe devolver un dict para poder leer
+        # fila["estado"]; el cursor pelado de psycopg2 devuelve tuplas y
+        # lanzaría TypeError al indexar con texto (bug de cancelar orden).
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
                 "SELECT estado FROM mesas WHERE id = %s::uuid AND tenant_id = %s FOR UPDATE",
                 (mesa_id, tenant_id)
