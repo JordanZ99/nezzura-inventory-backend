@@ -12,6 +12,7 @@ import uuid
 from psycopg2.errors import UniqueViolation
 from database.conexion import query
 from database.helpers import _resolver_producto_id, ahora_negocio, _parsear_ts
+from database.movimientos import registrar_movimiento_inventario
 
 
 def _adjuntar_variaciones(filas: list[dict], tenant_id: str) -> None:
@@ -114,12 +115,17 @@ def crear_variacion(producto: str, nombre: str, precio: float, tenant_id: str, f
             stock_final = float(stock_inicial)
             costo_lote = float(costo or 0) or 0
             fecha_var = str(ahora_negocio(tenant_id))
+            id_lote_var = str(uuid.uuid4())[:12]
             query("""
                 INSERT INTO lotes (ID_Lote, Producto, producto_id, Costo, Precio_Venta,
                                    Stock_Lote, Fecha_Entrada, fecha_entrada_ts, Estado, tenant_id, variacion_id)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'Activo', %s, %s)
-            """, (str(uuid.uuid4())[:12], producto, pid, costo_lote, float(precio or 0),
+            """, (id_lote_var, producto, pid, costo_lote, float(precio or 0),
                   stock_final, fecha_var, _parsear_ts(fecha_var), tenant_id, v["id"]))
+            registrar_movimiento_inventario(
+                tenant_id, producto, "entrada", "restock", stock_final,
+                id_lote=id_lote_var, conn=None,
+            )
     return {"ok": True, "variacion": {"id": v["id"], "nombre": v["nombre"], "precio": float(v["precio"] or 0), "foto": v.get("foto") or "", "stock": stock_final}}
 
 

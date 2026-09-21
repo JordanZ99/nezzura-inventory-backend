@@ -8,6 +8,7 @@ fotos_productos/
 __pycache__/
 *.pyc
 *.pyo
+.venv/
 
 # Streamlit
 .streamlit/secrets.toml

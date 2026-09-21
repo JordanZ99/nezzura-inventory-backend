@@ -17,6 +17,7 @@ from database.conexion import query, execute
 from database.helpers import _q, _e, _obtener_categorias_subquery, _sincronizar_categorias, ahora_negocio, _parsear_ts
 from database.variaciones import _adjuntar_variaciones
 from database.recetas import _adjuntar_recetas, _calcular_disponibilidad_compuestos
+from database.movimientos import registrar_movimiento_inventario
 
 
 def get_productos_meta(tenant_id: str) -> list[dict]:
@@ -227,6 +228,10 @@ def _crear_lote_inicial(
         _e(conn,
             "UPDATE lotes SET Stock_Lote = Stock_Lote + %s WHERE ID_Lote = %s AND tenant_id = %s",
             (stock, existente[0]["id_lote"], tenant_id))
+        registrar_movimiento_inventario(
+            tenant_id, producto, "entrada", "restock", stock,
+            id_lote=existente[0]["id_lote"], conn=conn,
+        )
         return "stock_sumado"
     id_lote = str(uuid.uuid4())[:12]
     fecha = str(ahora_negocio(tenant_id))
@@ -235,6 +240,10 @@ def _crear_lote_inicial(
                            Stock_Lote, Fecha_Entrada, fecha_entrada_ts, Estado, tenant_id, etiqueta)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'Activo', %s, %s)
     """, (id_lote, producto, product_id, costo, precio_venta, stock, fecha, _parsear_ts(fecha), tenant_id, etiqueta_limpia))
+    registrar_movimiento_inventario(
+        tenant_id, producto, "entrada", "restock", stock,
+        id_lote=id_lote, conn=conn,
+    )
     return "lote_creado"
 
 
@@ -275,12 +284,17 @@ def _crear_variaciones_y_lotes(
             vcosto = float(v.get("costo") or 0) or costo
             vid = r_var[0]["id"]
             vfecha = str(ahora_negocio(tenant_id))
+            id_lote_var = str(uuid.uuid4())[:12]
             _e(conn, """
                 INSERT INTO lotes (ID_Lote, Producto, producto_id, Costo, Precio_Venta,
                                    Stock_Lote, Fecha_Entrada, fecha_entrada_ts, Estado, tenant_id, variacion_id)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'Activo', %s, %s)
-            """, (str(uuid.uuid4())[:12], producto, product_id, vcosto, vprecio,
+            """, (id_lote_var, producto, product_id, vcosto, vprecio,
                    float(vstock), vfecha, _parsear_ts(vfecha), tenant_id, vid))
+            registrar_movimiento_inventario(
+                tenant_id, producto, "entrada", "restock", float(vstock),
+                id_lote=id_lote_var, conn=conn,
+            )
     return None
 
 

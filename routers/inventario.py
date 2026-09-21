@@ -44,6 +44,7 @@ from database.recetas import (
 )
 from database.conexion import query, execute
 from database.helpers import invalidar_zona_tenant
+from database.movimientos import get_movimientos
 from database.clientes import normalizar_campos_cliente
 from dependencies import validar_sesion
 from schemas.inventario import (
@@ -243,6 +244,29 @@ def listar_lotes(tenant_id: str = Depends(get_tenant_id)):
     """Todos los lotes activos con detalle de costo y stock por lote."""
     resultado = get_lotes(tenant_id)
     return resultado
+
+
+@router.get("/movimientos")
+def listar_movimientos(
+    tenant_id: str = Depends(get_tenant_id),
+    limit: int = 50,
+    offset: int = 0,
+    tipo: Optional[str] = None,
+    producto: Optional[str] = None,
+    desde: Optional[str] = None,
+    hasta: Optional[str] = None,
+):
+    """
+    Historial de cambios de inventario (ledger append-only, migración 040).
+
+    Cada entrada/salida/ajuste de stock deja un renglón inmutable: venta,
+    restock, ajuste manual, edición de venta, anulación o baja de lote, con
+    el stock resultante del lote al momento del movimiento.
+
+    Filtros opcionales: tipo (entrada|salida|ajuste), texto de producto y
+    rango de fechas (YYYY-MM-DD, en zona horaria del negocio).
+    """
+    return get_movimientos(tenant_id, limit=limit, offset=offset, tipo=tipo, producto=producto, desde=desde, hasta=hasta)
 
 
 @router.get("/lotes/{producto}")
