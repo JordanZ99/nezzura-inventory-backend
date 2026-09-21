@@ -8,6 +8,7 @@ from database.conexion import query, execute, get_conn, release_conn
 from database.lotes import descontar_stock_peps
 from database.helpers import ahora_negocio, _parsear_ts, zona_tenant, hoy_negocio
 from database.puntos import registrar_movimiento
+from database.movimientos import registrar_movimiento_inventario
 
 logger = logging.getLogger(__name__)
 
@@ -470,7 +471,7 @@ def _resolver_variacion_venta(cur, v: dict, tenant_id: str) -> int | None:
     return None
 
 
-def _revertir_consumo(cur, consumo: list[dict] | None, tenant_id: str) -> None:
+def _revertir_consumo(cur, consumo: list[dict] | None, tenant_id: str, origen: str = "anulacion", concepto: str | None = None) -> None:
     """
     Devuelve el stock a los lotes EXACTOS que una venta compuesta consumió.
     Usa el cursor `cur` (debe llamarse dentro de una transacción).
@@ -479,6 +480,9 @@ def _revertir_consumo(cur, consumo: list[dict] | None, tenant_id: str) -> None:
     buscar un lote por costo+precio (agregar_lote), se suma la cantidad al
     id_lote exacto registrado en el consumo. Si ese lote ya no existe
     (fue eliminado), se crea uno nuevo con el costo de ese consumo.
+
+    Cada devolución queda en el ledger de inventario con el `origen` indicado
+    ('anulacion' al anular, 'edicion_venta' al editar una venta compuesta).
     """
     if not consumo:
         return
@@ -501,6 +505,10 @@ def _revertir_consumo(cur, consumo: list[dict] | None, tenant_id: str) -> None:
                     "UPDATE lotes SET Stock_Lote = Stock_Lote + %s, Estado = 'Activo' "
                     "WHERE ID_Lote = %s AND tenant_id = %s",
                     (cantidad, id_lote, tenant_id)
+                )
+                registrar_movimiento_inventario(
+                    tenant_id, material, "entrada", origen, cantidad,
+                    id_lote=id_lote, concepto=concepto, conn=cur.connection,
                 )
                 continue
         # El lote ya no existe: recrearlo con el costo de ese consumo. Para el
@@ -526,6 +534,10 @@ def _revertir_consumo(cur, consumo: list[dict] | None, tenant_id: str) -> None:
             "VALUES (%s, %s, (SELECT id FROM productos WHERE Producto=%s AND tenant_id=%s), %s, %s, %s, %s, %s, 'Activo', %s)",
             (nuevo_id, material, material, tenant_id, costo, precio_recreado, cantidad, fe, _parsear_ts(fe), tenant_id)
         )
+        registrar_movimiento_inventario(
+            tenant_id, material, "entrada", origen, cantidad,
+            id_lote=nuevo_id, concepto=concepto, conn=cur.connection,
+        )
 
 
 def actualizar_venta(venta_id: int, fecha: str, cantidad: float, precio_real: float, costo_unitario: float, total_venta: float, ganancia_bruta: float, tenant_id: str) -> dict:
@@ -541,6 +553,7 @@ def actualizar_venta(venta_id: int, fecha: str, cantidad: float, precio_real: fl
                 
             vieja_cantidad = float(v["cantidad"])
             dif = cantidad - vieja_cantidad
+            concepto_edicion = f"Edición de la venta #{venta_id}"
 
             # 2. Ajustes de inventario según diferencia de cantidad.
             # Los SERVICIOS no tienen inventario: si la venta fue de un servicio,
@@ -561,7 +574,7 @@ def actualizar_venta(venta_id: int, fecha: str, cantidad: float, precio_real: fl
                         consumo_viejo = json.loads(consumo_viejo)
                     except Exception:
                         consumo_viejo = None
-                _revertir_consumo(cur, consumo_viejo, tenant_id)
+                _revertir_consumo(cur, consumo_viejo, tenant_id, origen="edicion_venta", concepto=concepto_edicion)
 
                 # 2b. Resolver la receta del compuesto SEGÚN la variación de la
                 #     venta (v["variacion"]) y re-descontar con la nueva cantidad
@@ -599,6 +612,10 @@ def actualizar_venta(venta_id: int, fecha: str, cantidad: float, precio_real: fl
                             "costo": c,
                         })
                         costo_total += c * cant_r
+                        registrar_movimiento_inventario(
+                            tenant_id, mat["material"], "salida", "edicion_venta", -cant_r,
+                            id_lote=r.get("id_lote"), concepto=concepto_edicion, conn=conn,
+                        )
 
                 costo_unitario = costo_total / cantidad if cantidad else 0.0
                 ganancia_bruta = (precio_real - costo_unitario) * cantidad
@@ -629,11 +646,19 @@ def actualizar_venta(venta_id: int, fecha: str, cantidad: float, precio_real: fl
                         continue
                     cons = min(restante, float(lote["stock_lote"]))
                     cur.execute("UPDATE lotes SET Stock_Lote=%s WHERE ID_Lote=%s AND tenant_id=%s", (round(float(lote["stock_lote"]) - cons, 3), lote["id_lote"], tenant_id))
+                    registrar_movimiento_inventario(
+                        tenant_id, v["producto"], "salida", "edicion_venta", -cons,
+                        id_lote=lote["id_lote"], concepto=concepto_edicion, conn=conn,
+                    )
                     restante -= cons
                 # Si aún falta, descontamos del lote más reciente (stock negativo)
                 if restante > 0 and lotes:
                     ultimo = lotes[-1]
                     cur.execute("UPDATE lotes SET Stock_Lote = Stock_Lote - %s WHERE ID_Lote=%s AND tenant_id=%s", (restante, ultimo["id_lote"], tenant_id))
+                    registrar_movimiento_inventario(
+                        tenant_id, v["producto"], "salida", "edicion_venta", -restante,
+                        id_lote=ultimo["id_lote"], concepto=concepto_edicion, conn=conn,
+                    )
             elif dif < 0:
                 restaurar = abs(dif)
                 # Stock por variación: restaurar al lote de ESA variación
@@ -642,10 +667,18 @@ def actualizar_venta(venta_id: int, fecha: str, cantidad: float, precio_real: fl
                 lote_exist = cur.fetchone()
                 if lote_exist:
                     cur.execute("UPDATE lotes SET Stock_Lote = Stock_Lote + %s WHERE ID_Lote = %s AND tenant_id=%s", (restaurar, lote_exist["id_lote"], tenant_id))
+                    registrar_movimiento_inventario(
+                        tenant_id, v["producto"], "entrada", "edicion_venta", restaurar,
+                        id_lote=lote_exist["id_lote"], concepto=concepto_edicion, conn=conn,
+                    )
                 else:
                     id_l = str(uuid.uuid4())[:12]
                     fe = str(ahora_negocio(tenant_id))
                     cur.execute("INSERT INTO lotes (ID_Lote, Producto, producto_id, Costo, Precio_Venta, Stock_Lote, Fecha_Entrada, fecha_entrada_ts, Estado, tenant_id, variacion_id) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'Activo', %s, %s)", (id_l, v["producto"], v["producto_id"], v["costo_unitario"], v["precio_lista"], restaurar, fe, _parsear_ts(fe), tenant_id, vid))
+                    registrar_movimiento_inventario(
+                        tenant_id, v["producto"], "entrada", "edicion_venta", restaurar,
+                        id_lote=id_l, concepto=concepto_edicion, conn=conn,
+                    )
 
             # 3. Guardar cambios en la venta
             cur.execute("""
@@ -664,7 +697,7 @@ def actualizar_venta(venta_id: int, fecha: str, cantidad: float, precio_real: fl
     finally:
         release_conn(conn)
 
-def _restaurar_stock_venta(cur, v: dict, tenant_id: str) -> float:
+def _restaurar_stock_venta(cur, v: dict, tenant_id: str, concepto: str | None = None) -> float:
     """
     Devuelve al inventario el stock consumido por UN renglón de venta
     (dentro de una transacción). Compartido por eliminar_venta y anular_orden.
@@ -675,10 +708,14 @@ def _restaurar_stock_venta(cur, v: dict, tenant_id: str) -> float:
       sin id_lote caen al match por costo+precio.
     - Servicio: sin inventario, no restaura nada.
 
+    Cada devolución de stock queda en el ledger de inventario (origen
+    'anulacion'), con referencia a la orden si el renglón pertenece a un ticket.
+
     Devuelve las unidades restauradas.
     """
     stock_restaurado = 0.0
     tipo = v.get("tipo_producto")
+    referencia = str(v["orden_id"]) if v.get("orden_id") else None
 
     if tipo == "compuesto":
         consumo = v.get("consumo")
@@ -716,6 +753,10 @@ def _restaurar_stock_venta(cur, v: dict, tenant_id: str) -> float:
                      v.get("precio_lista") or 0, cantidad,
                      fe_recreacion, _parsear_ts(fe_recreacion), tenant_id)
                 )
+            registrar_movimiento_inventario(
+                tenant_id, v["producto"], "entrada", "anulacion", cantidad,
+                id_lote=id_lote, referencia_id=referencia, concepto=concepto, conn=cur.connection,
+            )
             stock_restaurado = cantidad
         else:
             # Venta antigua sin id_lote: fallback al comportamiento previo
@@ -737,6 +778,7 @@ def _restaurar_stock_venta(cur, v: dict, tenant_id: str) -> float:
                     "WHERE ID_Lote=%s AND tenant_id=%s",
                     (cantidad, fila_lote["ID_Lote"], tenant_id)
                 )
+                id_lote_restaurado = fila_lote["ID_Lote"]
             else:
                 nuevo_id = str(uuid.uuid4())[:12]
                 fe = str(ahora_negocio(tenant_id))
@@ -747,6 +789,11 @@ def _restaurar_stock_venta(cur, v: dict, tenant_id: str) -> float:
                     (nuevo_id, v["producto"], v.get("producto_id"), v.get("costo_unitario") or 0,
                      v.get("precio_lista") or 0, cantidad, fe, _parsear_ts(fe), tenant_id)
                 )
+                id_lote_restaurado = nuevo_id
+            registrar_movimiento_inventario(
+                tenant_id, v["producto"], "entrada", "anulacion", cantidad,
+                id_lote=id_lote_restaurado, referencia_id=referencia, concepto=concepto, conn=cur.connection,
+            )
             stock_restaurado = cantidad
 
     return stock_restaurado
@@ -768,7 +815,7 @@ def eliminar_venta(venta_id: int, tenant_id: str) -> dict:
     conn = get_conn()
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            stock_restaurado = _restaurar_stock_venta(cur, v, tenant_id)
+            stock_restaurado = _restaurar_stock_venta(cur, v, tenant_id, concepto=f"Anulación de venta #{venta_id}")
 
             # Marcar la venta anulada en la MISMA transacción (antes del commit)
             cur.execute(
@@ -815,8 +862,9 @@ def anular_orden(orden_id: str, tenant_id: str) -> dict:
             renglones = cur.fetchall()
 
             stock_total = 0.0
+            concepto_anulacion = f"Anulación del ticket #{orden.get('n_ticket')}"
             for v in renglones:
-                stock_total += _restaurar_stock_venta(cur, v, tenant_id)
+                stock_total += _restaurar_stock_venta(cur, v, tenant_id, concepto=concepto_anulacion)
                 cur.execute(
                     "UPDATE ventas SET Estado='Inactivo' WHERE id=%s AND tenant_id=%s",
                     (v["id"], tenant_id)
@@ -1625,6 +1673,35 @@ def cobrar_carrito(
             venta["orden_id"] = orden_id
             venta["n_ticket"] = n_ticket
             insertar_venta(venta, tenant_id, conn=conn)
+
+        # ── Ledger de inventario (migración 040): una salida por renglón ──
+        # Stock: el id_lote exacto que PEPS asignó. Compuesto: un renglón por
+        # material consumido (según su receta). Servicios no tocan inventario.
+        # Misma transacción: si el cobro se revierte, los renglones no existen.
+        for venta in ventas_a_guardar:
+            tipo_v = venta.get("tipo_producto") or "stock"
+            if tipo_v == "servicio":
+                continue
+            ref = str(orden_id) if orden_id else None
+            if tipo_v == "compuesto":
+                for c in venta.get("consumo") or []:
+                    registrar_movimiento_inventario(
+                        tenant_id, c.get("material") or "", "salida", "venta",
+                        -float(c.get("cantidad") or 0),
+                        id_lote=c.get("id_lote"),
+                        referencia_id=ref,
+                        concepto=f"Consumo por venta de '{venta['producto']}' (ticket #{n_ticket})",
+                        conn=conn,
+                    )
+            else:
+                registrar_movimiento_inventario(
+                    tenant_id, venta["producto"], "salida", "venta",
+                    -float(venta["cantidad"] or 0),
+                    id_lote=venta.get("id_lote"),
+                    referencia_id=ref,
+                    concepto=f"Ticket #{n_ticket}" if n_ticket else None,
+                    conn=conn,
+                )
 
         # ── Liberar la mesa (misma transacción) ──
         # Solo si el cobro fue EXITOSO hasta aquí: borramos sus renglones

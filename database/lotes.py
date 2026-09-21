@@ -19,6 +19,7 @@
 import uuid
 from database.conexion import query, execute
 from database.helpers import _q, _e, _obtener_categorias_subquery, _sincronizar_categorias, _resolver_producto_id, ahora_negocio, _parsear_ts
+from database.movimientos import registrar_movimiento_inventario
 
 
 def get_lotes(tenant_id: str) -> list[dict]:
@@ -203,6 +204,10 @@ def agregar_lote(
             "UPDATE lotes SET Stock_Lote = Stock_Lote + %s WHERE ID_Lote = %s AND tenant_id = %s",
             (stock, existente[0]["id_lote"], tenant_id)
         )
+        registrar_movimiento_inventario(
+            tenant_id, producto, "entrada", "restock", stock,
+            id_lote=existente[0]["id_lote"], conn=None,
+        )
         return {"accion": "stock_sumado", "producto": producto, "cantidad": stock}
     else:
         id_lote = str(uuid.uuid4())[:12]
@@ -212,6 +217,10 @@ def agregar_lote(
                                Stock_Lote, Fecha_Entrada, fecha_entrada_ts, Estado, tenant_id, etiqueta, variacion_id)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'Activo', %s, %s, %s)
         """, (id_lote, producto, product_id, costo, precio_venta, stock, fecha, _parsear_ts(fecha), tenant_id, etiqueta_limpia, variacion_id))
+        registrar_movimiento_inventario(
+            tenant_id, producto, "entrada", "restock", stock,
+            id_lote=id_lote, conn=None,
+        )
         return {"accion": "lote_creado", "producto": producto, "id_lote": id_lote}
 
 
@@ -251,9 +260,22 @@ def actualizar_lote(id_lote: str, costo: float, precio_venta: float, stock: floa
             )
 
     # 1. Actualizar el lote (etiqueta: COALESCE mantiene la actual si no se envía)
+    # El stock llega como valor ABSOLUTO: el ledger registra el delta (ajuste).
+    viejo_stock = query(
+        "SELECT Producto, Stock_Lote FROM lotes WHERE ID_Lote=%s AND tenant_id=%s",
+        (id_lote, tenant_id)
+    )
     execute("""
         UPDATE lotes SET Costo=%s, Precio_Venta=%s, Stock_Lote=%s, etiqueta=COALESCE(%s, etiqueta) WHERE ID_Lote=%s AND tenant_id = %s
     """, (costo, precio_venta, stock, etiqueta, id_lote, tenant_id))
+
+    if viejo_stock:
+        delta = float(stock) - float(viejo_stock[0]["Stock_Lote"] or 0)
+        if abs(delta) > 1e-9:
+            registrar_movimiento_inventario(
+                tenant_id, viejo_stock[0]["producto"], "ajuste", "ajuste_manual", delta,
+                id_lote=id_lote, conn=None,
+            )
 
     # 2. Recalcular ganancias en ventas asociadas a este lote
     execute("""
@@ -299,23 +321,28 @@ def eliminar_lote(id_lote: str, tenant_id: str) -> dict:
     """
     # Obtener información del lote antes de desactivarlo
     info = query(
-        "SELECT Producto FROM lotes WHERE ID_Lote = %s AND tenant_id = %s",
+        "SELECT Producto, producto_id, Stock_Lote FROM lotes WHERE ID_Lote = %s AND tenant_id = %s",
         (id_lote, tenant_id)
     )
     if not info:
         return {"ok": False, "mensaje": "Lote no encontrado"}
 
     producto = info[0]["producto"]
-    producto_id = query(
-        "SELECT producto_id FROM lotes WHERE ID_Lote = %s AND tenant_id = %s",
-        (id_lote, tenant_id)
-    )[0]["producto_id"]
+    stock_previo = float(info[0]["Stock_Lote"] or 0)
+    producto_id = info[0]["producto_id"]
 
     # Marcar el lote como Inactivo y stock en 0
     execute(
         "UPDATE lotes SET Estado = 'Inactivo', Stock_Lote = 0 WHERE ID_Lote = %s AND tenant_id = %s",
         (id_lote, tenant_id)
     )
+
+    # El stock que tenía el lote sale del inventario por la baja
+    if abs(stock_previo) > 1e-9:
+        registrar_movimiento_inventario(
+            tenant_id, producto, "ajuste", "baja_lote", -stock_previo,
+            id_lote=id_lote, conn=None,
+        )
 
     # Verificar si quedan lotes activos para este producto
     # (descontando el lote que acabamos de desactivar)
