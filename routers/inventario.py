@@ -45,6 +45,7 @@ from database.recetas import (
 from database.conexion import query, execute
 from database.helpers import invalidar_zona_tenant
 from database.movimientos import get_movimientos
+from database import conteos
 from database.clientes import normalizar_campos_cliente
 from dependencies import validar_sesion
 from schemas.inventario import (
@@ -64,6 +65,8 @@ from schemas.inventario import (
     ActualizarPerfil,
     ActualizarPostOverride,
     ReordenarImagenes,
+    GuardarCapturasConteo,
+    CerrarConteo,
 )
 
 router = APIRouter(prefix="/inventario", tags=["Inventario"])
@@ -716,9 +719,107 @@ def reordenar_imagenes(producto: str, data: ReordenarImagenes, tenant_id: str = 
     Recibe un array de IDs en el nuevo orden (posición 0 = orden 1 = principal).
     El backend asigna orden 1, 2, 3... secuencialmente según el orden del array.
     Si el ID en orden 1 es diferente al anterior, actualiza productos.imagen
-    automáticamente con la URL de la nueva imagen principal.
+    automáticamente con la URL de la imagen principal nueva.
     """
     resultado = reordenar_imagenes_negocio(producto, data.ids, tenant_id)
     if not resultado.get("ok"):
         raise HTTPException(status_code=resultado["status"], detail=resultado["mensaje"])
+    return resultado
+
+
+# ==============================================================================
+# Conteos de auditoría (conteo físico vs sistema — migración 041)
+#
+# Ciclo: POST /conteos (abre y congela snapshot) → PATCH /conteos/{id}/items
+# (autosave acumulativo) → POST /conteos/{id}/cerrar (resuelve diferencias:
+# merma / venta declarada / ingreso hallado / error del sistema).
+# ==============================================================================
+
+
+def _traducir_error_conteo(resultado: dict) -> None:
+    """Convierte el {ok: False, tipo} del dominio en el HTTP status correcto."""
+    tipo = resultado.get("tipo")
+    if tipo == "no_encontrado":
+        raise HTTPException(status_code=404, detail=resultado.get("mensaje", "Conteo no encontrado"))
+    if tipo == "cerrado":
+        raise HTTPException(status_code=409, detail=resultado.get("mensaje", "El conteo ya está cerrado"))
+    if tipo == "validacion":
+        raise HTTPException(status_code=422, detail=resultado.get("mensaje", "Solicitud inválida"))
+    raise HTTPException(status_code=500, detail=resultado.get("mensaje", "Error al procesar el conteo"))
+
+
+@router.post("/conteos")
+def iniciar_conteo(tenant_id: str = Depends(get_tenant_id)):
+    """
+    Abre una sesión de conteo de auditoría congelando el snapshot del stock
+    (un renglón por producto+variación, incluidos los de stock 0). Solo puede
+    haber UN conteo abierto por tenant a la vez.
+    """
+    resultado = conteos.abrir_conteo(tenant_id)
+    if not resultado.get("ok"):
+        _traducir_error_conteo(resultado)
+    return resultado
+
+
+# Debe declararse ANTES que /conteos/{conteo_id} para que "activo" no se
+# capture como id de conteo.
+@router.get("/conteos/activo")
+def conteo_activo(tenant_id: str = Depends(get_tenant_id)):
+    """Sesión de conteo abierta (con sus renglones de captura) o conteo: null."""
+    return conteos.get_conteo_activo(tenant_id)
+
+
+@router.get("/conteos")
+def listar_conteos(tenant_id: str = Depends(get_tenant_id), limit: int = 30):
+    """Historial de conteos cerrados (el más reciente primero) con su resumen."""
+    return conteos.historial_conteos(tenant_id, limit=limit)
+
+
+@router.get("/conteos/{conteo_id}")
+def detalle_conteo(conteo_id: str, tenant_id: str = Depends(get_tenant_id)):
+    """Detalle de un conteo (abierto o cerrado) con el veredicto de cada renglón."""
+    resultado = conteos.get_conteo(conteo_id, tenant_id)
+    if not resultado.get("ok"):
+        _traducir_error_conteo(resultado)
+    return resultado
+
+
+@router.patch("/conteos/{conteo_id}/items")
+def guardar_capturas_conteo(conteo_id: str, data: GuardarCapturasConteo,
+                            tenant_id: str = Depends(get_tenant_id)):
+    """
+    Autosave del conteo: fija el total contado (valor absoluto) de cada
+    renglón (producto, variación). contado null borra la captura.
+    Los renglones que no existen en el snapshot se devuelven en
+    `no_encontrados` sin romper el guardado del resto.
+    """
+    resultado = conteos.guardar_capturas(conteo_id, tenant_id, [c.model_dump() for c in data.items])
+    if not resultado.get("ok"):
+        _traducir_error_conteo(resultado)
+    return resultado
+
+
+@router.post("/conteos/{conteo_id}/cerrar")
+def cerrar_conteo(conteo_id: str, data: CerrarConteo, tenant_id: str = Depends(get_tenant_id)):
+    """
+    Cierra la sesión resolviendo cada diferencia CONTRA EL STOCK VIVO (las
+    ventas hechas durante el conteo quedan absorbidas y no cuentan como merma).
+
+    - Faltante: merma (default) | venta (crea una orden retroactiva real) |
+      error_sistema.
+    - Sobrante: error_sistema (default) | entrada_no_registrada (crea un lote
+      con el costo indicado).
+    - Renglones sin captura o que cuadran no se tocan.
+
+    `fecha` ('YYYY-MM-DD') aplica a las ventas declaradas para que caigan al
+    día contable correcto (ej. lo vendido en el bazar del sábado).
+    Todo es atómico: si una resolución falla, no se aplica nada.
+    """
+    resultado = conteos.cerrar_conteo(
+        conteo_id, tenant_id,
+        [r.model_dump() for r in data.items],
+        fecha=data.fecha,
+    )
+    if not resultado.get("ok"):
+        _traducir_error_conteo(resultado)
     return resultado

@@ -138,3 +138,30 @@ class ActualizarPostOverride(BaseModel):
 
 class ReordenarImagenes(BaseModel):
     ids: list[int] = Field(..., description="Array de IDs de imágenes en el nuevo orden")
+
+
+class ConteoCaptura(BaseModel):
+    """Autosave de un renglón del conteo (PATCH /inventario/conteos/{id}/items).
+    El valor es ABSOLUTO (total contado, no un incremento): idempotente ante
+    reintentos de red."""
+    producto   : str = Field(..., description="Nombre del producto contado")
+    variacion  : str = Field("", description="Nombre de la variación contada ('' = base)")
+    contado    : Optional[float] = Field(None, ge=0, description="Total contado físico. None = borrar la captura")
+
+
+class GuardarCapturasConteo(BaseModel):
+    items: list[ConteoCaptura] = Field(..., description="Renglones a actualizar en el autosave")
+
+
+class ConteoResolucion(BaseModel):
+    """Decisión de cierre para un renglón con diferencia (POST /inventario/conteos/{id}/cerrar)."""
+    producto    : str = Field(..., description="Nombre del producto")
+    variacion   : str = Field("", description="Nombre de la variación ('' = base)")
+    resolucion  : Optional[str] = Field(None, description="merma | venta | error_sistema | entrada_no_registrada. Si se omite: merma para faltantes, error_sistema para sobrantes")
+    costo       : Optional[float] = Field(None, description="Solo entrada_no_registrada: costo de la mercancía hallada (default: costo del último lote activo)")
+    precio_venta: Optional[float] = Field(None, description="Solo entrada_no_registrada: precio de venta (default: precio del último lote activo)")
+
+
+class CerrarConteo(BaseModel):
+    items: list[ConteoResolucion] = Field([], description="Resoluciones por renglón; los no listados usan el default")
+    fecha: Optional[str] = Field(None, description="Fecha de las ventas declaradas ('YYYY-MM-DD' o ISO). Default: ahora")
