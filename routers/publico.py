@@ -46,10 +46,10 @@ def obtener_catalogo_publico(slug: str, response: Response):
     #    Solo retorna resultado si activo = true (catálogo habilitado).
     #    LEFT JOIN con tenants para obtener el logo personalizado del negocio.
     config_rows = query(
-        "SELECT cc.tenant_id, cc.tema, cc.template, cc.titulo, cc.subtitulo, "
+        "SELECT cc.tenant_id, cc.tema, cc.template, cc.titulo, cc.subtitulo, cc.fuente, "
         "       cc.mostrar_precios, cc.mostrar_stock, cc.mostrar_categorias, cc.agrupar_por_categoria, cc.columnas_movil, cc.permitir_descarga, cc.ocultar_agotados, cc.relacion_imagen, "
         "       cc.banner_url, cc.banner_url_movil, cc.hero_estilo, cc.banner_texto_color, cc.banner_mostrar_texto, cc.banner_mostrar_logo, cc.anuncio_texto, "
-        "       t.logo "
+        "       t.logo, t.telefono, t.correo, t.instagram, t.facebook, t.tiktok, t.sitio_web, t.maps "
         "FROM catalogo_config cc "
         "LEFT JOIN tenants t ON cc.tenant_id = t.id "
         "WHERE cc.slug = %s AND cc.activo = true",
@@ -162,12 +162,27 @@ def obtener_catalogo_publico(slug: str, response: Response):
     )
     mapa_orden = {fila["nombre"]: fila["orden"] for fila in ordenes}
 
+    # 5. Datos de contacto del negocio (migración 043): solo columnas públicas
+    #    escritas voluntariamente por el tenant. Se normalizan (trim) y se
+    #    devuelven como strings vacíos cuando no existe; el footer del catálogo
+    #    renderiza únicamente lo que venga lleno.
+    contacto = {
+        "telefono": (cfg.get("telefono") or "").strip(),
+        "correo": (cfg.get("correo") or "").strip(),
+        "instagram": (cfg.get("instagram") or "").strip(),
+        "facebook": (cfg.get("facebook") or "").strip(),
+        "tiktok": (cfg.get("tiktok") or "").strip(),
+        "sitio_web": (cfg.get("sitio_web") or "").strip(),
+        "maps": (cfg.get("maps") or "").strip(),
+    }
+
     return {
         "config": {
             "tema": cfg["tema"],
             "template": cfg["template"],
             "titulo": cfg["titulo"],
             "subtitulo": cfg.get("subtitulo", ""),
+            "fuente": cfg.get("fuente") or "serif",
             "mostrar_precios": cfg["mostrar_precios"],
             # El stock se muestra por defecto: null/true → true
             "mostrar_stock": cfg["mostrar_stock"] is not False,
@@ -187,5 +202,6 @@ def obtener_catalogo_publico(slug: str, response: Response):
             "logo": cfg.get("logo") or "",
         },
         "productos": productos,
-        "orden_categorias": mapa_orden
+        "orden_categorias": mapa_orden,
+        "contacto": contacto,
     }

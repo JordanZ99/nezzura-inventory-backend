@@ -23,6 +23,10 @@ from schemas.catalogo import TemplateEnum, ActualizarCatalogo, ActualizarPostCon
 
 router = APIRouter(prefix="/catalogo_gestion", tags=["Gestión de Catálogo"])
 
+# Claves de fuente display del catálogo (migración 044). Coinciden con
+# frontend/src/lib/catalogo-fuentes.ts — claves nuevas = actualizar ambos lados.
+_FUENTES_CATALOGO = ("serif", "sistema", "playfair", "cormorant", "poppins", "quicksand", "oswald", "baloo2")
+
 # Valores permitidos para la config de posts (Fase 1 — Posts Automáticos)
 TEMPLATES_POST = ("marco", "overlay")  # 'tarjeta' se eliminó (el render la trata como Marco)
 FUENTES_POST = ("moderna", "elegante", "redondeada")
@@ -36,7 +40,7 @@ def obtener_config_catalogo(tenant_id: str = Depends(get_tenant_id)):
     Si no existe, crea un registro con valores por defecto (slug auto-generado).
     """
     resultado = query(
-        "SELECT cc.id, cc.slug, cc.activo, cc.tema, cc.template, cc.titulo, cc.subtitulo, "
+        "SELECT cc.id, cc.slug, cc.activo, cc.tema, cc.template, cc.titulo, cc.subtitulo, cc.fuente, "
         "       cc.mostrar_precios, cc.mostrar_stock, cc.mostrar_categorias, cc.agrupar_por_categoria, cc.columnas_movil, cc.permitir_descarga, cc.ocultar_agotados, cc.relacion_imagen, "
         "       cc.banner_url, cc.banner_url_movil, cc.hero_estilo, cc.banner_texto_color, cc.banner_mostrar_texto, cc.banner_mostrar_logo, cc.anuncio_texto, cc.created_at, "
         "       t.logo AS logo "
@@ -52,7 +56,7 @@ def obtener_config_catalogo(tenant_id: str = Depends(get_tenant_id)):
             (tenant_id,)
         )
         resultado = query(
-            "SELECT cc.id, cc.slug, cc.activo, cc.tema, cc.template, cc.titulo, cc.subtitulo, "
+            "SELECT cc.id, cc.slug, cc.activo, cc.tema, cc.template, cc.titulo, cc.subtitulo, cc.fuente, "
             "       cc.mostrar_precios, cc.mostrar_stock, cc.mostrar_categorias, cc.agrupar_por_categoria, cc.columnas_movil, cc.permitir_descarga, cc.ocultar_agotados, cc.relacion_imagen, "
             "       cc.banner_url, cc.banner_url_movil, cc.hero_estilo, cc.banner_texto_color, cc.banner_mostrar_texto, cc.banner_mostrar_logo, cc.anuncio_texto, cc.created_at, "
             "       t.logo AS logo "
@@ -96,6 +100,12 @@ def actualizar_config_catalogo(
     if data.template is not None:
         campos.append("template = %s")
         valores.append(data.template.value)  # El Enum devuelve el string
+    if data.fuente is not None:
+        # Fuente display: whitelist de claves del frontend (migración 044)
+        if data.fuente not in _FUENTES_CATALOGO:
+            raise HTTPException(status_code=422, detail="Fuente del catálogo no reconocida")
+        campos.append("fuente = %s")
+        valores.append(data.fuente)
     if data.titulo is not None:
         campos.append("titulo = %s")
         valores.append(data.titulo)

@@ -14,6 +14,9 @@ class ActualizarCatalogo(BaseModel):
     template: Optional[TemplateEnum] = None
     titulo: Optional[str] = None
     subtitulo: Optional[str] = None
+    # Fuente display del catálogo (migración 044). Claves válidas en frontend
+    # (lib/catalogo-fuentes.ts) — se valida en el router del gestor.
+    fuente: Optional[str] = None
     mostrar_precios: Optional[bool] = None
     mostrar_stock: Optional[bool] = None
     mostrar_categorias: Optional[bool] = None
