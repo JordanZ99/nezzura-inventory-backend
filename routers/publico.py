@@ -49,6 +49,7 @@ def obtener_catalogo_publico(slug: str, response: Response):
         "SELECT cc.tenant_id, cc.tema, cc.template, cc.titulo, cc.subtitulo, cc.fuente, "
         "       cc.mostrar_precios, cc.mostrar_stock, cc.mostrar_categorias, cc.agrupar_por_categoria, cc.columnas_movil, cc.permitir_descarga, cc.ocultar_agotados, cc.relacion_imagen, "
         "       cc.banner_url, cc.banner_url_movil, cc.hero_estilo, cc.banner_texto_color, cc.banner_mostrar_texto, cc.banner_mostrar_logo, cc.anuncio_texto, "
+        "       cc.fondo_url, cc.fondo_modo, cc.fondo_opacidad, cc.fondo_color, "
         "       t.logo, t.telefono, t.correo, t.instagram, t.facebook, t.tiktok, t.sitio_web, t.maps "
         "FROM catalogo_config cc "
         "LEFT JOIN tenants t ON cc.tenant_id = t.id "
@@ -200,6 +201,11 @@ def obtener_catalogo_publico(slug: str, response: Response):
             "anuncio_texto": cfg.get("anuncio_texto") or "",
             "relacion_imagen": cfg.get("relacion_imagen") or "1:1",
             "logo": cfg.get("logo") or "",
+            # Fondo del catálogo con imagen (migración 045): '' = usa el tema
+            "fondo_url": cfg.get("fondo_url") or "",
+            "fondo_modo": cfg.get("fondo_modo") if cfg.get("fondo_modo") in ("cover", "repeat") else "cover",
+            "fondo_opacidad": int(cfg["fondo_opacidad"]) if cfg.get("fondo_opacidad") is not None else 100,
+            "fondo_color": cfg.get("fondo_color") or "",
         },
         "productos": productos,
         "orden_categorias": mapa_orden,

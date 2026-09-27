@@ -1,11 +1,17 @@
 from enum import Enum
 from typing import Optional, Literal
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class TemplateEnum(str, Enum):
     grid_clasico = "grid-clasico"
     menu_carta   = "menu-carta"
+
+
+class ModoFondoEnum(str, Enum):
+    """Modo de dibujado de la imagen de fondo del catálogo (migración 045)."""
+    cover = "cover"    # foto a pantalla completa
+    repeat = "repeat"  # textura tileada
 
 
 class ActualizarCatalogo(BaseModel):
@@ -32,6 +38,11 @@ class ActualizarCatalogo(BaseModel):
     banner_mostrar_texto: Optional[bool] = None
     banner_mostrar_logo: Optional[bool] = None
     anuncio_texto: Optional[str] = None
+    # Fondo del catálogo con imagen (migración 045)
+    fondo_url: Optional[str] = None
+    fondo_modo: Optional[ModoFondoEnum] = None
+    fondo_opacidad: Optional[int] = Field(None, ge=0, le=100, description="Opacidad de la imagen sobre el color de fondo (0-100)")
+    fondo_color: Optional[str] = None
 
 
 class ActualizarPostConfig(BaseModel):

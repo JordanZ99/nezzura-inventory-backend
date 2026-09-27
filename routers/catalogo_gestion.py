@@ -42,7 +42,9 @@ def obtener_config_catalogo(tenant_id: str = Depends(get_tenant_id)):
     resultado = query(
         "SELECT cc.id, cc.slug, cc.activo, cc.tema, cc.template, cc.titulo, cc.subtitulo, cc.fuente, "
         "       cc.mostrar_precios, cc.mostrar_stock, cc.mostrar_categorias, cc.agrupar_por_categoria, cc.columnas_movil, cc.permitir_descarga, cc.ocultar_agotados, cc.relacion_imagen, "
-        "       cc.banner_url, cc.banner_url_movil, cc.hero_estilo, cc.banner_texto_color, cc.banner_mostrar_texto, cc.banner_mostrar_logo, cc.anuncio_texto, cc.created_at, "
+        "       cc.banner_url, cc.banner_url_movil, cc.hero_estilo, cc.banner_texto_color, cc.banner_mostrar_texto, cc.banner_mostrar_logo, cc.anuncio_texto, "
+        "       cc.fondo_url, cc.fondo_modo, cc.fondo_opacidad, cc.fondo_color, "
+        "       cc.created_at, "
         "       t.logo AS logo "
         "FROM catalogo_config cc "
         "LEFT JOIN tenants t ON cc.tenant_id = t.id "
@@ -58,7 +60,9 @@ def obtener_config_catalogo(tenant_id: str = Depends(get_tenant_id)):
         resultado = query(
             "SELECT cc.id, cc.slug, cc.activo, cc.tema, cc.template, cc.titulo, cc.subtitulo, cc.fuente, "
             "       cc.mostrar_precios, cc.mostrar_stock, cc.mostrar_categorias, cc.agrupar_por_categoria, cc.columnas_movil, cc.permitir_descarga, cc.ocultar_agotados, cc.relacion_imagen, "
-            "       cc.banner_url, cc.banner_url_movil, cc.hero_estilo, cc.banner_texto_color, cc.banner_mostrar_texto, cc.banner_mostrar_logo, cc.anuncio_texto, cc.created_at, "
+            "       cc.banner_url, cc.banner_url_movil, cc.hero_estilo, cc.banner_texto_color, cc.banner_mostrar_texto, cc.banner_mostrar_logo, cc.anuncio_texto, "
+            "       cc.fondo_url, cc.fondo_modo, cc.fondo_opacidad, cc.fondo_color, "
+            "       cc.created_at, "
             "       t.logo AS logo "
             "FROM catalogo_config cc "
             "LEFT JOIN tenants t ON cc.tenant_id = t.id "
@@ -154,6 +158,20 @@ def actualizar_config_catalogo(
     if data.anuncio_texto is not None:
         campos.append("anuncio_texto = %s")
         valores.append(data.anuncio_texto)
+    if data.fondo_url is not None:
+        campos.append("fondo_url = %s")
+        valores.append(data.fondo_url)
+    if data.fondo_modo is not None:
+        campos.append("fondo_modo = %s")
+        valores.append(data.fondo_modo.value)  # whitelist del Enum ('cover' | 'repeat')
+    if data.fondo_opacidad is not None:
+        campos.append("fondo_opacidad = %s")
+        valores.append(data.fondo_opacidad)
+    if data.fondo_color is not None:
+        # Color de fondo: hex #RRGGBB o cadena vacía (= color del tema)
+        _validar_color_texto(data.fondo_color, "fondo_color")
+        campos.append("fondo_color = %s")
+        valores.append(data.fondo_color)
     if data.relacion_imagen is not None:
         campos.append("relacion_imagen = %s")
         valores.append(data.relacion_imagen)
