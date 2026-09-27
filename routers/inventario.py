@@ -33,7 +33,7 @@ from database.productos import (
 )
 from database.categorias import (
     eliminar_categoria_de_productos, listar_categorias, renombrar_categoria,
-    crear_categoria, toggle_visibilidad_categoria,
+    crear_categoria, toggle_visibilidad_categoria, reordenar_categorias,
 )
 from database.variaciones import (
     listar_variaciones_producto, crear_variacion, actualizar_variacion, eliminar_variacion,
@@ -65,6 +65,7 @@ from schemas.inventario import (
     ActualizarPerfil,
     ActualizarPostOverride,
     ReordenarImagenes,
+    ReordenarCategorias,
     GuardarCapturasConteo,
     CerrarConteo,
 )
@@ -468,6 +469,18 @@ def alternar_visibilidad_catalogo(categoria: str, tenant_id: str = Depends(get_t
     Si estaba visible, se oculta; si estaba oculta, se muestra.
     """
     return toggle_visibilidad_categoria(categoria, tenant_id)
+
+
+@router.patch("/categorias/reordenar")
+def reordenar_categorias_endpoint(data: ReordenarCategorias, tenant_id: str = Depends(get_tenant_id)):
+    """
+    Guarda el orden manual de las categorías del catálogo tras un drag & drop
+    desde Personalización > Catálogo: [{id, orden}] con orden 1..N según la
+    lista visible (mismo patrón que mesas / imágenes de producto).
+    """
+    return reordenar_categorias(
+        tenant_id, [{"id": fila.id, "orden": fila.orden} for fila in data.ordenes]
+    )
 
 
 # =============================================================================

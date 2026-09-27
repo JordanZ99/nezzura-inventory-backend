@@ -140,6 +140,17 @@ class ReordenarImagenes(BaseModel):
     ids: list[int] = Field(..., description="Array de IDs de imágenes en el nuevo orden")
 
 
+class ItemOrdenCategoria(BaseModel):
+    id: str
+    orden: int
+
+
+class ReordenarCategorias(BaseModel):
+    ordenes: list[ItemOrdenCategoria] = Field(
+        ..., description="Lista [{id, orden}] con la posición de cada categoría tras el drag & drop"
+    )
+
+
 class ConteoCaptura(BaseModel):
     """Autosave de un renglón del conteo (PATCH /inventario/conteos/{id}/items).
     El valor es ABSOLUTO (total contado, no un incremento): idempotente ante

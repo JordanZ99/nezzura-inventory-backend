@@ -152,6 +152,16 @@ def obtener_catalogo_publico(slug: str, response: Response):
             if p.get("tipo_producto") in ("servicio", "compuesto") or (p.get("stock_total") or 0) > 0
         ]
 
+    # 4. Orden manual de las categorías (drag & drop desde Personalización).
+    #     El catálogo público agrupa por categoría: el frontend recibe el mapa
+    #     nombre→orden y respeta ese orden; todo lo que no esté en el mapa
+    #     (ej. "Sin categoría") sigue al final, alfabético.
+    ordenes = query(
+        "SELECT nombre, orden FROM categorias WHERE tenant_id = %s AND orden IS NOT NULL ORDER BY orden ASC",
+        (tenant_id,)
+    )
+    mapa_orden = {fila["nombre"]: fila["orden"] for fila in ordenes}
+
     return {
         "config": {
             "tema": cfg["tema"],
@@ -176,5 +186,6 @@ def obtener_catalogo_publico(slug: str, response: Response):
             "relacion_imagen": cfg.get("relacion_imagen") or "1:1",
             "logo": cfg.get("logo") or "",
         },
-        "productos": productos
+        "productos": productos,
+        "orden_categorias": mapa_orden
     }

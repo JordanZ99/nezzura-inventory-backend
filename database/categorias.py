@@ -4,7 +4,7 @@
 # Extraído de lotes.py — Fase 1/2 del refactor por dominio.
 # ==============================================================================
 
-from database.conexion import query, execute
+from database.conexion import query, execute, get_conn, release_conn
 from database.helpers import _slugify
 
 
@@ -12,6 +12,9 @@ def listar_categorias(tenant_id: str) -> list[dict]:
     """
     Devuelve todas las categorías del tenant con el conteo de productos asociados.
     Útil para mostrar en la gestión de categorías del frontend.
+
+    Orden: `orden ASC` (personalizado, drag & drop desde Personalización) y
+    las categorías sin orden personalizado (NULL) van al final, alfabéticas.
     """
     return query("""
         SELECT
@@ -19,12 +22,13 @@ def listar_categorias(tenant_id: str) -> list[dict]:
             c.nombre,
             c.slug,
             c.visible_en_catalogo,
+            c.orden,
             COUNT(pc.producto_id) AS total_productos
         FROM categorias c
         LEFT JOIN producto_categorias pc ON pc.categoria_id = c.id
         WHERE c.tenant_id = %s
-        GROUP BY c.id, c.nombre, c.slug, c.visible_en_catalogo
-        ORDER BY c.nombre ASC
+        GROUP BY c.id, c.nombre, c.slug, c.visible_en_catalogo, c.orden
+        ORDER BY c.orden ASC NULLS LAST, c.nombre ASC
     """, (tenant_id,))
 
 
@@ -32,6 +36,9 @@ def crear_categoria(nombre: str, tenant_id: str) -> dict:
     """
     Crea una categoría nueva para el tenant.
     Si ya existe, retorna la existente.
+
+    `orden` queda NULL: se muestra al final del listado personalizado
+    (NULLS LAST) hasta que el tenant arrastre y guarde un reordenamiento.
     """
     nombre = nombre.strip()
     slug = _slugify(nombre)
@@ -159,3 +166,31 @@ def toggle_visibilidad_categoria(categoria: str, tenant_id: str) -> dict:
         "visible_en_catalogo": nuevo_valor,
         "mensaje": f"Categoría '{categoria}' {'visible' if nuevo_valor else 'oculta'} en el catálogo"
     }
+
+
+def reordenar_categorias(tenant_id: str, ordenes: list[dict]) -> dict:
+    """
+    Guarda el orden de las categorías tras un drag & drop desde
+    Personalización > Catálogo: [{id, orden}] con orden 1..N según la lista
+    visible (mismo patrón que reordenar_mesas / reordenar_imagenes).
+    """
+    if not ordenes:
+        return {"ok": True}
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            for fila in ordenes:
+                cur.execute(
+                    "UPDATE categorias SET orden = %s WHERE id = %s AND tenant_id = %s",
+                    (int(fila["orden"]), fila["id"], tenant_id)
+                )
+                if cur.rowcount == 0:
+                    conn.rollback()
+                    return {"ok": False, "mensaje": "Alguna categoría no pertenece a tu cuenta"}
+        conn.commit()
+        return {"ok": True}
+    except Exception as e:
+        conn.rollback()
+        return {"ok": False, "mensaje": f"Error al reordenar las categorías: {str(e)}"}
+    finally:
+        release_conn(conn)
