@@ -89,7 +89,7 @@ def get_inventario_consolidado(tenant_id: str) -> list[dict]:
             p.post_override                                          AS post_override,
             {cat_subquery},
             COALESCE(SUM(l.Stock_Lote), 0)                           AS stock_total,
-            COALESCE(MAX(l.Precio_Venta), p.precio_servicio, 0)      AS precio_venta,
+            COALESCE(MAX(CASE WHEN l.Stock_Lote > 0 THEN l.Precio_Venta END), MAX(l.Precio_Venta), p.precio_servicio, 0) AS precio_venta,
             -- Precio del lote MÁS ANTIGUO con stock > 0 (el que PEPS va a vender).
             -- Si ningún lote tiene stock, cae al precio máximo (fallback).
             -- Las 3 variantes del precio sugerido; el backend elige según el modo del tenant

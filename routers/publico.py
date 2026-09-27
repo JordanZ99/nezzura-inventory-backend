@@ -35,7 +35,7 @@ def obtener_catalogo_publico(slug: str, response: Response):
     Respuesta (sin tenant_id, sin costos, sin datos sensibles):
     {
       "config": { "titulo", "subtitulo", "tema", "template", "mostrar_precios", ... },
-      "productos": [{ "producto", "descripcion", "imagen", "imagenes", "precio_venta", "stock_total", "categoria" }]
+      "productos": [{ "producto", "descripcion", "imagen", "imagenes", "precio_venta", "precio_min", "precio_max", "stock_total", "categoria" }]
         donde "imagenes" es la galería completa (principal + extras de producto_imagenes)
     }
     """
@@ -81,7 +81,11 @@ def obtener_catalogo_publico(slug: str, response: Response):
             p.tipo_producto               AS tipo_producto,
             -- Las variaciones traen su propio `stock` (ver query de variaciones abajo)
             -- Servicios (sin lotes) usan su precio de servicio; productos normales el MAX de lotes
-            COALESCE(MAX(l.Precio_Venta), p.precio_servicio, 0) AS precio_venta,
+            -- Precio MAX de lotes CON stock; si ninguno tiene, cae al MAX de todos
+            COALESCE(MAX(CASE WHEN l.Stock_Lote > 0 THEN l.Precio_Venta END), MAX(l.Precio_Venta), p.precio_servicio, 0) AS precio_venta,
+            -- Rango de precios de los lotes CON stock (para mostrar "$X – $Y")
+            COALESCE(MIN(CASE WHEN l.Stock_Lote > 0 THEN l.Precio_Venta END), MAX(l.Precio_Venta), p.precio_servicio, 0) AS precio_min,
+            COALESCE(MAX(CASE WHEN l.Stock_Lote > 0 THEN l.Precio_Venta END), MAX(l.Precio_Venta), p.precio_servicio, 0) AS precio_max,
             CASE WHEN p.tipo_producto IN ('servicio', 'compuesto') THEN 0
                  ELSE COALESCE(SUM(l.Stock_Lote), 0) END          AS stock_total,
             {cat_subquery}
