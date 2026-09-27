@@ -35,7 +35,7 @@ def obtener_catalogo_publico(slug: str, response: Response):
     Respuesta (sin tenant_id, sin costos, sin datos sensibles):
     {
       "config": { "titulo", "subtitulo", "tema", "template", "mostrar_precios", ... },
-      "productos": [{ "producto", "descripcion", "imagen", "imagenes", "precio_venta", "precio_min", "precio_max", "stock_total", "categoria" }]
+      "productos": [{ "producto", "descripcion", "imagen", "imagenes", "precio_venta", "precio_min", "precio_max", "stock_total", "categoria", "sufijo_precio", "tamano_cm", "tipo_producto" }]
         donde "imagenes" es la galería completa (principal + extras de producto_imagenes)
     }
     """
@@ -78,6 +78,7 @@ def obtener_catalogo_publico(slug: str, response: Response):
             p.Descripcion                 AS descripcion,
             p.Imagen                      AS imagen,
             p.sufijo_precio               AS sufijo_precio,
+            p.tamano_cm                   AS tamano_cm,
             p.tipo_producto               AS tipo_producto,
             -- Las variaciones traen su propio `stock` (ver query de variaciones abajo)
             -- Servicios (sin lotes) usan su precio de servicio; productos normales el MAX de lotes
@@ -93,7 +94,7 @@ def obtener_catalogo_publico(slug: str, response: Response):
         LEFT JOIN lotes l ON l.producto_id = p.id AND l.tenant_id = p.tenant_id AND l.Estado = 'Activo'
         WHERE p.Estado = 'Activo' AND p.tenant_id = %s
         AND p.visible_en_catalogo = true
-        GROUP BY p.Producto, p.Descripcion, p.Imagen, p.sufijo_precio, p.tipo_producto, p.precio_servicio, p.id
+        GROUP BY p.Producto, p.Descripcion, p.Imagen, p.sufijo_precio, p.tamano_cm, p.tipo_producto, p.precio_servicio, p.id
         ORDER BY p.Producto ASC
     """, (tenant_id,))
 

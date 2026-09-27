@@ -35,7 +35,7 @@ def get_productos_meta(tenant_id: str) -> list[dict]:
             visible_en_catalogo,
             sufijo_precio,
             fraccionable,
-            tipo_producto,
+            tamano_cm,
             costo_servicio,
             precio_servicio,
             {cat_subquery}
@@ -83,6 +83,7 @@ def get_inventario_consolidado(tenant_id: str) -> list[dict]:
             p.visible_en_catalogo                                    AS visible_en_catalogo,
             p.sufijo_precio                                          AS sufijo_precio,
             p.fraccionable                                           AS fraccionable,
+            p.tamano_cm                                              AS tamano_cm,
             p.tipo_producto                                          AS tipo_producto,
             p.costo_servicio                                         AS costo_servicio,
             p.precio_servicio                                        AS precio_servicio,
@@ -103,7 +104,7 @@ def get_inventario_consolidado(tenant_id: str) -> list[dict]:
         FROM productos p
         LEFT JOIN lotes l ON l.producto_id = p.id AND l.Tenant_ID = p.Tenant_ID AND l.Estado = 'Activo'
         WHERE p.Tenant_ID = %s AND p.Estado = 'Activo' AND p.es_generico IS NOT TRUE
-        GROUP BY p.Producto, p.Descripcion, p.Imagen, p.Estado, p.id, p.codigo_interno, p.codigo_barras, p.ubicacion, p.visible_en_catalogo, p.sufijo_precio, p.fraccionable, p.tipo_producto, p.costo_servicio, p.precio_servicio, p.post_override
+        GROUP BY p.Producto, p.Descripcion, p.Imagen, p.Estado, p.id, p.codigo_interno, p.codigo_barras, p.ubicacion, p.visible_en_catalogo, p.sufijo_precio, p.fraccionable, p.tamano_cm, p.tipo_producto, p.costo_servicio, p.precio_servicio, p.post_override
         ORDER BY p.Producto ASC
     """, (tenant_id,))
 
@@ -164,6 +165,7 @@ def _upsert_producto(
     ubicacion: str | None,
     sufijo_limpio: str,
     frac: bool,
+    tamano: float | None,
     tipo: str,
     costo_srv: float,
     precio_srv: float,
@@ -176,8 +178,8 @@ def _upsert_producto(
     r = _q(conn, """
         INSERT INTO productos (Producto, Descripcion, Imagen, Estado, tenant_id,
                                codigo_interno, codigo_barras, ubicacion, sufijo_precio,
-                               fraccionable, tipo_producto, costo_servicio, precio_servicio, visible_en_catalogo)
-        VALUES (%s, %s, %s, 'Activo', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                               fraccionable, tamano_cm, tipo_producto, costo_servicio, precio_servicio, visible_en_catalogo)
+        VALUES (%s, %s, %s, 'Activo', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT(Producto, tenant_id) DO UPDATE SET
             Descripcion = EXCLUDED.Descripcion,
             Imagen = CASE WHEN EXCLUDED.Imagen != 'No hay foto'
@@ -189,6 +191,7 @@ def _upsert_producto(
                                  THEN EXCLUDED.sufijo_precio ELSE productos.sufijo_precio END,
             fraccionable = CASE WHEN EXCLUDED.fraccionable
                                 THEN EXCLUDED.fraccionable ELSE productos.fraccionable END,
+            tamano_cm = COALESCE(EXCLUDED.tamano_cm, productos.tamano_cm),
             tipo_producto = productos.tipo_producto,
             costo_servicio = CASE WHEN EXCLUDED.costo_servicio > 0
                                   THEN EXCLUDED.costo_servicio ELSE productos.costo_servicio END,
@@ -198,7 +201,7 @@ def _upsert_producto(
             visible_en_catalogo = productos.visible_en_catalogo
         RETURNING id
     """, (producto, descripcion, imagen, tenant_id, codigo_interno, codigo_barras, ubicacion,
-          sufijo_limpio, frac, tipo, costo_srv, precio_srv, vis))
+          sufijo_limpio, frac, tamano, tipo, costo_srv, precio_srv, vis))
     return r[0]["id"]
 
 
@@ -360,6 +363,7 @@ def crear_producto_completo(
     etiqueta: str = "",
     sufijo_precio: str = "",
     fraccionable: bool | None = None,
+    tamano_cm: float | None = None,
     tipo_producto: str = "stock",
     costo_servicio: float | None = None,
     precio_servicio: float | None = None,
@@ -401,6 +405,7 @@ def crear_producto_completo(
     precio_srv = float(precio_servicio or 0)
     vis = bool(visible_en_catalogo) if visible_en_catalogo is not None else True
     frac = bool(fraccionable) if fraccionable is not None else False
+    tamano = float(tamano_cm) if tamano_cm else None
 
     conn = get_conn()
     try:
@@ -409,7 +414,7 @@ def crear_producto_completo(
             conn,
             producto=producto, descripcion=descripcion, imagen=imagen, tenant_id=tenant_id,
             codigo_interno=codigo_interno, codigo_barras=codigo_barras, ubicacion=ubicacion,
-            sufijo_limpio=sufijo_limpio, frac=frac, tipo=tipo,
+            sufijo_limpio=sufijo_limpio, frac=frac, tamano=tamano, tipo=tipo,
             costo_srv=costo_srv, precio_srv=precio_srv, vis=vis,
         )
 
@@ -480,6 +485,7 @@ def actualizar_producto(
     visible_en_catalogo: bool | None = None,
     sufijo_precio: str | None = None,
     fraccionable: bool | None = None,
+    tamano_cm: float | None = None,
     tipo_producto: str | None = None,
     costo_servicio: float | None = None,
     precio_servicio: float | None = None
@@ -515,13 +521,14 @@ def actualizar_producto(
                 "visible_en_catalogo=COALESCE(%s, visible_en_catalogo), "
                 "sufijo_precio=COALESCE(%s, sufijo_precio), "
                 "fraccionable=COALESCE(%s, fraccionable), "
+                "tamano_cm=COALESCE(%s, tamano_cm), "
                 "tipo_producto=COALESCE(%s, tipo_producto), "
                 "costo_servicio=COALESCE(%s, costo_servicio), "
                 "precio_servicio=COALESCE(%s, precio_servicio) "
                 "WHERE Producto=%s AND tenant_id=%s",
                 (nombre_final, descripcion, imagen, estado,
                  codigo_interno, codigo_barras, ubicacion, visible_en_catalogo, sufijo_precio,
-                 fraccionable, tipo_producto, costo_servicio, precio_servicio, producto, tenant_id)
+                 fraccionable, tamano_cm, tipo_producto, costo_servicio, precio_servicio, producto, tenant_id)
             )
             # Renombrar en lotes
             execute(
@@ -544,12 +551,13 @@ def actualizar_producto(
                     visible_en_catalogo=COALESCE(%s, visible_en_catalogo),
                     sufijo_precio=COALESCE(%s, sufijo_precio),
                     fraccionable=COALESCE(%s, fraccionable),
+                    tamano_cm=COALESCE(%s, tamano_cm),
                     tipo_producto=COALESCE(%s, tipo_producto),
                     costo_servicio=COALESCE(%s, costo_servicio),
                     precio_servicio=COALESCE(%s, precio_servicio)
                 WHERE Producto=%s AND tenant_id = %s
             """, (descripcion, imagen, estado, codigo_interno, codigo_barras, ubicacion, visible_en_catalogo, sufijo_precio,
-                   fraccionable, tipo_producto, costo_servicio, precio_servicio, producto, tenant_id))
+                   fraccionable, tamano_cm, tipo_producto, costo_servicio, precio_servicio, producto, tenant_id))
     else:
         # Actualizar producto sin renombrar
         execute("""
@@ -560,12 +568,13 @@ def actualizar_producto(
                 visible_en_catalogo=COALESCE(%s, visible_en_catalogo),
                 sufijo_precio=COALESCE(%s, sufijo_precio),
                 fraccionable=COALESCE(%s, fraccionable),
+                tamano_cm=COALESCE(%s, tamano_cm),
                 tipo_producto=COALESCE(%s, tipo_producto),
                 costo_servicio=COALESCE(%s, costo_servicio),
                 precio_servicio=COALESCE(%s, precio_servicio)
             WHERE Producto=%s AND tenant_id = %s
         """, (descripcion, imagen, estado, codigo_interno, codigo_barras, ubicacion, visible_en_catalogo, sufijo_precio,
-               fraccionable, tipo_producto, costo_servicio, precio_servicio, producto, tenant_id))
+               fraccionable, tamano_cm, tipo_producto, costo_servicio, precio_servicio, producto, tenant_id))
 
     # Obtener el ID numérico del producto para la tabla pivote
     prod = query(

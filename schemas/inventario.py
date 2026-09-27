@@ -32,6 +32,7 @@ class NuevoProducto(BaseModel):
     etiqueta       : Optional[str] = None
     sufijo_precio  : Optional[str] = None
     fraccionable   : Optional[bool] = None
+    tamano_cm      : Optional[float] = Field(None, gt=0, description="Tamaño del producto en cm (pill del catálogo)")
     tipo_producto  : str = "stock"
     costo_servicio : Optional[float] = None
     precio_servicio: Optional[float] = None
@@ -63,6 +64,7 @@ class ActualizarProducto(BaseModel):
     visible_en_catalogo : Optional[bool] = None
     sufijo_precio       : Optional[str] = None
     fraccionable        : Optional[bool] = None
+    tamano_cm           : Optional[float] = Field(None, gt=0, description="Tamaño en cm; None = conservar, 0 no permitido")
     tipo_producto       : Optional[str] = None
     costo_servicio      : Optional[float] = None
     precio_servicio     : Optional[float] = None
