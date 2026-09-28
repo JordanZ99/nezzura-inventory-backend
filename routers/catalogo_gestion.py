@@ -216,13 +216,13 @@ def actualizar_config_catalogo(
             if not isinstance(elementos, list) or len(elementos) > 30:
                 raise HTTPException(status_code=422, detail="elementos debe ser una lista de hasta 30 elementos")
             claves_elem = {"id", "tipo", "x", "y", "w", "texto", "fuente", "tamano", "color", "peso", "align"}
-            tipos_elem = ("texto", "redes", "boton")
+            tipos_elem = ("texto", "redes", "boton", "logo")
             vistos: set = set()
             for el in elementos:
                 if not isinstance(el, dict) or not set(el.keys()).issubset(claves_elem):
                     raise HTTPException(status_code=422, detail="elementos contiene campos no permitidos")
                 if el.get("tipo") not in tipos_elem:
-                    raise HTTPException(status_code=422, detail="tipo debe ser texto, redes o boton")
+                    raise HTTPException(status_code=422, detail="tipo debe ser texto, logo, redes o boton")
                 try:
                     x = float(el["x"]); y = float(el["y"])
                 except (TypeError, KeyError, ValueError):
