@@ -15,7 +15,7 @@
 import calendar
 from datetime import date, datetime, timedelta
 from database.conexion import execute, get_conn, release_conn, query
-from database.helpers import ahora_negocio, fecha_negocio_de, hoy_negocio
+from database.helpers import ahora_negocio, fecha_negocio_de, hoy_negocio, zona_tenant
 from psycopg2.extras import RealDictCursor
 
 
@@ -101,14 +101,18 @@ def _calcular_inicio_periodo(ultima_ejecucion_raw, tenant_id, cur, fallback_str:
             ue_date = date.fromisoformat(ue_str)
             return (ue_date + timedelta(days=1)).isoformat()
 
-    # Sin ejecución previa → desde la primera venta registrada
+    # Sin ejecución previa → desde la primera venta registrada.
+    # Columna canónica ventas.fecha_ts (TIMESTAMPTZ, migración 031): el día de
+    # negocio se deriva con la zona IANA del tenant. NO usar MIN(fecha) sobre el
+    # TEXT: es copia de display en UTC y desplaza la primera venta de un día.
     cur.execute(
-        "SELECT MIN(fecha) FROM ventas WHERE tenant_id = %s",
-        (tenant_id,)
+        "SELECT MIN((fecha_ts AT TIME ZONE %s)::date) AS min_fecha "
+        "FROM ventas WHERE tenant_id = %s",
+        (zona_tenant(tenant_id).key, tenant_id)
     )
     row = cur.fetchone()
-    min_fecha = row["min"] if row and "min" in row else None
-    return min_fecha if min_fecha else fallback_str
+    min_fecha = row["min_fecha"] if row and row["min_fecha"] else None
+    return min_fecha.isoformat() if min_fecha else fallback_str
 
 
 def _calcular_monto_porcentaje(tenant_id: str, regla: dict, cur) -> float:
@@ -131,21 +135,30 @@ def _calcular_monto_porcentaje(tenant_id: str, regla: dict, cur) -> float:
     )
     fin = _hoy(tenant_id).isoformat()
 
-    # 1. SUM(ganancia_bruta) de ventas activas en el período
+    # 1. SUM(ganancia_bruta) de ventas activas en el período.
+    # Día de negocio canónico: (fecha_ts AT TIME ZONE zona)::date con la zona
+    # IANA del tenant (migración 031). NO usar fecha::date: el TEXT dual-write
+    # guarda el instante en UTC y desplaza las ventas nocturnas al día
+    # siguiente (bug validado con datos reales: 9.6% de las ventas de un
+    # tenant quedaban en el día equivocado).
+    _zona = zona_tenant(tenant_id).key
     cur.execute(
         "SELECT COALESCE(SUM(ganancia_bruta), 0) AS total FROM ventas "
         "WHERE tenant_id = %s AND estado != 'Inactivo' "
-        "AND fecha::date >= %s::date AND fecha::date <= %s::date",
-        (tenant_id, inicio, fin)
+        "AND (fecha_ts AT TIME ZONE %s)::date >= %s::date "
+        "AND (fecha_ts AT TIME ZONE %s)::date <= %s::date",
+        (tenant_id, _zona, inicio, _zona, fin)
     )
     row = cur.fetchone()
     ganancia_bruta = float(row["total"]) if row and row["total"] is not None else 0.0
 
-    # 2. SUM(gastos.monto) histórico del período (ANTES de este gasto)
+    # 2. SUM(gastos.monto) histórico del período (ANTES de este gasto).
+    # gastos.fecha_negocio (migración 031) es DATE puro: ya ES el día de
+    # negocio capturado al registrar, comparación directa sin conversión de zona.
     cur.execute(
         "SELECT COALESCE(SUM(monto), 0) AS total FROM gastos "
         "WHERE tenant_id = %s "
-        "AND fecha::date >= %s::date AND fecha::date <= %s::date",
+        "AND fecha_negocio >= %s::date AND fecha_negocio <= %s::date",
         (tenant_id, inicio, fin)
     )
     row = cur.fetchone()
