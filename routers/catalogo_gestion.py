@@ -46,7 +46,8 @@ def obtener_config_catalogo(tenant_id: str = Depends(get_tenant_id)):
         "       cc.fondo_url, cc.fondo_modo, cc.fondo_opacidad, cc.fondo_color, "
         "       cc.hero_url, cc.hero_url_movil, cc.hero_color, cc.hero_opacidad, cc.hero_layout, "
         "       cc.created_at, "
-        "       t.logo AS logo "
+        "       t.logo AS logo, "
+        "       t.telefono, t.instagram, t.facebook, t.tiktok "
         "FROM catalogo_config cc "
         "LEFT JOIN tenants t ON cc.tenant_id = t.id "
         "WHERE cc.tenant_id = %s",
@@ -65,7 +66,8 @@ def obtener_config_catalogo(tenant_id: str = Depends(get_tenant_id)):
             "       cc.fondo_url, cc.fondo_modo, cc.fondo_opacidad, cc.fondo_color, "
         "       cc.hero_url, cc.hero_url_movil, cc.hero_color, cc.hero_opacidad, cc.hero_layout, "
         "       cc.created_at, "
-            "       t.logo AS logo "
+        "       t.logo AS logo, "
+        "       t.telefono, t.instagram, t.facebook, t.tiktok "
             "FROM catalogo_config cc "
             "LEFT JOIN tenants t ON cc.tenant_id = t.id "
             "WHERE cc.tenant_id = %s",
@@ -215,14 +217,17 @@ def actualizar_config_catalogo(
             elementos = layout["elementos"]
             if not isinstance(elementos, list) or len(elementos) > 30:
                 raise HTTPException(status_code=422, detail="elementos debe ser una lista de hasta 30 elementos")
-            claves_elem = {"id", "tipo", "x", "y", "w", "texto", "fuente", "tamano", "color", "peso", "align"}
-            tipos_elem = ("texto", "redes", "boton", "logo")
+            claves_elem = {"id", "tipo", "x", "y", "w", "texto", "fuente", "tamano", "color", "peso", "align", "red"}
+            tipos_elem = ("texto", "redes", "boton", "logo", "red")
+            redes_validas = ("instagram", "facebook", "tiktok", "whatsapp")
             vistos: set = set()
             for el in elementos:
                 if not isinstance(el, dict) or not set(el.keys()).issubset(claves_elem):
                     raise HTTPException(status_code=422, detail="elementos contiene campos no permitidos")
                 if el.get("tipo") not in tipos_elem:
-                    raise HTTPException(status_code=422, detail="tipo debe ser texto, logo, redes o boton")
+                    raise HTTPException(status_code=422, detail="tipo debe ser texto, logo, redes, red o boton")
+                if el.get("tipo") == "red" and el.get("red") not in redes_validas:
+                    raise HTTPException(status_code=422, detail="red debe ser instagram, facebook, tiktok o whatsapp")
                 try:
                     x = float(el["x"]); y = float(el["y"])
                 except (TypeError, KeyError, ValueError):
