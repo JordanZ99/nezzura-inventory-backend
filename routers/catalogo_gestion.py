@@ -212,18 +212,22 @@ def actualizar_config_catalogo(
                 raise HTTPException(status_code=422, detail=f"{clave} debe ser booleano")
         # Mini-canva (Fase 2): elementos posicionados libremente. EL body manda
         # el array completo (estado final tras cada gesto del editor).
-        # Coordenadas en % del hero (0-100).
-        if "elementos" in layout:
-            elementos = layout["elementos"]
+        # Coordenadas en % del hero (0-100). Hay DOS sets: 'elementos' (el
+        # canva de escritorio) y 'elementos_movil' (vista teléfono, opcional;
+        # ausente = hereda el de escritorio escalado).
+        for clave_set in ("elementos", "elementos_movil"):
+            if clave_set not in layout:
+                continue
+            elementos = layout[clave_set]
             if not isinstance(elementos, list) or len(elementos) > 30:
-                raise HTTPException(status_code=422, detail="elementos debe ser una lista de hasta 30 elementos")
+                raise HTTPException(status_code=422, detail=f"{clave_set} debe ser una lista de hasta 30 elementos")
             claves_elem = {"id", "tipo", "x", "y", "w", "texto", "fuente", "tamano", "color", "peso", "align", "red"}
             tipos_elem = ("texto", "redes", "boton", "logo", "red")
             redes_validas = ("instagram", "facebook", "tiktok", "whatsapp")
             vistos: set = set()
             for el in elementos:
                 if not isinstance(el, dict) or not set(el.keys()).issubset(claves_elem):
-                    raise HTTPException(status_code=422, detail="elementos contiene campos no permitidos")
+                    raise HTTPException(status_code=422, detail=f"{clave_set} contiene campos no permitidos")
                 if el.get("tipo") not in tipos_elem:
                     raise HTTPException(status_code=422, detail="tipo debe ser texto, logo, redes, red o boton")
                 if el.get("tipo") == "red" and el.get("red") not in redes_validas:
