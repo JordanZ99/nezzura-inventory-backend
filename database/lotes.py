@@ -1,100 +1,25 @@
 # ==============================================================================
 # backend/database/lotes.py
-# Lógica de inventario y algoritmo PEPS — sin Streamlit.
+# Inventario físico: lotes (stock, costo, precio) y algoritmo PEPS.
+#
+# Refactor Fase 1/2: este módulo quedó solo con lo de LOTES. Los demás
+# dominios viven en:
+#   - productos.py      → get_productos_meta, get_inventario_consolidado,
+#                         crear_producto_completo, actualizar_producto
+#   - variaciones.py    → CRUD de variaciones
+#   - recetas.py        → recetas (BOM) de compuestos
+#   - categorias.py     → CRUD de categorías
+#   - helpers.py        → helpers compartidos (_q, _e, zona horaria del negocio, categorías, ...)
+#
+# Refactor Fase 3: descontar_stock_peps se dividió en _registro_venta,
+# _crear_lote_virtual y _consumir_lotes_peps (misma lógica, sin duplicación
+# del dict de venta que se construía 5 veces).
 # ==============================================================================
 
 import uuid
-import datetime
-import re
-from zoneinfo import ZoneInfo
-
-
-# ── Zona horaria del negocio (Cancún, UTC-5) ──
-_TZ = ZoneInfo("America/Cancun")
 from database.conexion import query, execute
-
-# ==============================================================================
-# Funciones auxiliares para el manejo de categorías (Many-to-Many)
-# ==============================================================================
-
-
-def _slugify(texto: str) -> str:
-    """
-    Convierte un nombre de categoría en un slug URL-amigable.
-    Ej: 'Accesorios de Moda' → 'accesorios-de-moda'
-    """
-    texto = texto.lower().strip()
-    # Reemplazar espacios y caracteres no alfanuméricos (excepto guiones) por guiones
-    texto = re.sub(r'[^a-z0-9áéíóúüñ\s-]', '', texto)
-    texto = re.sub(r'[\s-]+', '-', texto)
-    return texto.strip('-')
-
-
-def _sincronizar_categorias(producto_id: int, categorias: list[str], tenant_id: str) -> None:
-    """
-    Sincroniza las categorías de un producto en la tabla pivote (producto_categorias).
-    
-    Estrategia:
-    1. Elimina todas las relaciones existentes para este producto en producto_categorias.
-    2. Por cada nombre de categoría, hace un upsert en la tabla 'categorias' y
-       crea la relación en 'producto_categorias'.
-    
-    Args:
-        producto_id: ID numérico del producto (productos.id)
-        categorias: Lista de nombres de categorías a asignar
-        tenant_id: UUID del tenant propietario
-    """
-    # Normalizar: limpiar espacios y eliminar duplicados preservando orden
-    categorias = list(dict.fromkeys([c.strip() for c in categorias if c.strip()]))
-    if not categorias:
-        categorias = ["General"]
-
-    # 1. Eliminar relaciones existentes para este producto
-    execute(
-        "DELETE FROM producto_categorias WHERE producto_id = %s",
-        (producto_id,)
-    )
-
-    # 2. Upsert cada categoría y crear la relación
-    for nombre in categorias:
-        slug = _slugify(nombre)
-
-        # Upsert: si ya existe (tenant_id, nombre), devuelve el id existente
-        result = query("""
-            INSERT INTO categorias (tenant_id, nombre, slug)
-            VALUES (%s, %s, %s)
-            ON CONFLICT (tenant_id, nombre) DO UPDATE SET
-                slug = EXCLUDED.slug
-            RETURNING id
-        """, (tenant_id, nombre, slug))
-
-        categoria_id = result[0]["id"]
-
-        # Insertar en la tabla pivote (ignorar si ya existe por alguna razón)
-        execute(
-            "INSERT INTO producto_categorias (producto_id, categoria_id) VALUES (%s, %s) ON CONFLICT DO NOTHING",
-            (producto_id, categoria_id)
-        )
-
-
-def _obtener_categorias_subquery(alias: str) -> str:
-    """
-    Genera una subquery SQL correlacionada para obtener las categorías
-    de un producto como un array de nombres.
-    
-    Úsala en cualquier SELECT que necesite incluir categorías sin importar
-    la columna antigua Categoria de la tabla productos.
-    
-    Args:
-        alias: Alias de la tabla productos (e.g. 'p')
-    """
-    return f"""COALESCE(
-        (SELECT array_agg(c.nombre ORDER BY c.nombre)
-         FROM producto_categorias pc
-         JOIN categorias c ON pc.categoria_id = c.id
-         WHERE pc.producto_id = {alias}.id),
-        ARRAY['General']
-    ) AS categoria"""
+from database.helpers import _q, _e, _obtener_categorias_subquery, _sincronizar_categorias, _resolver_producto_id, ahora_negocio, _parsear_ts
+from database.movimientos import registrar_movimiento_inventario
 
 
 def get_lotes(tenant_id: str) -> list[dict]:
@@ -104,77 +29,44 @@ def get_lotes(tenant_id: str) -> list[dict]:
         SELECT 
             l.id as id,
             l.id_lote as id_lote,
+            l.producto_id as producto_id,
             l.producto as producto,
             l.costo as costo,
             l.precio_venta as precio_venta,
             l.stock_lote as stock_lote,
             l.fecha_entrada as fecha_entrada,
             l.estado as estado,
+            l.etiqueta as etiqueta,
+            l.variacion_id as variacion_id,
+            v.nombre as variacion,
             p.Imagen as imagen, 
             p.Descripcion as descripcion,
+            p.visible_en_catalogo as visible_en_catalogo,
             {cat_subquery}
         FROM lotes l
-        LEFT JOIN productos p ON l.Producto = p.Producto AND l.tenant_id = p.tenant_id
+        JOIN productos p ON p.id = l.producto_id AND p.tenant_id = l.tenant_id
+        LEFT JOIN producto_variaciones v ON v.id = l.variacion_id
         WHERE l.Estado = 'Activo' AND l.tenant_id = %s
         ORDER BY l.Producto, l.Fecha_Entrada ASC
     """, (tenant_id,))
 
 
-def get_productos_meta(tenant_id: str) -> list[dict]:
-    """Lee la tabla productos (metadatos) con sus categorías desde la relación Many-to-Many."""
-    cat_subquery = _obtener_categorias_subquery("productos")
-    return query(f"""
-        SELECT 
-            Producto as producto, 
-            Descripcion as descripcion, 
-            Imagen as imagen, 
-            Estado as estado,
-            codigo_interno,
-            codigo_barras,
-            ubicacion,
-            {cat_subquery}
-        FROM productos 
-        WHERE Tenant_ID = %s
-        ORDER BY Producto ASC
-    """,  (tenant_id,))
-
-
-def get_inventario_consolidado(tenant_id: str) -> list[dict]:
-    """
-    Devuelve una fila por producto con stock total,
-    precio del lote más reciente, costo promedio ponderado y categorías.
-    """
-    cat_subquery = _obtener_categorias_subquery("p")
-    return query(f"""
-        SELECT
-            l.Producto                                               AS producto,
-            p.Descripcion                                            AS descripcion,
-            p.Imagen                                                 AS imagen,
-            p.Estado                                                 AS estado,
-            p.codigo_interno,
-            p.codigo_barras,
-            p.ubicacion,
-            {cat_subquery},
-            SUM(l.Stock_Lote)                                        AS stock_total,
-            MAX(l.Precio_Venta)                                      AS precio_venta,
-            SUM(l.Costo * l.Stock_Lote) / NULLIF(SUM(l.Stock_Lote), 0) AS costo_promedio
-        FROM lotes l
-        LEFT JOIN productos p ON l.Producto = p.Producto AND l.Tenant_ID = p.Tenant_ID
-        WHERE l.Estado = 'Activo' AND l.Tenant_ID = %s
-        GROUP BY l.Producto, p.Descripcion, p.Imagen, p.Estado, p.id, p.codigo_interno, p.codigo_barras, p.ubicacion
-        ORDER BY l.Producto ASC
-    """, (tenant_id,))
-
-
 def get_detalle_lotes(producto: str, tenant_id: str) -> list[dict]:
-    """Devuelve los lotes activos de un producto específico."""
+    """Devuelve los lotes activos de un producto específico, con la variación
+    a la que pertenece cada lote (None = stock base del producto)."""
     return query("""
         SELECT 
-            id, id_lote, producto, costo, precio_venta, stock_lote, fecha_entrada, estado 
-        FROM lotes
-        WHERE Producto = %s AND Estado = 'Activo' AND tenant_id = %s
-        ORDER BY Fecha_Entrada DESC
-    """, (producto, tenant_id))
+            l.id, l.id_lote, l.producto_id, l.producto, l.costo, l.precio_venta, l.stock_lote,
+            l.fecha_entrada, l.estado, l.etiqueta,
+            l.variacion_id, v.nombre AS variacion
+        FROM lotes l
+        LEFT JOIN producto_variaciones v ON v.id = l.variacion_id
+        WHERE l.producto_id = (
+            SELECT p.id FROM productos p
+            WHERE p.Producto = %s AND p.tenant_id = %s
+        ) AND l.Estado = 'Activo' AND l.tenant_id = %s
+        ORDER BY l.Fecha_Entrada DESC
+    """, (producto, tenant_id, tenant_id))
 
 
 def agregar_lote(
@@ -182,299 +74,236 @@ def agregar_lote(
     descripcion: str,
     costo: float,
     precio_venta: float,
-    stock: int,
+    stock: float,
     imagen: str = "No hay foto",
     categoria: list[str] = ["General"],
     tenant_id: str = "",
     codigo_interno: str | None = None,
     codigo_barras: str | None = None,
-    ubicacion: str | None = None
+    ubicacion: str | None = None,
+    etiqueta: str = "",
+    sufijo_precio: str = "",
+    fraccionable: bool = False,
+    tipo_producto: str = "stock",
+    costo_servicio: float | None = None,
+    precio_servicio: float | None = None,
+    variacion: str = ""
 ) -> dict:
-    producto = producto.strip()
-    descripcion = descripcion.strip()
     """
     Crea producto si no existe, luego inserta un lote nuevo
     o suma stock si ya existe uno con el mismo costo y precio.
     Las categorías se guardan en la tabla pivote producto_categorias.
+
+    Si tipo_producto == 'servicio' NO se crea lote: el producto se vende sin
+    inventario (ej. corte de cabello) y guarda costo/precio propios en
+    productos.costo_servicio / productos.precio_servicio.
+    Si tipo_producto == 'compuesto' tampoco se crea lote: su stock son los
+    MATERIALES de su receta (producto_recetas). Su precio de venta se guarda
+    en productos.precio_servicio (reutilizando la columna).
     """
+    producto = producto.strip()
+    descripcion = descripcion.strip()
+    etiqueta_limpia = (etiqueta or "").strip()
     # Upsert en productos (YA NO incluye Categoria, se maneja aparte)
+    sufijo_limpio = (sufijo_precio or "").strip()
+    tipo = (tipo_producto or "stock").strip().lower()
+    if tipo not in ("stock", "servicio", "compuesto"):
+        tipo = "stock"
+    costo_srv = float(costo_servicio or 0)
+    precio_srv = float(precio_servicio or 0)
+    # ¿El producto ya existía? Las categorías solo se sincronizan al CREAR un
+    # producto nuevo; en un restock de un producto existente NO se tocan (el
+    # default ["General"] antes borraba las categorías en cada restock — bug).
+    producto_existia = bool(query(
+        "SELECT 1 FROM productos WHERE Producto = %s AND tenant_id = %s",
+        (producto, tenant_id)))
     result = query("""
         INSERT INTO productos (Producto, Descripcion, Imagen, Estado, tenant_id,
-                               codigo_interno, codigo_barras, ubicacion)
-        VALUES (%s, %s, %s, 'Activo', %s, %s, %s, %s)
+                               codigo_interno, codigo_barras, ubicacion, sufijo_precio,
+                               fraccionable, tipo_producto, costo_servicio, precio_servicio)
+        VALUES (%s, %s, %s, 'Activo', %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT(Producto, tenant_id) DO UPDATE SET
             Descripcion = EXCLUDED.Descripcion,
             Imagen = CASE WHEN EXCLUDED.Imagen != 'No hay foto'
                          THEN EXCLUDED.Imagen ELSE productos.Imagen END,
             codigo_interno = COALESCE(EXCLUDED.codigo_interno, productos.codigo_interno),
             codigo_barras = COALESCE(EXCLUDED.codigo_barras, productos.codigo_barras),
-            ubicacion = COALESCE(EXCLUDED.ubicacion, productos.ubicacion)
+            ubicacion = COALESCE(EXCLUDED.ubicacion, productos.ubicacion),
+            sufijo_precio = CASE WHEN EXCLUDED.sufijo_precio != ''
+                                 THEN EXCLUDED.sufijo_precio ELSE productos.sufijo_precio END,
+            fraccionable = CASE WHEN EXCLUDED.fraccionable
+                                THEN EXCLUDED.fraccionable ELSE productos.fraccionable END,
+            -- El tipo NO se pisa en restock: se define al crear el producto
+            tipo_producto = productos.tipo_producto,
+            costo_servicio = CASE WHEN EXCLUDED.costo_servicio > 0
+                                  THEN EXCLUDED.costo_servicio ELSE productos.costo_servicio END,
+            precio_servicio = CASE WHEN EXCLUDED.precio_servicio > 0
+                                   THEN EXCLUDED.precio_servicio ELSE productos.precio_servicio END
         RETURNING id
-    """, (producto, descripcion, imagen, tenant_id, codigo_interno, codigo_barras, ubicacion))
+    """, (producto, descripcion, imagen, tenant_id, codigo_interno, codigo_barras, ubicacion,
+          sufijo_limpio, bool(fraccionable), tipo, costo_srv, precio_srv))
 
     product_id = result[0]["id"]
 
-    # Sincronizar categorías en la tabla pivote (Many-to-Many)
-    _sincronizar_categorias(product_id, categoria, tenant_id)
+    # Sincronizar categorías SOLO si el producto es nuevo: el restock de un
+    # producto existente conserva las categorías que ya tenía (evita que el
+    # default ["General"] las borre en cada restock).
+    if not producto_existia:
+        _sincronizar_categorias(product_id, categoria, tenant_id)
 
-    # Buscar lote existente con mismo costo y precio
+    # ── Servicio/Compuesto: no tienen inventario propio → no se crea lote ──
+    if tipo == "servicio":
+        return {"accion": "servicio_creado", "producto": producto}
+    if tipo == "compuesto":
+        return {"accion": "compuesto_creado", "producto": producto}
+
+    # ── Variaciones ──
+    # Si el producto tiene variaciones, TODO lote DEBE pertenecer a una
+    # variación concreta (cada variación lleva su propio inventario). Si no
+    # tiene variaciones, no se permiten lotes ligados a una variación.
+    vnombre = (variacion or "").strip()
+    variacion_id = None
+    tiene_variaciones = query(
+        "SELECT 1 FROM producto_variaciones v "
+        "JOIN productos p ON p.id = v.producto_id "
+        "WHERE p.Producto = %s AND p.tenant_id = %s LIMIT 1",
+        (producto, tenant_id)
+    )
+    if tiene_variaciones:
+        if not vnombre:
+            return {"ok": False, "tipo": "validacion",
+                    "mensaje": "Este producto tiene variaciones: indica a cuál variación llegó el stock."}
+        var_row = query("""
+            SELECT v.id FROM producto_variaciones v
+            JOIN productos p ON p.id = v.producto_id
+            WHERE p.Producto = %s AND v.nombre = %s AND v.tenant_id = %s
+        """, (producto, vnombre, tenant_id))
+        if not var_row:
+            return {"ok": False, "tipo": "validacion",
+                    "mensaje": f"La variación '{vnombre}' no existe para este producto."}
+        variacion_id = var_row[0]["id"]
+    elif vnombre:
+        return {"ok": False, "tipo": "validacion",
+                "mensaje": "Este producto no tiene variaciones: quita la variación o créala primero en Editar producto."}
+
+    # Buscar lote existente con mismo costo, precio y VARIACIÓN.
+    # Si la etiqueta nueva está vacía, se fusiona con cualquiera (comportamiento
+    # actual); si trae etiqueta, solo se fusiona con un lote de la MISMA
+    # presentación — si no hay match, se crea un lote nuevo con su etiqueta
+    # (evita que la etiqueta se pierda al restockear al mismo precio).
     existente = query("""
         SELECT id_lote FROM lotes
-        WHERE Producto=%s AND Costo=%s AND Precio_Venta=%s AND Estado='Activo' AND tenant_id = %s
+        WHERE producto_id=%s AND Costo=%s AND Precio_Venta=%s AND Estado='Activo' AND tenant_id = %s
+          AND (%s = '' OR COALESCE(etiqueta, '') = %s)
+          AND variacion_id IS NOT DISTINCT FROM %s
         LIMIT 1
-    """, (producto, costo, precio_venta, tenant_id))
+    """, (product_id, costo, precio_venta, tenant_id, etiqueta_limpia, etiqueta_limpia, variacion_id))
 
     if existente:
         execute(
             "UPDATE lotes SET Stock_Lote = Stock_Lote + %s WHERE ID_Lote = %s AND tenant_id = %s",
             (stock, existente[0]["id_lote"], tenant_id)
         )
+        registrar_movimiento_inventario(
+            tenant_id, producto, "entrada", "restock", stock,
+            id_lote=existente[0]["id_lote"], conn=None,
+        )
         return {"accion": "stock_sumado", "producto": producto, "cantidad": stock}
     else:
         id_lote = str(uuid.uuid4())[:12]
-        fecha   = str(datetime.datetime.now(_TZ))
+        fecha   = str(ahora_negocio(tenant_id))
         execute("""
-            INSERT INTO lotes (ID_Lote, Producto, Costo, Precio_Venta,
-                               Stock_Lote, Fecha_Entrada, Estado, tenant_id)
-            VALUES (%s, %s, %s, %s, %s, %s, 'Activo', %s)
-        """, (id_lote, producto, costo, precio_venta, stock, fecha, tenant_id))
+            INSERT INTO lotes (ID_Lote, Producto, producto_id, Costo, Precio_Venta,
+                               Stock_Lote, Fecha_Entrada, fecha_entrada_ts, Estado, tenant_id, etiqueta, variacion_id)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'Activo', %s, %s, %s)
+        """, (id_lote, producto, product_id, costo, precio_venta, stock, fecha, _parsear_ts(fecha), tenant_id, etiqueta_limpia, variacion_id))
+        registrar_movimiento_inventario(
+            tenant_id, producto, "entrada", "restock", stock,
+            id_lote=id_lote, conn=None,
+        )
         return {"accion": "lote_creado", "producto": producto, "id_lote": id_lote}
 
 
-def actualizar_producto(
-    producto: str,
-    descripcion: str,
-    imagen: str,
-    estado: str,
-    categoria: list[str],
-    costo: float | None = None,
-    precio_venta: float | None = None,
-    tenant_id: str = "",
-    nuevo_producto: str | None = None,
-    codigo_interno: str | None = None,
-    codigo_barras: str | None = None,
-    ubicacion: str | None = None
-) -> dict:
-    producto = producto.strip()
-    descripcion = descripcion.strip()
+def actualizar_lote(id_lote: str, costo: float, precio_venta: float, stock: float, tenant_id: str, etiqueta: str | None = None, variacion: str | None = None) -> dict:
     """
-    Actualiza metadatos de un producto y sus categorías (Many-to-Many).
-    Si pasa a Inactivo, desactiva todos sus lotes.
-    Si se proporcionan costo y/o precio_venta, actualiza todos los lotes activos.
-    Si se proporciona nuevo_producto, renombra el producto en todas las tablas.
-    También actualiza codigo_interno, codigo_barras y ubicacion si se proporcionan.
+    Actualiza costo, precio de venta, stock y etiqueta de un lote específico.
+
+    variacion: None = conservar la variación actual;
+               ''    = desvincular el lote de su variación (pasa a base);
+               'Nombre' = reasignar el lote a esa variación del mismo producto.
     """
-    nombre_final = producto
-    if nuevo_producto is not None:
-        nombre_final = nuevo_producto.strip()
-        if nombre_final and nombre_final != producto:
-            # Renombrar en la tabla productos
+    # 0. Reasignar/desvincular la variación del lote si se indica
+    if variacion is not None:
+        vn = (variacion or "").strip()
+        info = query(
+            "SELECT Producto FROM lotes WHERE ID_Lote=%s AND tenant_id=%s",
+            (id_lote, tenant_id)
+        )
+        if not info:
+            return {"ok": False, "mensaje": "Lote no encontrado"}
+        if vn:
+            pid = _resolver_producto_id(info[0]["producto"], tenant_id)
+            var = query(
+                "SELECT id FROM producto_variaciones WHERE producto_id=%s AND nombre=%s AND tenant_id=%s",
+                (pid, vn, tenant_id)
+            ) if pid else []
+            if not var:
+                return {"ok": False, "mensaje": f"La variación '{vn}' no existe para este producto"}
             execute(
-                "UPDATE productos SET Producto=%s, Descripcion=%s, Imagen=%s, Estado=%s, "
-                "codigo_interno=COALESCE(%s, codigo_interno), "
-                "codigo_barras=COALESCE(%s, codigo_barras), "
-                "ubicacion=COALESCE(%s, ubicacion) "
-                "WHERE Producto=%s AND tenant_id=%s",
-                (nombre_final, descripcion, imagen, estado,
-                 codigo_interno, codigo_barras, ubicacion, producto, tenant_id)
+                "UPDATE lotes SET variacion_id=%s WHERE ID_Lote=%s AND tenant_id=%s",
+                (var[0]["id"], id_lote, tenant_id)
             )
-            # Renombrar en lotes
-            execute(
-                "UPDATE lotes SET Producto=%s WHERE Producto=%s AND tenant_id=%s",
-                (nombre_final, producto, tenant_id)
-            )
-            # Renombrar en ventas
-            execute(
-                "UPDATE ventas SET Producto=%s WHERE Producto=%s AND tenant_id=%s",
-                (nombre_final, producto, tenant_id)
-            )
-            # Usar el nuevo nombre para el resto de operaciones
-            producto = nombre_final
         else:
-            # Si nuevo_producto está vacío o es igual, solo actualizar normal
-            execute("""
-                UPDATE productos SET Descripcion=%s, Imagen=%s, Estado=%s,
-                    codigo_interno=COALESCE(%s, codigo_interno),
-                    codigo_barras=COALESCE(%s, codigo_barras),
-                    ubicacion=COALESCE(%s, ubicacion)
-                WHERE Producto=%s AND tenant_id = %s
-            """, (descripcion, imagen, estado, codigo_interno, codigo_barras, ubicacion, producto, tenant_id))
-    else:
-        # Actualizar producto sin renombrar
-        execute("""
-            UPDATE productos SET Descripcion=%s, Imagen=%s, Estado=%s,
-                codigo_interno=COALESCE(%s, codigo_interno),
-                codigo_barras=COALESCE(%s, codigo_barras),
-                ubicacion=COALESCE(%s, ubicacion)
-            WHERE Producto=%s AND tenant_id = %s
-        """, (descripcion, imagen, estado, codigo_interno, codigo_barras, ubicacion, producto, tenant_id))
+            execute(
+                "UPDATE lotes SET variacion_id=NULL WHERE ID_Lote=%s AND tenant_id=%s",
+                (id_lote, tenant_id)
+            )
 
-    # Obtener el ID numérico del producto para la tabla pivote
-    prod = query(
-        "SELECT id FROM productos WHERE Producto = %s AND tenant_id = %s",
-        (producto, tenant_id)
+    # 1. Actualizar el lote (etiqueta: COALESCE mantiene la actual si no se envía)
+    # El stock llega como valor ABSOLUTO: el ledger registra el delta (ajuste).
+    viejo_stock = query(
+        "SELECT Producto, Stock_Lote FROM lotes WHERE ID_Lote=%s AND tenant_id=%s",
+        (id_lote, tenant_id)
     )
-    if prod:
-        # Sincronizar categorías en la tabla pivote
-        _sincronizar_categorias(prod[0]["id"], categoria, tenant_id)
-
-    # Actualizar costo y/o precio de venta en todos los lotes activos
-    if costo is not None:
-        execute(
-            "UPDATE lotes SET Costo=%s WHERE Producto=%s AND Estado='Activo' AND tenant_id=%s",
-            (costo, producto, tenant_id)
-        )
-    if precio_venta is not None:
-        execute(
-            "UPDATE lotes SET Precio_Venta=%s WHERE Producto=%s AND Estado='Activo' AND tenant_id=%s",
-            (precio_venta, producto, tenant_id)
-        )
-
-    if estado == "Inactivo":
-        execute(
-            "UPDATE lotes SET Estado='Inactivo' WHERE Producto=%s AND tenant_id = %s",
-            (producto, tenant_id)
-        )
-    return {"ok": True, "producto": producto, "estado": estado}
-
-
-def listar_categorias(tenant_id: str) -> list[dict]:
-    """
-    Devuelve todas las categorías del tenant con el conteo de productos asociados.
-    Útil para mostrar en la gestión de categorías del frontend.
-    """
-    return query("""
-        SELECT
-            c.id,
-            c.nombre,
-            c.slug,
-            COUNT(pc.producto_id) AS total_productos
-        FROM categorias c
-        LEFT JOIN producto_categorias pc ON pc.categoria_id = c.id
-        WHERE c.tenant_id = %s
-        GROUP BY c.id, c.nombre, c.slug
-        ORDER BY c.nombre ASC
-    """, (tenant_id,))
-
-
-def crear_categoria(nombre: str, tenant_id: str) -> dict:
-    """
-    Crea una categoría nueva para el tenant.
-    Si ya existe, retorna la existente.
-    """
-    nombre = nombre.strip()
-    slug = _slugify(nombre)
-
-    result = query("""
-        INSERT INTO categorias (tenant_id, nombre, slug)
-        VALUES (%s, %s, %s)
-        ON CONFLICT (tenant_id, nombre) DO NOTHING
-        RETURNING id, nombre, slug
-    """, (tenant_id, nombre, slug))
-
-    if not result:
-        # Si no se insertó es porque ya existe, la recuperamos
-        existente = query(
-            "SELECT id, nombre, slug FROM categorias WHERE nombre = %s AND tenant_id = %s",
-            (nombre, tenant_id)
-        )
-        if existente:
-            return {"ok": True, "categoria": existente[0], "mensaje": f"La categoría '{nombre}' ya existía"}
-        return {"ok": False, "mensaje": "Error al crear la categoría"}
-
-    return {"ok": True, "categoria": result[0], "mensaje": f"Categoría '{nombre}' creada"}
-
-
-def renombrar_categoria(viejo_nombre: str, nuevo_nombre: str, tenant_id: str) -> dict:
-    """
-    Cambia el nombre de una categoría y actualiza su slug.
-    Retorna la categoría actualizada o un error si no existe.
-    """
-    viejo_nombre = viejo_nombre.strip()
-    nuevo_nombre = nuevo_nombre.strip()
-    nuevo_slug = _slugify(nuevo_nombre)
-
-    result = query("""
-        UPDATE categorias
-        SET nombre = %s, slug = %s
-        WHERE nombre = %s AND tenant_id = %s
-        RETURNING id, nombre, slug
-    """, (nuevo_nombre, nuevo_slug, viejo_nombre, tenant_id))
-
-    if not result:
-        return {"ok": False, "mensaje": f"Categoría '{viejo_nombre}' no encontrada"}
-
-    return {
-        "ok": True,
-        "categoria": result[0]
-    }
-
-
-def eliminar_categoria_de_productos(categoria: str, tenant_id: str) -> dict:
-    """
-    Elimina una categoría de todos los productos del tenant.
-    Busca la categoría por nombre en la tabla 'categorias',
-    elimina todas las relaciones en 'producto_categorias' y
-    luego elimina la categoría misma.
-    """
-    categoria = categoria.strip()
-
-    # Buscar la categoría por nombre y tenant
-    result = query(
-        "SELECT id FROM categorias WHERE nombre = %s AND tenant_id = %s",
-        (categoria, tenant_id)
-    )
-
-    if not result:
-        return {
-            "ok": True,
-            "categoria_eliminada": categoria,
-            "productos_actualizados": 0
-        }
-
-    cat_id = result[0]["id"]
-
-    # Contar cuántos productos tenían esta categoría
-    affected = query(
-        "SELECT COUNT(*) as count FROM producto_categorias WHERE categoria_id = %s",
-        (cat_id,)
-    )
-    actualizados = affected[0]["count"] if affected else 0
-
-    # Eliminar relaciones en la tabla pivote (CASCADE también lo haría,
-    # pero hacemos DELETE explícito para claridad y control)
-    execute(
-        "DELETE FROM producto_categorias WHERE categoria_id = %s",
-        (cat_id,)
-    )
-
-    # Eliminar la categoría de la tabla madre
-    execute(
-        "DELETE FROM categorias WHERE id = %s AND tenant_id = %s",
-        (cat_id, tenant_id)
-    )
-
-    return {
-        "ok": True,
-        "categoria_eliminada": categoria,
-        "productos_actualizados": actualizados
-    }
-
-
-def actualizar_lote(id_lote: str, costo: float, precio_venta: float, stock: int, tenant_id: str) -> dict:
-    """Actualiza costo, precio de venta y stock de un lote específico."""
-    # 1. Actualizar el lote
     execute("""
-        UPDATE lotes SET Costo=%s, Precio_Venta=%s, Stock_Lote=%s WHERE ID_Lote=%s AND tenant_id = %s
-    """, (costo, precio_venta, stock, id_lote, tenant_id))
+        UPDATE lotes SET Costo=%s, Precio_Venta=%s, Stock_Lote=%s, etiqueta=COALESCE(%s, etiqueta) WHERE ID_Lote=%s AND tenant_id = %s
+    """, (costo, precio_venta, stock, etiqueta, id_lote, tenant_id))
+
+    if viejo_stock:
+        delta = float(stock) - float(viejo_stock[0]["Stock_Lote"] or 0)
+        if abs(delta) > 1e-9:
+            registrar_movimiento_inventario(
+                tenant_id, viejo_stock[0]["producto"], "ajuste", "ajuste_manual", delta,
+                id_lote=id_lote, conn=None,
+            )
 
     # 2. Recalcular ganancias en ventas asociadas a este lote
     execute("""
-        UPDATE ventas 
+        UPDATE ventas
         SET Costo_Unitario = %s,
             Ganancia_Bruta = (Precio_Real - %s) * Cantidad
         WHERE ID_Lote = %s AND Estado = 'Activo' AND tenant_id = %s
     """, (costo, costo, id_lote, tenant_id))
+
+    # 3. Las órdenes que contienen esas ventas deben reflejar la nueva ganancia
+    execute("""
+        UPDATE ordenes o
+        SET total = COALESCE(ag.total, 0),
+            ganancia = COALESCE(ag.ganancia, 0),
+            cantidad_items = COALESCE(ag.unidades, 0),
+            estado = CASE WHEN COALESCE(ag.activos, 0) = 0 THEN 'Anulada' ELSE 'Activa' END
+        FROM (
+            SELECT orden_id,
+                   SUM(total_venta) FILTER (WHERE estado != 'Inactivo') AS total,
+                   SUM(ganancia_bruta) FILTER (WHERE estado != 'Inactivo') AS ganancia,
+                   SUM(cantidad) FILTER (WHERE estado != 'Inactivo') AS unidades,
+                   COUNT(*) FILTER (WHERE estado != 'Inactivo') AS activos
+            FROM ventas
+            WHERE ID_Lote = %s AND tenant_id = %s
+            GROUP BY orden_id
+        ) ag
+        WHERE o.id = ag.orden_id AND o.tenant_id = %s
+    """, (id_lote, tenant_id, tenant_id))
 
     return {"ok": True, "id_lote": id_lote}
 
@@ -492,13 +321,15 @@ def eliminar_lote(id_lote: str, tenant_id: str) -> dict:
     """
     # Obtener información del lote antes de desactivarlo
     info = query(
-        "SELECT Producto FROM lotes WHERE ID_Lote = %s AND tenant_id = %s",
+        "SELECT Producto, producto_id, Stock_Lote FROM lotes WHERE ID_Lote = %s AND tenant_id = %s",
         (id_lote, tenant_id)
     )
     if not info:
         return {"ok": False, "mensaje": "Lote no encontrado"}
 
     producto = info[0]["producto"]
+    stock_previo = float(info[0]["Stock_Lote"] or 0)
+    producto_id = info[0]["producto_id"]
 
     # Marcar el lote como Inactivo y stock en 0
     execute(
@@ -506,19 +337,26 @@ def eliminar_lote(id_lote: str, tenant_id: str) -> dict:
         (id_lote, tenant_id)
     )
 
+    # El stock que tenía el lote sale del inventario por la baja
+    if abs(stock_previo) > 1e-9:
+        registrar_movimiento_inventario(
+            tenant_id, producto, "ajuste", "baja_lote", -stock_previo,
+            id_lote=id_lote, conn=None,
+        )
+
     # Verificar si quedan lotes activos para este producto
     # (descontando el lote que acabamos de desactivar)
     activos_restantes = query(
-        "SELECT COUNT(*) as total FROM lotes WHERE Producto = %s AND Estado = 'Activo' AND tenant_id = %s",
-        (producto, tenant_id)
+        "SELECT COUNT(*) as total FROM lotes WHERE producto_id = %s AND Estado = 'Activo' AND tenant_id = %s",
+        (producto_id, tenant_id)
     )
     producto_desactivado = False
 
     if activos_restantes and activos_restantes[0]["total"] == 0:
         # No quedan lotes activos → desactivar el producto también
         execute(
-            "UPDATE productos SET Estado = 'Inactivo' WHERE Producto = %s AND tenant_id = %s",
-            (producto, tenant_id)
+            "UPDATE productos SET Estado = 'Inactivo' WHERE id = %s AND tenant_id = %s",
+            (producto_id, tenant_id)
         )
         producto_desactivado = True
 
@@ -530,15 +368,116 @@ def eliminar_lote(id_lote: str, tenant_id: str) -> dict:
     }
 
 
+# ==============================================================================
+# Helpers de PEPS (Fase 3): descontar_stock_peps usa estas piezas. El dict de
+# venta se construía 5 veces idéntico → ahora lo arma _registro_venta.
+# ==============================================================================
+
+
+def _registro_venta(
+    producto: str,
+    cantidad: float,
+    precio_lista: float,
+    precio_real: float,
+    costo_unitario: float,
+    id_lote: str,
+    tenant_id: str,
+    fecha: str | None = None,
+) -> dict:
+    """Construye el registro de venta que devuelve descontar_stock_peps."""
+    fecha = fecha or str(ahora_negocio(tenant_id))
+    return {
+        "fecha"          : fecha,
+        "producto"       : producto,
+        "cantidad"       : cantidad,
+        "precio_lista"   : float(precio_lista),
+        "precio_real"    : precio_real,
+        "costo_unitario" : float(costo_unitario),
+        "total_venta"    : precio_real * cantidad,
+        "ganancia_bruta" : (precio_real - float(costo_unitario)) * cantidad,
+        "id_lote"        : id_lote
+    }
+
+
+def _crear_lote_virtual(conn, producto: str, precio_real: float, cantidad: float, tenant_id: str, variacion_id: int | None, fecha: str | None = None) -> tuple[str, str]:
+    """
+    Crea un lote virtual con stock negativo (no hay stock físico que descontar)
+    y devuelve (id_lote, fecha). La fecha se reutiliza en el registro de venta.
+    """
+    nuevo_id = str(uuid.uuid4())[:12]
+    fecha = fecha or str(ahora_negocio(tenant_id))
+    producto_row = _q(conn,
+        "SELECT id FROM productos WHERE Producto = %s AND tenant_id = %s",
+        (producto, tenant_id)
+    )
+    if not producto_row:
+        raise ValueError(f"Producto no encontrado: {producto}")
+    producto_id = producto_row[0]["id"]
+    _e(conn,
+        "INSERT INTO lotes (ID_Lote, Producto, producto_id, Costo, Precio_Venta, Stock_Lote, Fecha_Entrada, fecha_entrada_ts, Estado, tenant_id, variacion_id) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'Activo', %s, %s)",
+        (nuevo_id, producto, producto_id, 0, precio_real, -cantidad, fecha, _parsear_ts(fecha), tenant_id, variacion_id)
+    )
+    return nuevo_id, fecha
+
+
+def _consumir_lotes_peps(conn, lotes: list[dict], producto: str, cantidad_total: float, precio_real: float, tenant_id: str) -> tuple[list[dict], float]:
+    """
+    Primera pasada del PEPS: consume stock de los lotes con inventario positivo
+    en orden de antigüedad. Muta `lotes` in-place (actualiza stock_lote en
+    memoria) para que la segunda pasada vea los valores correctos.
+    Devuelve (ventas_generadas, restante).
+    """
+    ventas_generadas = []
+    restante = cantidad_total
+
+    for lote in lotes:
+        if restante <= 0:
+            break
+        # Solo consumimos de lotes que tengan stock positivo
+        if float(lote["stock_lote"]) <= 0:
+            continue
+
+        consumir    = min(restante, float(lote["stock_lote"]))
+        nuevo_stock = round(float(lote["stock_lote"]) - consumir, 3)
+
+        _e(conn,
+            "UPDATE lotes SET Stock_Lote=%s WHERE ID_Lote=%s AND tenant_id = %s",
+            (nuevo_stock, lote["id_lote"], tenant_id)
+        )
+        # Actualizar el valor en memoria para que la segunda pasada (negativos)
+        # vea el stock correcto, no el valor original de la consulta.
+        lote["stock_lote"] = nuevo_stock
+
+        ventas_generadas.append(_registro_venta(
+            producto, consumir, lote["precio_venta"], precio_real, lote["costo"], lote["id_lote"], tenant_id
+        ))
+        restante -= consumir
+
+    return ventas_generadas, restante
+
+
 def descontar_stock_peps(
     producto: str,
-    cantidad_total: int,
+    cantidad_total: float,
     precio_real: float,
-    tenant_id: str
+    tenant_id: str,
+    id_lote: str | None = None,
+    variacion_id: int | None = None,
+    conn=None
 ) -> list[dict]:
     producto = producto.strip()
     """
     Algoritmo PEPS: descuenta del lote más antiguo primero.
+    
+    Si se proporciona id_lote, descuenta exclusivamente de ese lote específico
+    en lugar de seguir el orden PEPS. Si el lote no tiene suficiente stock,
+    se permite stock negativo (consistente con el comportamiento general).
+    
+    Si se proporciona variacion_id, descuenta SOLO de los lotes de esa
+    variación (stock por variación, Fase 6). Si es None, descuenta solo de
+    los lotes base del producto (variacion_id IS NULL) — el comportamiento
+    estándar.
     
     A diferencia de la versión anterior, ahora PERMITE stock negativo.
     Si no hay suficiente stock físico, se consume todo lo disponible
@@ -548,95 +487,77 @@ def descontar_stock_peps(
     cobrar aunque falte inventario, con la advertencia correspondiente.
     
     Retorna siempre una lista de registros de venta (nunca None).
-    """
-    # Obtenemos TODOS los lotes activos, incluso con stock 0 o negativo
-    # para poder seguir el orden PEPS correctamente
-    lotes = query("""
-        SELECT * FROM lotes
-        WHERE Producto=%s AND Estado='Activo' AND tenant_id = %s
-        ORDER BY Fecha_Entrada ASC
-    """, (producto, tenant_id))
 
-    ventas_generadas = []
-    restante = cantidad_total
+    Si se pasa `conn`, todas las operaciones se ejecutan sobre esa conexión
+    (para poder usarse dentro de una transacción atómica junto con el INSERT
+    de las ventas). Si no se pasa, usa las conexiones del pool global.
+    """
+    # ── Si se especificó un lote concreto, descontar solo de ese lote ──
+    if id_lote is not None:
+        lotes = _q(conn, """
+            SELECT * FROM lotes
+            WHERE ID_Lote=%s AND producto_id=(SELECT id FROM productos WHERE Producto=%s AND tenant_id=%s)
+              AND Estado='Activo' AND tenant_id = %s
+            FOR UPDATE
+        """, (id_lote, producto, tenant_id, tenant_id))
+
+        if not lotes:
+            # Si no existe el lote, crear uno virtual con stock negativo
+            # (comportamiento consistente con el PEPS normal)
+            nuevo_id, fecha = _crear_lote_virtual(conn, producto, precio_real, cantidad_total, tenant_id, variacion_id)
+            return [_registro_venta(producto, cantidad_total, precio_real, precio_real, 0, nuevo_id, tenant_id, fecha=fecha)]
+
+        lote = lotes[0]
+        nuevo_stock = round(float(lote["stock_lote"]) - cantidad_total, 3)
+        _e(conn,
+            "UPDATE lotes SET Stock_Lote=%s WHERE ID_Lote=%s AND tenant_id = %s",
+            (nuevo_stock, id_lote, tenant_id)
+        )
+
+        return [_registro_venta(
+            producto, cantidad_total, lote["precio_venta"], precio_real, lote["costo"], lote["id_lote"], tenant_id
+        )]
+
+    # ── PEPS normal (sin lote específico) ──
+    # Obtenemos TODOS los lotes activos de esa variación (o base si no se
+    # indica), incluso con stock 0 o negativo para seguir el orden PEPS.
+    producto_row = _q(conn,
+        "SELECT id FROM productos WHERE Producto = %s AND tenant_id = %s",
+        (producto, tenant_id)
+    )
+    if not producto_row:
+        raise ValueError(f"Producto no encontrado: {producto}")
+    producto_id = producto_row[0]["id"]
+
+    lotes = _q(conn, """
+        SELECT * FROM lotes
+        WHERE producto_id=%s AND Estado='Activo' AND tenant_id = %s
+          AND variacion_id IS NOT DISTINCT FROM %s
+        ORDER BY Fecha_Entrada ASC
+        FOR UPDATE
+    """, (producto_id, tenant_id, variacion_id))
 
     # --- Primera pasada: consumir stock de lotes con inventario positivo ---
-    for lote in lotes:
-        if restante <= 0:
-            break
-
-        # Solo consumimos de lotes que tengan stock positivo
-        if int(lote["stock_lote"]) <= 0:
-            continue
-
-        consumir    = min(restante, int(lote["stock_lote"]))
-        nuevo_stock = int(lote["stock_lote"]) - consumir
-
-        execute(
-            "UPDATE lotes SET Stock_Lote=%s WHERE ID_Lote=%s AND tenant_id = %s",
-            (nuevo_stock, lote["id_lote"], tenant_id)
-        )
-        
-        # Actualizar el valor en memoria para que la segunda pasada (negativos)
-        # vea el stock correcto, no el valor original de la consulta.
-        lote["stock_lote"] = nuevo_stock
-
-        ventas_generadas.append({
-            "fecha"          : str(datetime.datetime.now(_TZ)),
-            "producto"       : producto,
-            "cantidad"       : consumir,
-            "precio_lista"   : float(lote["precio_venta"]),
-            "precio_real"    : precio_real,
-            "costo_unitario" : float(lote["costo"]),
-            "total_venta"    : precio_real * consumir,
-            "ganancia_bruta" : (precio_real - float(lote["costo"])) * consumir,
-            "id_lote"        : lote["id_lote"]
-        })
-        restante -= consumir
+    ventas_generadas, restante = _consumir_lotes_peps(conn, lotes, producto, cantidad_total, precio_real, tenant_id)
 
     # --- Segunda pasada: si aún falta stock, lo descontamos del lote más reciente (stock negativo) ---
     if restante > 0:
         if lotes:
             # Usamos el lote más reciente (último del orden PEPS = último insertado)
             lote_destino = lotes[-1]
-            nuevo_stock = int(lote_destino["stock_lote"]) - restante
-            
-            execute(
+            nuevo_stock = round(float(lote_destino["stock_lote"]) - restante, 3)
+
+            _e(conn,
                 "UPDATE lotes SET Stock_Lote=%s WHERE ID_Lote=%s AND tenant_id = %s",
                 (nuevo_stock, lote_destino["id_lote"], tenant_id)
             )
-            
-            ventas_generadas.append({
-                "fecha"          : str(datetime.datetime.now(_TZ)),
-                "producto"       : producto,
-                "cantidad"       : restante,
-                "precio_lista"   : float(lote_destino["precio_venta"]),
-                "precio_real"    : precio_real,
-                "costo_unitario" : float(lote_destino["costo"]),
-                "total_venta"    : precio_real * restante,
-                "ganancia_bruta" : (precio_real - float(lote_destino["costo"])) * restante,
-                "id_lote"        : lote_destino["id_lote"]
-            })
+
+            ventas_generadas.append(_registro_venta(
+                producto, restante, lote_destino["precio_venta"], precio_real, lote_destino["costo"], lote_destino["id_lote"], tenant_id
+            ))
         else:
             # No existe ningún lote para este producto — creamos uno virtual con stock negativo
-            id_lote   = str(uuid.uuid4())[:12]
-            fecha     = str(datetime.datetime.now(_TZ))
-            
-            execute(
-                "INSERT INTO lotes (ID_Lote, Producto, Costo, Precio_Venta, Stock_Lote, Fecha_Entrada, Estado, tenant_id) VALUES (%s, %s, %s, %s, %s, %s, 'Activo', %s)",
-                (id_lote, producto, 0, precio_real, -restante, fecha, tenant_id)
-            )
-            
-            ventas_generadas.append({
-                "fecha"          : fecha,
-                "producto"       : producto,
-                "cantidad"       : restante,
-                "precio_lista"   : precio_real,
-                "precio_real"    : precio_real,
-                "costo_unitario" : 0,
-                "total_venta"    : precio_real * restante,
-                "ganancia_bruta" : precio_real * restante,
-                "id_lote"        : id_lote
-            })
+            nuevo_id_l, fecha = _crear_lote_virtual(conn, producto, precio_real, restante, tenant_id, variacion_id)
+            ventas_generadas.append(_registro_venta(producto, restante, precio_real, precio_real, 0, nuevo_id_l, tenant_id, fecha=fecha))
 
     return ventas_generadas
