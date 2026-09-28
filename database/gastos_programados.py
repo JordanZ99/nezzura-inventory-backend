@@ -6,6 +6,7 @@
 import calendar
 from zoneinfo import ZoneInfo
 from database.conexion import execute, get_conn, release_conn
+from database.fechas import sql_fecha_local, params_zona
 from psycopg2.extras import RealDictCursor
 from datetime import date, datetime, timedelta
 
@@ -98,12 +99,16 @@ def _calcular_inicio_periodo(ultima_ejecucion_raw, tenant_id, cur, fallback_str:
             return (ue_date + timedelta(days=1)).isoformat()
 
     # Sin ejecución previa → desde la primera venta registrada
+    # (MIN(fecha) sobre el instante normalizado UTC → instante más antiguo;
+    # devolvemos su FECHA LOCAL para mantener el contrato YYYY-MM-DD)
     cur.execute(
-        "SELECT MIN(fecha) FROM ventas WHERE tenant_id = %s",
-        (tenant_id,)
+        "SELECT MIN(" + sql_fecha_local() + ")::date AS min_fecha "
+        "FROM ventas v JOIN tenants t ON t.id = v.tenant_id "
+        "WHERE v.tenant_id = %s",
+        {**params_zona(_TZ.key), "tid": tenant_id}
     )
     row = cur.fetchone()
-    min_fecha = row["min"] if row and "min" in row else None
+    min_fecha = str(row["min_fecha"]) if row and row["min_fecha"] else None
     return min_fecha if min_fecha else fallback_str
 
 
@@ -155,21 +160,30 @@ def ejecutar_gasto_programado(regla_id: str, tenant_id: str) -> dict:
                 fin = _hoy().isoformat()
 
                 # ── 1. SUM(ganancia_bruta) de ventas activas en el período ──
+                # La fecha se normaliza a la zona del tenant antes de comparar:
+                # evita que ventas nocturnas (guardadas en UTC) caigan en el día
+                # equivocado del Corte de Caja (bug validado: 9.6% de registros).
                 cur.execute(
-                    "SELECT COALESCE(SUM(ganancia_bruta), 0) AS total FROM ventas "
-                    "WHERE tenant_id = %s AND estado != 'Inactivo' "
-                    "AND fecha::date >= %s::date AND fecha::date <= %s::date",
-                    (tenant_id, inicio, fin)
+                    "SELECT COALESCE(SUM(ganancia_bruta), 0) AS total FROM ventas v "
+                    "JOIN tenants t ON t.id = v.tenant_id "
+                    "WHERE v.tenant_id = %(tid)s AND v.estado != 'Inactivo' "
+                    "AND (" + sql_fecha_local() + ")::date >= %(inicio)s::date "
+                    "AND (" + sql_fecha_local() + ")::date <= %(fin)s::date",
+                    {**params_zona(_TZ.key), "tid": tenant_id, "inicio": inicio, "fin": fin}
                 )
                 row = cur.fetchone()
                 ganancia_bruta = float(row["total"]) if row and row["total"] is not None else 0.0
 
                 # ── 2. SUM(gastos.monto) histórico del período (ANTES de este gasto) ──
+                # Misma normalización: gastos.fecha también tiene formatos mixtos
+                # (ISO del frontend y fechas simples del motor de programados).
                 cur.execute(
-                    "SELECT COALESCE(SUM(monto), 0) AS total FROM gastos "
-                    "WHERE tenant_id = %s "
-                    "AND fecha::date >= %s::date AND fecha::date <= %s::date",
-                    (tenant_id, inicio, fin)
+                    "SELECT COALESCE(SUM(monto), 0) AS total FROM gastos g "
+                    "JOIN tenants t ON t.id = g.tenant_id "
+                    "WHERE g.tenant_id = %(tid)s "
+                    "AND (" + sql_fecha_local() + ")::date >= %(inicio)s::date "
+                    "AND (" + sql_fecha_local() + ")::date <= %(fin)s::date",
+                    {**params_zona(_TZ.key), "tid": tenant_id, "inicio": inicio, "fin": fin}
                 )
                 row = cur.fetchone()
                 total_gastos = float(row["total"]) if row and row["total"] is not None else 0.0
@@ -251,12 +265,14 @@ def verificar_y_generar_gastos_programados(tenant_id: str) -> dict:
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             # ── Paso A: Reglas vencidas ──
+            # proxima_fecha es una FECHA SIMPLE local (YYYY-MM-DD): comparar
+            # directo contra CURRENT_DATE, sin cast ni normalización.
             cur.execute(
                 "SELECT id, nombre, tipo, valor, frecuencia, "
                 "       proxima_fecha, ultima_ejecucion "
                 "FROM gastos_programados "
                 "WHERE tenant_id = %s "
-                "AND proxima_fecha::date <= CURRENT_DATE",
+                "AND proxima_fecha <= CURRENT_DATE::text",
                 (tenant_id,)
             )
             reglas = cur.fetchall()
@@ -287,21 +303,27 @@ def verificar_y_generar_gastos_programados(tenant_id: str) -> dict:
                     fin_periodo = proxima_fecha
 
                     # ── 1. SUM(ganancia_bruta) de ventas activas en el período ──
+                    # Normalización TZ idéntica a la ejecución manual (ver arriba).
                     cur.execute(
-                        "SELECT COALESCE(SUM(ganancia_bruta), 0) AS total FROM ventas "
-                        "WHERE tenant_id = %s AND estado != 'Inactivo' "
-                        "AND fecha::date >= %s::date AND fecha::date <= %s::date",
-                        (tenant_id, inicio_periodo, fin_periodo)
+                        "SELECT COALESCE(SUM(ganancia_bruta), 0) AS total FROM ventas v "
+                        "JOIN tenants t ON t.id = v.tenant_id "
+                        "WHERE v.tenant_id = %(tid)s AND v.estado != 'Inactivo' "
+                        "AND (" + sql_fecha_local() + ")::date >= %(inicio)s::date "
+                        "AND (" + sql_fecha_local() + ")::date <= %(fin)s::date",
+                        {**params_zona(_TZ.key), "tid": tenant_id, "inicio": inicio_periodo, "fin": fin_periodo}
                     )
                     row = cur.fetchone()
                     ganancia_bruta = float(row["total"]) if row and row["total"] is not None else 0.0
 
                     # ── 2. SUM(gastos.monto) histórico del período (ANTES de este gasto) ──
+                    # Misma normalización TZ (formatos mixtos también en gastos).
                     cur.execute(
-                        "SELECT COALESCE(SUM(monto), 0) AS total FROM gastos "
-                        "WHERE tenant_id = %s "
-                        "AND fecha::date >= %s::date AND fecha::date <= %s::date",
-                        (tenant_id, inicio_periodo, fin_periodo)
+                        "SELECT COALESCE(SUM(monto), 0) AS total FROM gastos g "
+                        "JOIN tenants t ON t.id = g.tenant_id "
+                        "WHERE g.tenant_id = %(tid)s "
+                        "AND (" + sql_fecha_local() + ")::date >= %(inicio)s::date "
+                        "AND (" + sql_fecha_local() + ")::date <= %(fin)s::date",
+                        {**params_zona(_TZ.key), "tid": tenant_id, "inicio": inicio_periodo, "fin": fin_periodo}
                     )
                     row = cur.fetchone()
                     total_gastos = float(row["total"]) if row and row["total"] is not None else 0.0
@@ -324,10 +346,12 @@ def verificar_y_generar_gastos_programados(tenant_id: str) -> dict:
                 )
 
                 # ── Paso D: Avanzar proxima_fecha y marcar ultima_ejecucion ──
+                # proxima_fecha es una FECHA SIMPLE local: sumar días directamente
+                # sobre date (sin timestamptz) para no desplazar por zona horaria.
                 intervalo = _intervalo_sql(frecuencia)
                 cur.execute(
                     "UPDATE gastos_programados "
-                    "SET proxima_fecha = (proxima_fecha::date + INTERVAL %s)::text, "
+                    "SET proxima_fecha = (proxima_fecha::date + INTERVAL %s)::date::text, "
                     "    ultima_ejecucion = CURRENT_TIMESTAMP "
                     "WHERE id = %s AND tenant_id = %s",
                     (intervalo, rid, tenant_id)
