@@ -78,10 +78,42 @@ def execute(sql: str, params: tuple = None) -> None:
         release_conn(conn)
 
 
+def _solo_comentarios(stmt: str) -> bool:
+    """True si el statement vaciado no contiene nada ejecutable: solo
+    comentarios de línea/bloque y espacios."""
+    en_comentario_linea = False
+    en_comentario_bloque = False
+    i = 0
+    n = len(stmt)
+    while i < n:
+        if en_comentario_linea:
+            if stmt[i] in ("\n", "\r"):
+                en_comentario_linea = False
+        elif en_comentario_bloque:
+            if stmt.startswith("*/", i):
+                en_comentario_bloque = False
+                i += 2
+                continue
+        elif stmt.startswith("--", i):
+            en_comentario_linea = True
+            i += 2
+            continue
+        elif stmt.startswith("/*", i):
+            en_comentario_bloque = True
+            i += 2
+            continue
+        elif not stmt[i].isspace():
+            return False  # hay algo no-comentario
+        i += 1
+    return True
+
+
 def _dividir_sql(sql: str) -> list[str]:
     """Divide un script SQL en statements individuales, respetando bloques
     $$...$$ (las migraciones 003/006 usan DO blocks con `;` internos), así como
-    comentarios de línea (--), comentarios de bloque (/* ... */) y cadenas literales ('...')."""
+    comentarios de línea (--), comentarios de bloque (/* ... */) y cadenas literales ('...').
+    Los statements que solo contienen comentarios se descartan (no hay nada
+    que ejecutar y psycopg2 rechaza la cadena vacía-like)."""
     statements = []
     actual = []
     i = 0
@@ -135,7 +167,7 @@ def _dividir_sql(sql: str) -> list[str]:
                 en_cadena = True
             elif c == ";" and not en_dolar:
                 stmt = "".join(actual).strip()
-                if stmt:
+                if stmt and not _solo_comentarios(stmt):
                     statements.append(stmt)
                 actual = []
                 i += 1
@@ -145,7 +177,7 @@ def _dividir_sql(sql: str) -> list[str]:
         i += 1
         
     stmt = "".join(actual).strip()
-    if stmt:
+    if stmt and not _solo_comentarios(stmt):
         statements.append(stmt)
     return statements
 
@@ -158,24 +190,39 @@ def _ejecutar_migraciones(cur) -> None:
     inline en inicializar_db() (con comentarios tipo "misma columna que 005..."),
     lo que generaba drift silencioso si solo se cambiaba uno de los dos lugares.
 
-    Cada statement va en su propio try/except (mismo comportamiento tolerante
-    que el código anterior): un fallo puntual —tabla/columna que aún no existe,
-    migración ya aplicada— no detiene el resto ni rompe el arranque.
+    Control de aplicadas: tabla schema_migrations. Cada migración corre en SU
+    PROPIA transacción (inserta su fila de control y hace commit al terminar):
+    las 49 previas no están registradas y todas son idempotentes, así que se
+    re-ejecutan una última vez y quedan selladas.
+
+    Un fallo AHORA es fatal: aborta el resto y relanza, para que la migración
+    rota no quede aplicada a medias en silencio. (Antes cada statement iba en
+    su propio try/except que solo imprimía.)
     """
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+            nombre      TEXT PRIMARY KEY,
+            aplicada_en TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+    """)
     directorio = Path(__file__).resolve().parent.parent / "migrations"
     if not directorio.exists():
         return
     for archivo in sorted(directorio.glob("*.sql")):
+        cur.execute(
+            "SELECT 1 FROM schema_migrations WHERE nombre = %s", (archivo.name,))
+        if cur.fetchone():
+            continue
         try:
             sql = archivo.read_text(encoding="utf-8")
         except Exception as e:
-            print(f"Error leyendo {archivo.name}: {e}")
-            continue
+            raise RuntimeError(f"No se pudo leer la migración {archivo.name}: {e}") from e
+        print(f"Migración {archivo.name}...")
         for stmt in _dividir_sql(sql):
-            try:
-                cur.execute(stmt)
-            except Exception as e:
-                print(f"Migración {archivo.name}: {e}")
+            cur.execute(stmt)
+        # La migración completa fue exitosa: sellarla para no re-ejecutarla.
+        cur.execute(
+            "INSERT INTO schema_migrations (nombre) VALUES (%s)", (archivo.name,))
 
 
 def inicializar_db():
@@ -282,7 +329,8 @@ def inicializar_db():
             # Antes, cada migración (005-025) estaba DUPLICADA inline aquí con
             # comentarios tipo "misma columna que 005..." — dos fuentes de verdad
             # que podían divergir en silencio. El runner ejecuta los archivos en
-            # orden; cada statement en su propio try/except (tolerante a fallos).
+            # orden con control de aplicadas (schema_migrations): si una falla,
+            # inicializar_db() falla y se reintenta en el próximo arranque.
             _ejecutar_migraciones(cur)
 
         conn.commit()
