@@ -202,7 +202,7 @@ def actualizar_config_catalogo(
         # Solo se guardan las claves conocidas del bloque hero (esto explica el
         # subset check): el editor manda el layout COMPLETO al instante, claves
         # nuevas de Fase 2 se agregan aquí. texto_posicion con whitelist.
-        permitidas = {"texto_posicion", "mostrar_logo", "mostrar_redes", "mostrar_boton", "elementos"}
+        permitidas = {"texto_posicion", "mostrar_logo", "mostrar_redes", "mostrar_boton", "elementos", "elementos_movil"}
         if not set(layout.keys()).issubset(permitidas):
             raise HTTPException(status_code=422, detail="hero_layout contiene claves no permitidas")
         if layout.get("texto_posicion") is not None and layout["texto_posicion"] not in ("centro", "arriba-izq", "abajo-izq"):
