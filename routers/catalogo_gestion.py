@@ -200,7 +200,7 @@ def actualizar_config_catalogo(
         # Solo se guardan las claves conocidas del bloque hero (esto explica el
         # subset check): el editor manda el layout COMPLETO al instante, claves
         # nuevas de Fase 2 se agregan aquí. texto_posicion con whitelist.
-        permitidas = {"texto_posicion", "mostrar_logo", "mostrar_redes", "mostrar_boton"}
+        permitidas = {"texto_posicion", "mostrar_logo", "mostrar_redes", "mostrar_boton", "elementos"}
         if not set(layout.keys()).issubset(permitidas):
             raise HTTPException(status_code=422, detail="hero_layout contiene claves no permitidas")
         if layout.get("texto_posicion") is not None and layout["texto_posicion"] not in ("centro", "arriba-izq", "abajo-izq"):
@@ -208,6 +208,53 @@ def actualizar_config_catalogo(
         for clave in ("mostrar_logo", "mostrar_redes", "mostrar_boton"):
             if layout.get(clave) is not None and not isinstance(layout[clave], bool):
                 raise HTTPException(status_code=422, detail=f"{clave} debe ser booleano")
+        # Mini-canva (Fase 2): elementos posicionados libremente. EL body manda
+        # el array completo (estado final tras cada gesto del editor).
+        # Coordenadas en % del hero (0-100).
+        if "elementos" in layout:
+            elementos = layout["elementos"]
+            if not isinstance(elementos, list) or len(elementos) > 30:
+                raise HTTPException(status_code=422, detail="elementos debe ser una lista de hasta 30 elementos")
+            claves_elem = {"id", "tipo", "x", "y", "w", "texto", "fuente", "tamano", "color", "peso", "align"}
+            tipos_elem = ("texto", "redes", "boton")
+            vistos: set = set()
+            for el in elementos:
+                if not isinstance(el, dict) or not set(el.keys()).issubset(claves_elem):
+                    raise HTTPException(status_code=422, detail="elementos contiene campos no permitidos")
+                if el.get("tipo") not in tipos_elem:
+                    raise HTTPException(status_code=422, detail="tipo debe ser texto, redes o boton")
+                try:
+                    x = float(el["x"]); y = float(el["y"])
+                except (TypeError, KeyError, ValueError):
+                    raise HTTPException(status_code=422, detail="cada elemento necesita x e y numéricos")
+                if not (0 <= x <= 100 and 0 <= y <= 100):
+                    raise HTTPException(status_code=422, detail="x e y deben estar entre 0 y 100")
+                if el.get("w") is not None:
+                    w = float(el["w"])
+                    if not (2 <= w <= 100):
+                        raise HTTPException(status_code=422, detail="w debe estar entre 2 y 100")
+                if el.get("tamano") is not None:
+                    t = float(el["tamano"])
+                    if not (8 <= t <= 240):
+                        raise HTTPException(status_code=422, detail="tamano debe estar entre 8 y 240")
+                if el.get("texto") is not None:
+                    if not isinstance(el["texto"], str) or len(el["texto"]) > 300:
+                        raise HTTPException(status_code=422, detail="texto demasiado largo")
+                if el.get("fuente") is not None and el["fuente"] not in _FUENTES_CATALOGO:
+                    raise HTTPException(status_code=422, detail="Fuente del elemento no reconocida")
+                if el.get("color") is not None:
+                    _validar_color_texto(el["color"], "color del elemento")
+                if el.get("peso") is not None:
+                    if not (isinstance(el["peso"], str) and str(el["peso"]) in ("400", "600", "700", "800")):
+                        raise HTTPException(status_code=422, detail="peso debe ser 400, 600, 700 u 800")
+                if el.get("align") is not None:
+                    if el["align"] not in ("left", "center", "right"):
+                        raise HTTPException(status_code=422, detail="align debe ser left, center o right")
+                eid = el.get("id")
+                if eid in vistos:
+                    raise HTTPException(status_code=422, detail="ids de elementos duplicados")
+                if eid is not None:
+                    vistos.add(eid)
         campos.append("hero_layout = COALESCE(hero_layout, '{}'::jsonb) || %s::jsonb")
         valores.append(json.dumps(layout))
 
