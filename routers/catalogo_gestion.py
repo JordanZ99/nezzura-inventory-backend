@@ -244,8 +244,8 @@ def actualizar_config_catalogo(
                         raise HTTPException(status_code=422, detail="w debe estar entre 2 y 100")
                 if el.get("tamano") is not None:
                     t = float(el["tamano"])
-                    if not (8 <= t <= 240):
-                        raise HTTPException(status_code=422, detail="tamano debe estar entre 8 y 240")
+                    if not (8 <= t <= 320):
+                        raise HTTPException(status_code=422, detail="tamano debe estar entre 8 y 320")
                 if el.get("texto") is not None:
                     if not isinstance(el["texto"], str) or len(el["texto"]) > 300:
                         raise HTTPException(status_code=422, detail="texto demasiado largo")
