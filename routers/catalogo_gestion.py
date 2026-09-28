@@ -44,6 +44,7 @@ def obtener_config_catalogo(tenant_id: str = Depends(get_tenant_id)):
         "       cc.mostrar_precios, cc.mostrar_stock, cc.mostrar_categorias, cc.agrupar_por_categoria, cc.columnas_movil, cc.permitir_descarga, cc.ocultar_agotados, cc.relacion_imagen, "
         "       cc.banner_url, cc.banner_url_movil, cc.hero_estilo, cc.banner_texto_color, cc.banner_mostrar_texto, cc.banner_mostrar_logo, cc.anuncio_texto, "
         "       cc.fondo_url, cc.fondo_modo, cc.fondo_opacidad, cc.fondo_color, "
+        "       cc.hero_url, cc.hero_url_movil, cc.hero_color, cc.hero_opacidad, "
         "       cc.created_at, "
         "       t.logo AS logo "
         "FROM catalogo_config cc "
@@ -62,6 +63,7 @@ def obtener_config_catalogo(tenant_id: str = Depends(get_tenant_id)):
             "       cc.mostrar_precios, cc.mostrar_stock, cc.mostrar_categorias, cc.agrupar_por_categoria, cc.columnas_movil, cc.permitir_descarga, cc.ocultar_agotados, cc.relacion_imagen, "
             "       cc.banner_url, cc.banner_url_movil, cc.hero_estilo, cc.banner_texto_color, cc.banner_mostrar_texto, cc.banner_mostrar_logo, cc.anuncio_texto, "
             "       cc.fondo_url, cc.fondo_modo, cc.fondo_opacidad, cc.fondo_color, "
+            "       cc.hero_url, cc.hero_url_movil, cc.hero_color, cc.hero_opacidad, "
             "       cc.created_at, "
             "       t.logo AS logo "
             "FROM catalogo_config cc "
@@ -175,6 +177,21 @@ def actualizar_config_catalogo(
     if data.relacion_imagen is not None:
         campos.append("relacion_imagen = %s")
         valores.append(data.relacion_imagen)
+    # Modo Hero de la portada (migración 047)
+    if data.hero_url is not None:
+        campos.append("hero_url = %s")
+        valores.append(data.hero_url)
+    if data.hero_url_movil is not None:
+        campos.append("hero_url_movil = %s")
+        valores.append(data.hero_url_movil)
+    if data.hero_opacidad is not None:
+        campos.append("hero_opacidad = %s")
+        valores.append(data.hero_opacidad)
+    if data.hero_color is not None:
+        # Color del velo: hex #RRGGBB o cadena vacía (= gradiente del tema)
+        _validar_color_texto(data.hero_color, "hero_color")
+        campos.append("hero_color = %s")
+        valores.append(data.hero_color)
 
     if not campos:
         return {"ok": True, "mensaje": "Nada que actualizar"}

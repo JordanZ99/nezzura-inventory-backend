@@ -43,6 +43,11 @@ class ActualizarCatalogo(BaseModel):
     fondo_modo: Optional[ModoFondoEnum] = None
     fondo_opacidad: Optional[int] = Field(None, ge=0, le=100, description="Opacidad de la imagen sobre el color de fondo (0-100)")
     fondo_color: Optional[str] = None
+    # Modo Hero de la portada (migración 047): imagen a pantalla completa
+    hero_url: Optional[str] = None
+    hero_url_movil: Optional[str] = None
+    hero_color: Optional[str] = None
+    hero_opacidad: Optional[int] = Field(None, ge=0, le=100, description="Opacidad del velo sobre la imagen hero (0-100)")
 
 
 class ActualizarPostConfig(BaseModel):

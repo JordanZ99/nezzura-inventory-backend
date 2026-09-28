@@ -50,6 +50,7 @@ def obtener_catalogo_publico(slug: str, response: Response):
         "       cc.mostrar_precios, cc.mostrar_stock, cc.mostrar_categorias, cc.agrupar_por_categoria, cc.columnas_movil, cc.permitir_descarga, cc.ocultar_agotados, cc.relacion_imagen, "
         "       cc.banner_url, cc.banner_url_movil, cc.hero_estilo, cc.banner_texto_color, cc.banner_mostrar_texto, cc.banner_mostrar_logo, cc.anuncio_texto, "
         "       cc.fondo_url, cc.fondo_modo, cc.fondo_opacidad, cc.fondo_color, "
+        "       cc.hero_url, cc.hero_url_movil, cc.hero_color, cc.hero_opacidad, "
         "       t.logo, t.telefono, t.correo, t.instagram, t.facebook, t.tiktok, t.sitio_web, t.maps "
         "FROM catalogo_config cc "
         "LEFT JOIN tenants t ON cc.tenant_id = t.id "
@@ -211,6 +212,11 @@ def obtener_catalogo_publico(slug: str, response: Response):
             "fondo_modo": cfg.get("fondo_modo") if cfg.get("fondo_modo") in ("cover", "repeat") else "cover",
             "fondo_opacidad": int(cfg["fondo_opacidad"]) if cfg.get("fondo_opacidad") is not None else 100,
             "fondo_color": cfg.get("fondo_color") or "",
+            # Modo Hero de la portada (migración 047)
+            "hero_url": cfg.get("hero_url") or "",
+            "hero_url_movil": cfg.get("hero_url_movil") or "",
+            "hero_color": cfg.get("hero_color") or "",
+            "hero_opacidad": int(cfg["hero_opacidad"]) if cfg.get("hero_opacidad") is not None else 40,
         },
         "productos": productos,
         "orden_categorias": mapa_orden,
