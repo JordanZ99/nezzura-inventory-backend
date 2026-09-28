@@ -44,7 +44,7 @@ def obtener_config_catalogo(tenant_id: str = Depends(get_tenant_id)):
         "       cc.mostrar_precios, cc.mostrar_stock, cc.mostrar_categorias, cc.agrupar_por_categoria, cc.columnas_movil, cc.permitir_descarga, cc.ocultar_agotados, cc.relacion_imagen, "
         "       cc.banner_url, cc.banner_url_movil, cc.hero_estilo, cc.banner_texto_color, cc.banner_mostrar_texto, cc.banner_mostrar_logo, cc.anuncio_texto, "
         "       cc.fondo_url, cc.fondo_modo, cc.fondo_opacidad, cc.fondo_color, "
-        "       cc.hero_url, cc.hero_url_movil, cc.hero_color, cc.hero_opacidad, "
+        "       cc.hero_url, cc.hero_url_movil, cc.hero_color, cc.hero_opacidad, cc.hero_layout, "
         "       cc.created_at, "
         "       t.logo AS logo "
         "FROM catalogo_config cc "
@@ -63,8 +63,8 @@ def obtener_config_catalogo(tenant_id: str = Depends(get_tenant_id)):
             "       cc.mostrar_precios, cc.mostrar_stock, cc.mostrar_categorias, cc.agrupar_por_categoria, cc.columnas_movil, cc.permitir_descarga, cc.ocultar_agotados, cc.relacion_imagen, "
             "       cc.banner_url, cc.banner_url_movil, cc.hero_estilo, cc.banner_texto_color, cc.banner_mostrar_texto, cc.banner_mostrar_logo, cc.anuncio_texto, "
             "       cc.fondo_url, cc.fondo_modo, cc.fondo_opacidad, cc.fondo_color, "
-            "       cc.hero_url, cc.hero_url_movil, cc.hero_color, cc.hero_opacidad, "
-            "       cc.created_at, "
+        "       cc.hero_url, cc.hero_url_movil, cc.hero_color, cc.hero_opacidad, cc.hero_layout, "
+        "       cc.created_at, "
             "       t.logo AS logo "
             "FROM catalogo_config cc "
             "LEFT JOIN tenants t ON cc.tenant_id = t.id "
@@ -192,6 +192,24 @@ def actualizar_config_catalogo(
         _validar_color_texto(data.hero_color, "hero_color")
         campos.append("hero_color = %s")
         valores.append(data.hero_color)
+    # Layout personalizable del hero (migración 049, Fase 1)
+    if data.hero_layout is not None:
+        layout = data.hero_layout
+        if not isinstance(layout, dict):
+            raise HTTPException(status_code=422, detail="hero_layout debe ser un objeto")
+        # Solo se guardan las claves conocidas del bloque hero (esto explica el
+        # subset check): el editor manda el layout COMPLETO al instante, claves
+        # nuevas de Fase 2 se agregan aquí. texto_posicion con whitelist.
+        permitidas = {"texto_posicion", "mostrar_logo", "mostrar_redes", "mostrar_boton"}
+        if not set(layout.keys()).issubset(permitidas):
+            raise HTTPException(status_code=422, detail="hero_layout contiene claves no permitidas")
+        if layout.get("texto_posicion") is not None and layout["texto_posicion"] not in ("centro", "arriba-izq", "abajo-izq"):
+            raise HTTPException(status_code=422, detail="texto_posicion debe ser centro, arriba-izq o abajo-izq")
+        for clave in ("mostrar_logo", "mostrar_redes", "mostrar_boton"):
+            if layout.get(clave) is not None and not isinstance(layout[clave], bool):
+                raise HTTPException(status_code=422, detail=f"{clave} debe ser booleano")
+        campos.append("hero_layout = COALESCE(hero_layout, '{}'::jsonb) || %s::jsonb")
+        valores.append(json.dumps(layout))
 
     if not campos:
         return {"ok": True, "mensaje": "Nada que actualizar"}

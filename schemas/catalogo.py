@@ -48,6 +48,9 @@ class ActualizarCatalogo(BaseModel):
     hero_url_movil: Optional[str] = None
     hero_color: Optional[str] = None
     hero_opacidad: Optional[int] = Field(None, ge=0, le=100, description="Opacidad del velo sobre la imagen hero (0-100)")
+    # Layout personalizable del hero (migración 049, Fase 1): dict PARCIAL de
+    # reglas bajo el bloque 'hero' del editor. Valores permitidos en el router.
+    hero_layout: Optional[dict] = None
 
 
 class ActualizarPostConfig(BaseModel):

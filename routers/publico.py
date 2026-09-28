@@ -50,7 +50,7 @@ def obtener_catalogo_publico(slug: str, response: Response):
         "       cc.mostrar_precios, cc.mostrar_stock, cc.mostrar_categorias, cc.agrupar_por_categoria, cc.columnas_movil, cc.permitir_descarga, cc.ocultar_agotados, cc.relacion_imagen, "
         "       cc.banner_url, cc.banner_url_movil, cc.hero_estilo, cc.banner_texto_color, cc.banner_mostrar_texto, cc.banner_mostrar_logo, cc.anuncio_texto, "
         "       cc.fondo_url, cc.fondo_modo, cc.fondo_opacidad, cc.fondo_color, "
-        "       cc.hero_url, cc.hero_url_movil, cc.hero_color, cc.hero_opacidad, "
+        "       cc.hero_url, cc.hero_url_movil, cc.hero_color, cc.hero_opacidad, cc.hero_layout, "
         "       t.logo, t.telefono, t.correo, t.instagram, t.facebook, t.tiktok, t.sitio_web, t.maps "
         "FROM catalogo_config cc "
         "LEFT JOIN tenants t ON cc.tenant_id = t.id "
@@ -217,6 +217,9 @@ def obtener_catalogo_publico(slug: str, response: Response):
             "hero_url_movil": cfg.get("hero_url_movil") or "",
             "hero_color": cfg.get("hero_color") or "",
             "hero_opacidad": int(cfg["hero_opacidad"]) if cfg.get("hero_opacidad") is not None else 40,
+            # Layout personalizable del hero (migración 049): dict parcial;
+            # vacío = defaults (texto centro, logo y botón visibles, sin redes)
+            "hero_layout": cfg.get("hero_layout") or {},
         },
         "productos": productos,
         "orden_categorias": mapa_orden,
