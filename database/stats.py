@@ -64,9 +64,17 @@ def resumen_periodo(
     )[0]
 
     # ── Gastos (por día contable) ──
+    # "Gasto del periodo" = dinero REALMENTE pagado. Los gastos registrados como
+    # 'pendiente' (p. ej. el Diezmo semanal que aún no se confirma) y los
+    # 'descartado' no son salida de caja: contarlos inflaba el gasto y hacía que
+    # la utilidad neta de este panel NO coincidiera con la del Análisis
+    # Inteligente. Se exponen aparte para no perder esa información.
     f_g, p_g = _filtro_ventana(desde_d, hasta_d, "fecha_negocio")
     g = query(
-        "SELECT COALESCE(SUM(Monto), 0) AS total_gastos "
+        "SELECT "
+        "COALESCE(SUM(monto) FILTER (WHERE lower(COALESCE(estado, '')) "
+        "         NOT IN ('pendiente', 'descartado')), 0) AS total_gastos, "
+        "COALESCE(SUM(monto) FILTER (WHERE lower(COALESCE(estado, '')) = 'pendiente'), 0) AS gastos_pendientes "
         "FROM gastos WHERE Tenant_ID = %s" + f_g,
         (tenant_id,) + p_g
     )[0]
@@ -140,6 +148,7 @@ def resumen_periodo(
         "tickets": tickets_n,
         "ticket_promedio": (total_vendido / tickets_n) if tickets_n > 0 else 0.0,
         "total_gastos": float(g["total_gastos"]),
+        "gastos_pendientes": float(g["gastos_pendientes"]),
         "cobros_por_metodo": {
             "efectivo": float(c["efectivo"]),
             "tarjeta_debito": float(c["tarjeta_debito"]),
@@ -189,7 +198,8 @@ def serie_periodo(tenant_id: str, granularidad: str, desde_ts, hasta_ts, desde_d
     f_g, p_g = _filtro_ventana(desde_d, hasta_d, "fecha_negocio")
     filas_gastos = query(
         "SELECT date_trunc('" + gran_sql + "', fecha_negocio::timestamp) AS bucket, "
-        "COALESCE(SUM(Monto), 0) AS gastos "
+        "COALESCE(SUM(monto) FILTER (WHERE lower(COALESCE(estado, '')) "
+        "         NOT IN ('pendiente', 'descartado')), 0) AS gastos "
         "FROM gastos WHERE Tenant_ID = %s" + f_g + " GROUP BY 1",
         (tenant_id,) + p_g
     )
