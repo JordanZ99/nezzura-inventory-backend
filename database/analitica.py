@@ -15,6 +15,9 @@ from database.conexion import query
 from database.helpers import hoy_negocio, ventana_ts_de_rango, zona_tenant
 
 _DIAS = ("domingo", "lunes", "martes", "miércoles", "jueves", "viernes", "sábado")
+# Claves SIN acento (mismas que guarda tenants.dias_cerrados): para comparar la
+# configuración con el DOW sin depender de si el texto trae 'sábado' o 'sabado'.
+_CLAVES = ("domingo", "lunes", "martes", "miercoles", "jueves", "viernes", "sabado")
 _ACTIVO = "estado != 'Inactivo'"
 _VENTAS_COLD_START = 20
 
@@ -158,7 +161,9 @@ def _q_todo(
            JOIN productos p2 ON p2.id = l2.producto_id AND p2.tenant_id = l2.tenant_id
          WHERE l2.tenant_id = %s AND l2.estado = 'Activo' AND l2.stock_lote > 0
            AND p2.estado = 'Activo' AND p2.es_generico IS NOT TRUE
-           AND COALESCE(p2.tipo_producto, 'stock') = 'stock') AS valor_inventario
+           AND COALESCE(p2.tipo_producto, 'stock') = 'stock') AS valor_inventario,
+
+        (SELECT COALESCE(dias_cerrados, '[]'::jsonb) FROM tenants WHERE id = %s) AS dias_cerrados
         """,
         # Los params van en el ORDEN EN QUE APARECEN los %s dentro del SQL:
         (mes_ts_desde, mes_ts_hasta, zona, zona, zona, tenant_id, tenant_id) + p_v          # ventas
@@ -170,6 +175,7 @@ def _q_todo(
         + (tenant_id, tenant_id) + p_v                                                     # alertas
         + (tenant_id, hace_90, tenant_id)                                                  # productos
         + (tenant_id,)                                                                     # valor_inventario
+        + (tenant_id,)                                                                     # dias_cerrados
     )
     return fila[0] if fila else {}
 
@@ -306,7 +312,7 @@ def generar(tenant_id: str, desde_ts, hasta_ts, desde_d: date | None, hasta_d: d
             "proyeccion_mes_actual": proyeccion,
             "productos_90": foto,
             "semanas_8": semanas_8,
-            "ingresos_por_dow": [{"dia": _DIAS[x["dow"]], "ingresos": _f(x["ingresos"])} for x in dow],
+            "ingresos_por_dow": [{"dia": _DIAS[x["dow"]], "clave": _CLAVES[x["dow"]], "ingresos": _f(x["ingresos"])} for x in dow],
             "gastos_por_categoria": [
                 {"categoria": c.get("categoria") or "", "monto": _f(c.get("monto"))} for c in categorias
             ],
@@ -318,5 +324,8 @@ def generar(tenant_id: str, desde_ts, hasta_ts, desde_d: date | None, hasta_d: d
             ],
             "vendidos_sin_lote": [a["producto"] for a in alertas if a["tipo"] == "sin_lote"],
             "ventas_nocturnas": _i(v.get("nocturnas")),
+            # Días en que el negocio NO abre (migración 051): la regla de
+            # concentración los excluye y no sugiere promos ahí.
+            "dias_cerrados": [d for d in (r.get("dias_cerrados") or []) if isinstance(d, str)],
         },
     }

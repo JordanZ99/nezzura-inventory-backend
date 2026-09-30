@@ -13,8 +13,6 @@
 #   4. Nada de jerga interna (nada de "PEPS", "stock muerto", "lote").
 # ==============================================================================
 
-from datetime import date
-
 # ── Umbrales (calibrados con el tenant Kali; validar con un segundo giro) ──
 VENTAS_COLD_START = 20
 TOP_BEST_SELLER = 10
@@ -112,22 +110,24 @@ def _quiebre(hechos: dict) -> list[dict]:
     """Un SOLO hallazgo con los productos agotados que sí se vendían.
 
     Antes eran 3 tarjetas rojas casi idénticas; una sola con la lista se lee
-    mucho mejor y la acción es la misma para todos."""
+    mucho mejor y la acción es la misma para todos. Los nombres se separan con
+    '·' porque varios productos traen coma dentro del nombre (ej. 'Alocasia
+    Xanthosoma variegada, Mantarraya'): con comas se leían 5 cuando eran 4."""
     top = sorted(hechos.get("productos_90") or [], key=lambda p: p["ingresos"], reverse=True)[:TOP_BEST_SELLER]
     agotados = [p for p in top if p["ingresos"] > 0 and p["stock"] <= 0]
     if not agotados:
         return []
 
-    nombres = [f"{p['producto']} (~{_unidades(p['unidades'] / 3)}/mes)" for p in agotados[:4]]
+    nombres = [f"{p['producto']} (unas {_unidades(p['unidades'] / 3)} al mes)" for p in agotados[:4]]
     if len(agotados) > 4:
         nombres.append(f"y {len(agotados) - 4} más")
     n = len(agotados)
     return [_hallazgo(
         "quiebre_best_seller", "rojo",
         f"Te falta stock de {n} producto{'s' if n > 1 else ''} que sí vendes",
-        f"Sin existencias: {', '.join(nombres)}. En esos 90 días movableon "
-        f"{_dinero(sum(p['ingresos'] for p in agotados))}.",
-        "Reabastécelos cuanto antes: son los que más rotan de tu negocio.",
+        f"Sin existencias: {' · '.join(nombres)}. En los últimos 90 días vendieron "
+        f"{_dinero(sum(p['ingresos'] for p in agotados))} entre todos.",
+        "Considera reabastecerlos en tu próxima compra: son los que más rotan.",
         ventana=V_90,
         accion=_ir_a("/inventario", "Ir a Inventario"),
     )]
@@ -156,7 +156,7 @@ def _sin_movimiento(hechos: dict) -> dict | None:
         f"{len(valiosos)} producto(s) llevan 90 días sin venderse una sola pieza "
         f"({_unidades(unidades)} en total): {nombres}{extra}. Es el {pct * 100:.0f}% "
         "de lo que tienes invertido en inventario.",
-        "Bájale el precio, arma un combo o deja de reponerlo: ese dinero está parado.",
+        "Bájale el precio, arma un combo o considera dejar de reponerlo: ese dinero está parado.",
         ventana=V_90,
         accion=_ir_a("/inventario", "Ir a Inventario"),
     )
@@ -218,7 +218,17 @@ def _margen_bajo(hechos: dict) -> list[dict]:
 
 
 def _concentracion(hechos: dict) -> dict | None:
-    dias = [d for d in (hechos.get("ingresos_por_dow") or []) if d["ingresos"] > 0]
+    """Concentración de ingresos en pocos días, RESPECTANDO los días cerrados
+    (migración 051): un sábado marcado como día de descanso sale del cálculo,
+    aunque tenga ventas de los días que abrió por excepción — y jamás se
+    sugiere como día para promo."""
+    cerrados = set(hechos.get("dias_cerrados") or [])
+    # "clave" es el nombre del día SIN acento, mismo formato que tenants.dias_cerrados:
+    # comparar 'sabado' (config) contra 'sábado' (display) era un falso negativo.
+    dias = [
+        d for d in (hechos.get("ingresos_por_dow") or [])
+        if d["ingresos"] > 0 and d.get("clave", d["dia"]) not in cerrados
+    ]
     total = sum(d["ingresos"] for d in dias)
     if total <= 0 or len(dias) <= CONCENTRACION_DIAS:
         return None
@@ -227,13 +237,21 @@ def _concentracion(hechos: dict) -> dict | None:
     if pct <= CONCENTRACION_PCT:
         return None
     nombres = ", ".join(d["dia"] for d in top)
-    flojos = sorted(dias, key=lambda d: d["ingresos"])[0]
+    # La promo se sugiere SOLO en un día que el negocio SÍ abre.
+    flojo = min(dias, key=lambda d: d["ingresos"])
+    # Honestidad del título: 60-75% es "dos tercios", no "casi todo".
+    if pct >= 0.85:
+        parte = "Casi todo"
+    elif pct >= 0.60:
+        parte = "Dos tercios"
+    else:
+        parte = f"El {pct * 100:.0f}%"
     return _hallazgo(
         "concentracion_dias", "amarillo",
-        f"Casi todo se te vende en {CONCENTRACION_DIAS} días a la semana",
-        f"El {pct * 100:.0f}% de tus ingresos entran {nombres}. El día más flojo es "
-        f"{flojos['dia']} ({_dinero(flojos['ingresos'])}).",
-        f"Prueba una promo corta el {flojos['dia']} antes de concluir que no viene gente.",
+        f"{parte} de tus ventas caen en {CONCENTRACION_DIAS} días a la semana",
+        f"Se te amontonan {nombres}"
+        + ("." if not cerrados else f" — se dejaron fuera tus días de descanso: {', '.join(sorted(cerrados))}."),
+        f"Podrías probar una promo corta el {flojo['dia']}, tu día más tranquilo con puertas abiertas.",
         ventana=V_PERIODO,
     )
 
@@ -267,7 +285,7 @@ def _error_inventario(hechos: dict) -> dict | None:
         "lotes_inconsistentes", "amarillo",
         f"Hay {len(filas)} producto{'s' if len(filas) > 1 else ''} con el inventario mal",
         f"En {nombres}{extra} el inventario quedó en negativo o con costo negativo. "
-        "Es un error de captura, no un cálculo.",
+        "Alguien registró mal las cantidades o el costo en algún momento.",
         "Corrígelo en Inventario antes de volver a vender esos productos: el conteo "
         "automático se descuadra con el real.",
         ventana="ahora",
@@ -299,11 +317,13 @@ def _pendientes(hechos: dict) -> dict | None:
     pct = (monto / gastos_mes) if gastos_mes > 0 else 0
     if n < PENDIENTES_MIN and pct <= PENDIENTES_PCT_MES:
         return None
+    # Amarillo, no informativo: los pendientes no cuentan en la utilidad todavía,
+    # así que mientras queden sin confirmar el número que ve la dueña no es real.
     return _hallazgo(
-        "gastos_pendientes", "verde",
+        "gastos_pendientes", "amarillo",
         f"Tienes {n} gasto{'s' if n > 1 else ''} sin confirmar",
         f"Suman {_dinero(monto)}" + (f", el {pct * 100:.0f}% de lo que gastaste este mes." if gastos_mes else "."),
-        "Confírmalos o bórralos: hasta entonces no cuentan en tu utilidad.",
+        "Confírmalos o bórralos: hasta entonces tu utilidad está incompleta.",
         ventana=V_MES,
         accion=_ir_a("/gastos", "Ir a Gastos"),
     )
@@ -339,17 +359,8 @@ def _informativos(hechos: dict) -> list[dict]:
                 "Repite lo que hiciste ese mes (stock, promo o temporada) en el siguiente.",
                 ventana=V_PERIODO,
             ))
-    proy = hechos.get("proyeccion_mes_actual")
-    hoy: date | None = hechos.get("hoy")
-    if proy and hoy and hoy.day >= 3:
-        salida.append(_hallazgo(
-            "proyeccion_mes", "verde",
-            f"A este ritmo el mes cierra en {_dinero(proy)}",
-            "Estimación: se proyecta lo que vas sumando al ritmo de los días que ya "
-            "transcurrieron. No es una predicción.",
-            "Úsala para decidir si compras hoy o esperas al corte.",
-            ventana=V_MES,
-        ))
+    # La proyección del mes vive como cifra en la cabecera del panel (con su
+    # etiqueta "estimada"): repetirla como tarjeta era dos veces el mismo dato.
     promedio = float(hechos.get("ticket_promedio") or 0)
     mediano = float(hechos.get("ticket_mediano") or 0)
     if mediano > 0 and promedio > mediano * TICKET_GAP_RATIO and int(hechos.get("num_ventas") or 0) >= VENTAS_COLD_START:

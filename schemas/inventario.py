@@ -121,6 +121,10 @@ class ActualizarPerfil(BaseModel):
     zona_horaria: Optional[str] = None
     metodo_pago_default: Optional[str] = None
     gasto_comision_automatico: Optional[bool] = None
+    # ── Días de descanso (migración 051): lista de días en que el negocio no abre.
+    #    ['lunes'..'domingo']; [] = abre todos. La usa el Análisis Inteligente para
+    #    no sugerir promos en días cerrados ni contarlos en la concentración.
+    dias_cerrados: Optional[list] = None
     # ── Cartera de clientes (migración 038) ──
     clientes_activos: Optional[bool] = None
     # {email | telefono | pin: {activo, requerido}}; 'nombre' es fijo.

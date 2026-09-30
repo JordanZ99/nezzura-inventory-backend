@@ -78,7 +78,7 @@ def _leer_config_perfil(tenant_id: str) -> dict:
     """Lee modo_precio_sugerido, zona horaria, método de pago, flag de comisiones
     y la config de la cartera de clientes + sistema de puntos (migraciones 038/039)."""
     fila = query(
-        "SELECT modo_precio_sugerido, zona_horaria, metodo_pago_default, gasto_comision_automatico, "
+        "SELECT modo_precio_sugerido, zona_horaria, metodo_pago_default, gasto_comision_automatico, dias_cerrados, "
         "clientes_activos, cliente_campos, puntos_activos, puntos_valor_punto, puntos_modo, "
         "puntos_gasto_monto, puntos_gasto_pts, puntos_fijos "
         "FROM tenants WHERE id = %s",
@@ -90,6 +90,8 @@ def _leer_config_perfil(tenant_id: str) -> dict:
         "zona_horaria": (f.get("zona_horaria") if fila else None) or "America/Cancun",
         "metodo_pago_default": (f.get("metodo_pago_default") if fila else None) or "efectivo",
         "gasto_comision_automatico": bool(f["gasto_comision_automatico"]) if fila else False,
+        # ── Días de descanso (051): JSONB → lista limpia o lista vacía
+        "dias_cerrados": [d for d in (f.get("dias_cerrados") or []) if isinstance(d, str)] if fila else [],
         # ── Cartera de clientes (038) ──
         "clientes_activos": bool(f.get("clientes_activos")) if fila else False,
         "cliente_campos": normalizar_campos_cliente(f.get("cliente_campos")),
@@ -126,6 +128,7 @@ def actualizar_mi_perfil(data: ActualizarPerfil, tenant_id: str = Depends(get_te
     """
     if (data.modo_precio_sugerido is None and data.zona_horaria is None
             and data.metodo_pago_default is None and data.gasto_comision_automatico is None
+            and data.dias_cerrados is None
             and data.clientes_activos is None and data.cliente_campos is None
             and data.puntos_activos is None and data.puntos_valor_punto is None
             and data.puntos_modo is None and data.puntos_gasto_monto is None
@@ -139,6 +142,23 @@ def actualizar_mi_perfil(data: ActualizarPerfil, tenant_id: str = Depends(get_te
         execute("UPDATE tenants SET gasto_comision_automatico = %s WHERE id = %s",
                 (bool(data.gasto_comision_automatico), tenant_id))
         respuesta["gasto_comision_automatico"] = bool(data.gasto_comision_automatico)
+
+    if data.dias_cerrados is not None:
+        # Whitelist: mismos nombres (sin acento, minúscula) que ataja la analítica.
+        DIAS_VALIDOS = ("lunes", "martes", "miercoles", "jueves", "viernes", "sabado", "domingo")
+        if not isinstance(data.dias_cerrados, list):
+            raise HTTPException(status_code=400, detail="dias_cerrados debe ser una lista")
+        dias = [str(d).strip().lower() for d in data.dias_cerrados]
+        desconocidos = [d for d in dias if d not in DIAS_VALIDOS]
+        if desconocidos:
+            raise HTTPException(
+                status_code=400,
+                detail=f"dias_cerrados: días inválidos {desconocidos}; usa: {', '.join(DIAS_VALIDOS)}",
+            )
+        dias = sorted(set(dias))
+        execute("UPDATE tenants SET dias_cerrados = %s::jsonb WHERE id = %s",
+                (json.dumps(dias), tenant_id))
+        respuesta["dias_cerrados"] = dias
 
     if data.metodo_pago_default is not None:
         metodo = data.metodo_pago_default.strip().lower()
