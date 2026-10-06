@@ -47,7 +47,7 @@ def obtener_config_catalogo(tenant_id: str = Depends(get_tenant_id)):
         "       cc.hero_url, cc.hero_url_movil, cc.hero_color, cc.hero_opacidad, cc.hero_layout, "
         "       cc.created_at, "
         "       t.logo AS logo, "
-        "       t.telefono, t.instagram, t.facebook, t.tiktok "
+        "       t.telefono, t.instagram, t.facebook, t.tiktok, t.maps "
         "FROM catalogo_config cc "
         "LEFT JOIN tenants t ON cc.tenant_id = t.id "
         "WHERE cc.tenant_id = %s",
@@ -67,7 +67,7 @@ def obtener_config_catalogo(tenant_id: str = Depends(get_tenant_id)):
         "       cc.hero_url, cc.hero_url_movil, cc.hero_color, cc.hero_opacidad, cc.hero_layout, "
         "       cc.created_at, "
         "       t.logo AS logo, "
-        "       t.telefono, t.instagram, t.facebook, t.tiktok "
+        "       t.telefono, t.instagram, t.facebook, t.tiktok, t.maps "
             "FROM catalogo_config cc "
             "LEFT JOIN tenants t ON cc.tenant_id = t.id "
             "WHERE cc.tenant_id = %s",
@@ -221,7 +221,8 @@ def actualizar_config_catalogo(
             elementos = layout[clave_set]
             if not isinstance(elementos, list) or len(elementos) > 30:
                 raise HTTPException(status_code=422, detail=f"{clave_set} debe ser una lista de hasta 30 elementos")
-            claves_elem = {"id", "tipo", "x", "y", "w", "texto", "fuente", "tamano", "color", "peso", "align", "red"}
+            claves_elem = {"id", "tipo", "x", "y", "w", "texto", "fuente", "tamano", "color", "peso", "align", "red",
+                           "radio", "accion", "estilo", "color_texto"}
             tipos_elem = ("texto", "redes", "boton", "logo", "red")
             redes_validas = ("instagram", "facebook", "tiktok", "whatsapp")
             vistos: set = set()
@@ -253,6 +254,20 @@ def actualizar_config_catalogo(
                     raise HTTPException(status_code=422, detail="Fuente del elemento no reconocida")
                 if el.get("color") is not None:
                     _validar_color_texto(el["color"], "color del elemento")
+                if el.get("color_texto") is not None:
+                    _validar_color_texto(el["color_texto"], "color_texto del elemento")
+                # Solo boton (migración 049): redondeo, función, estilo y color del texto
+                if el.get("radio") is not None:
+                    try:
+                        r = float(el["radio"])
+                    except (TypeError, ValueError):
+                        raise HTTPException(status_code=422, detail="radio debe ser numérico")
+                    if not (0 <= r <= 999):
+                        raise HTTPException(status_code=422, detail="radio debe estar entre 0 y 999 (999 = píldora)")
+                if el.get("accion") is not None and el["accion"] not in ("catalogo", "maps"):
+                    raise HTTPException(status_code=422, detail="accion debe ser catalogo o maps")
+                if el.get("estilo") is not None and el["estilo"] not in ("solido", "outline"):
+                    raise HTTPException(status_code=422, detail="estilo debe ser solido o outline")
                 if el.get("peso") is not None:
                     if not (isinstance(el["peso"], str) and str(el["peso"]) in ("400", "600", "700", "800")):
                         raise HTTPException(status_code=422, detail="peso debe ser 400, 600, 700 u 800")
