@@ -242,10 +242,36 @@ def _sincronizar_principal_galeria(producto_id: int, nueva_url: str, tenant_id: 
         return
 
     if fila1:
-        execute(
-            "UPDATE producto_imagenes SET url=%s WHERE id=%s",
-            (nueva_url, fila1[0]["id"])
+        # La principal cambió y la URL NUEVA no existe en la galería (ni en el
+        # orden 1 ni en ninguna otra fila): puede ser un reemplazo legítimo
+        # (el editor sube una foto y borra la vieja por su cuenta) o una foto
+        # promovida a principal que aún no tiene fila.
+        # Para que NUNCA se pierda la foto del orden 1: si hay slot libre, la
+        # frase anterior se mueve a ese slot con su URL intacta y la nueva
+        # principal se inserta como fila de orden 1. Solo si la galería está
+        # llena (5/5) se pisa la URL en la fila 1 — caso de reemplazo
+        # intencional donde el editor elimina la sobrante.
+        ocupados = query(
+            "SELECT orden FROM producto_imagenes WHERE producto_id=%s AND tenant_id=%s",
+            (producto_id, tenant_id)
         )
+        slots = {r["orden"] for r in ocupados}
+        libre = next((i for i in range(2, 6) if i not in slots), None)
+        if libre is not None:
+            execute(
+                "UPDATE producto_imagenes SET orden=%s WHERE id=%s AND tenant_id=%s",
+                (libre, fila1[0]["id"], tenant_id)
+            )
+            execute(
+                "INSERT INTO producto_imagenes (producto_id, tenant_id, url, orden) "
+                "VALUES (%s, %s, %s, 1)",
+                (producto_id, tenant_id, nueva_url)
+            )
+        else:
+            execute(
+                "UPDATE producto_imagenes SET url=%s WHERE id=%s",
+                (nueva_url, fila1[0]["id"])
+            )
     else:
         execute(
             "INSERT INTO producto_imagenes (producto_id, tenant_id, url, orden) "
@@ -449,6 +475,13 @@ def listar_imagenes_producto(producto: str, tenant_id: str) -> list:
     Devuelve la galería completa de imágenes de un producto.
     Para Plan Plus: hasta 5 imágenes unificadas (la orden 1 es la principal).
     Para Plan básico: devuelve una lista vacía (el frontend usa ImagePicker simple).
+
+    READ-REPAIR: productos creados antes del sistema de galería pueden tener
+    la foto principal SOLO en productos.imagen, sin fila en producto_imagenes.
+    Si ese desync existe (y no hay fila de orden 1 que se podría pisar), se
+    inserta aquí: el editor la ve con id real y el reordenamiento nunca la
+    pisa con una URL que no tiene fila (bug: "al promocionar otra foto a
+    principal, la anterior desaparecía").
     """
     producto_id = _get_producto_id(producto, tenant_id)
     resultado = query(
@@ -457,6 +490,32 @@ def listar_imagenes_producto(producto: str, tenant_id: str) -> list:
         "ORDER BY orden ASC",
         (producto_id, tenant_id)
     )
+    try:
+        if _get_tenant_plan(tenant_id) == "plus":
+            fila_prod = query(
+                "SELECT Imagen FROM productos WHERE id = %s AND tenant_id = %s",
+                (producto_id, tenant_id)
+            )
+            principal = (fila_prod[0].get("Imagen") or "").strip() if fila_prod else ""
+            tiene_principal = bool(principal) and principal != "No hay foto"
+            en_galeria = any(r.get("url") == principal for r in resultado)
+            if tiene_principal and not en_galeria:
+                fila1 = next((r for r in resultado if r.get("orden") == 1), None)
+                if fila1 is None:
+                    execute(
+                        "INSERT INTO producto_imagenes (producto_id, tenant_id, url, orden) "
+                        "VALUES (%s, %s, %s, 1)",
+                        (producto_id, tenant_id, principal)
+                    )
+                    resultado = query(
+                        "SELECT id, url, orden FROM producto_imagenes "
+                        "WHERE producto_id = %s AND tenant_id = %s "
+                        "ORDER BY orden ASC",
+                        (producto_id, tenant_id)
+                    )
+    except Exception as e:
+        # El repair es best-effort: si falla, se devuelve la galería sin reparar
+        print(f"Error reparando el desync de la principal en la galería: {e}")
     return resultado
 
 
