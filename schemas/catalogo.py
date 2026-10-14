@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 class TemplateEnum(str, Enum):
     grid_clasico = "grid-clasico"
     grid_card    = "grid-card"
+    menu         = "menu"
 
 
 class ModoFondoEnum(str, Enum):
