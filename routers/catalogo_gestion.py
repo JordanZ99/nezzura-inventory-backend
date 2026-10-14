@@ -6,7 +6,7 @@
 # El usuario configura su catálogo desde /personalizacion:
 #   - Activar/desactivar
 #   - Elegir tema prehecho (default, midnightBlack, strawberry, cozyYellow)
-#   - Elegir template (grid-clasico, grid-carta)
+#   - Elegir template (grid-clasico, grid-card)
 #   - Editar título y subtítulo
 #   - Mostrar/ocultar precios, stock, categorías
 #   - Obtener su link y slug

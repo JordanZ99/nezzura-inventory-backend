@@ -5,7 +5,7 @@ from pydantic import BaseModel, Field
 
 class TemplateEnum(str, Enum):
     grid_clasico = "grid-clasico"
-    grid_carta   = "grid-carta"
+    grid_card    = "grid-card"
 
 
 class ModoFondoEnum(str, Enum):
