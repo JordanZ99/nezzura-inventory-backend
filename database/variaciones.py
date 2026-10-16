@@ -13,6 +13,7 @@ from psycopg2.errors import UniqueViolation
 from database.conexion import query
 from database.helpers import _resolver_producto_id, ahora_negocio, _parsear_ts
 from database.movimientos import registrar_movimiento_inventario
+from database.imagenes import borrar_imagen_cloudinary
 
 
 def _adjuntar_variaciones(filas: list[dict], tenant_id: str) -> None:
@@ -160,3 +161,44 @@ def eliminar_variacion(variacion_id: int, tenant_id: str) -> dict:
     if not result:
         return {"ok": False, "mensaje": "Variación no encontrada"}
     return {"ok": True, "id": variacion_id}
+
+
+def eliminar_variacion_verificada(variacion_id: int, confirmar: bool, tenant_id: str) -> dict:
+    """
+    Elimina una variación con aviso previo de stock (movida desde
+    routers/inventario.py — borrar_variacion_endpoint).
+
+    Si la variación tiene STOCK en sus lotes y no llega confirmar=True, NO
+    borra nada: devuelve el aviso {requiere_confirmacion} para que el frontend
+    muestre el modal "mover/desvincular o eliminar de todos modos". Con
+    confirmar=True se elimina (sus lotes se borran en cascada: el stock
+    desaparece a propósito).
+
+    Al eliminar se borra también su foto de Cloudinary (best-effort: si falla,
+    la eliminación sigue).
+    """
+    # Si NO hay confirmación, primero advertir por el stock — aquí NO se borra
+    # nada (la foto de Cloudinary se borra solo si realmente se elimina).
+    if not confirmar:
+        stock_info = query("""
+            SELECT COALESCE(SUM(Stock_Lote), 0) AS unidades, COUNT(*) AS lotes
+            FROM lotes
+            WHERE variacion_id = %s AND tenant_id = %s AND Estado = 'Activo'
+        """, (variacion_id, tenant_id))
+        if stock_info and (float(stock_info[0]["unidades"] or 0) > 0 or int(stock_info[0]["lotes"] or 0) > 0):
+            return {
+                "ok": False,
+                "requiere_confirmacion": True,
+                "unidades": float(stock_info[0]["unidades"] or 0),
+                "lotes": int(stock_info[0]["lotes"] or 0),
+                "mensaje": "Esta variación tiene stock. Puedes moverlo a otra variación o desvincularlo antes de eliminar, o eliminar de todos modos (su stock desaparecerá del inventario).",
+            }
+
+    # Aquí sí se elimina: borrar la foto de Cloudinary y la variación
+    try:
+        fila = query("SELECT foto FROM producto_variaciones WHERE id=%s AND tenant_id=%s", (variacion_id, tenant_id))
+        if fila and fila[0].get("foto"):
+            borrar_imagen_cloudinary(fila[0]["foto"])
+    except Exception as e:
+        print(f"Error borrando foto de variación en Cloudinary: {e}")
+    return eliminar_variacion(variacion_id, tenant_id)

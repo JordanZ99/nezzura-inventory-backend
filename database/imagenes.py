@@ -854,3 +854,57 @@ def reordenar_imagenes(producto: str, ids: list, tenant_id: str) -> dict:
         )
 
     return {"ok": True, "mensaje": "Imágenes reordenadas correctamente"}
+
+
+def leer_imagen_actual_producto(producto: str, tenant_id: str) -> str | None:
+    """
+    Lee la URL de la foto principal de un producto (productos.imagen), scoped
+    al tenant. Best-effort: ante error devuelve None (el flujo de edición no
+    se rompe por esto; lo peor caso es que la foto vieja no se limpie de
+    Cloudinary).
+    """
+    try:
+        filas = query(
+            "SELECT Imagen as imagen FROM productos WHERE Producto=%s AND tenant_id=%s",
+            (producto, tenant_id)
+        )
+        return filas[0]["imagen"] if filas else None
+    except Exception as e:
+        print(f"Error leyendo foto actual del producto: {e}")
+        return None
+
+
+def sincronizar_imagenes_tras_editar_producto(
+    producto_original: str,
+    producto_resultado: dict,
+    nueva_img: str,
+    old_url: str | None,
+    tenant_id: str,
+) -> None:
+    """
+    Post-proceso de imágenes al editar un producto (PATCH /inventario/{producto}),
+    movido desde routers/inventario.py. Todo best-effort: un fallo aquí no rompe
+    el guardado del producto.
+
+    1. Sincroniza la foto principal con la galería (plan Plus): la principal
+       vive en productos.imagen y también debe reflejarse en producto_imagenes
+       (orden 1); así el editor la ve como una foto con id y el reordenamiento
+       no la pisa con una URL vieja.
+    2. Borra la foto anterior de Cloudinary SOLO si el guardado tuvo éxito, la
+       imagen cambió y la URL quedó huérfana (ya no está referenciada en
+       ninguna tabla). Nunca se destruye un asset que sigue en uso (evita la
+       clase de fotos rotas del catálogo público).
+    """
+    try:
+        if _get_tenant_plan(tenant_id) == "plus":
+            fila_id = query(
+                "SELECT id FROM productos WHERE Producto = %s AND tenant_id = %s",
+                (producto_resultado.get("producto") or producto_original, tenant_id)
+            )
+            if fila_id:
+                _sincronizar_principal_galeria(fila_id[0]["id"], nueva_img, tenant_id)
+    except Exception as e:
+        print(f"Error sincronizando foto principal con la galería: {e}")
+
+    if old_url and old_url != nueva_img and not _url_sigue_referenciada(old_url, tenant_id):
+        borrar_imagen_cloudinary(old_url)

@@ -3,21 +3,15 @@
 # Endpoints de inventario, lotes y productos.
 # ==============================================================================
 
-import json
-import re
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Depends
-from pydantic import BaseModel
 from typing import Optional
 from dependencies import get_tenant_id
 
 from database.imagenes import (
-    _url_sigue_referenciada, _sincronizar_principal_galeria,
-    _get_tenant_plan, _ErrorGaleria,
+    _ErrorGaleria,
     borrar_imagen_url,
-    # Bug latente corregido: editar_producto y borrar_variacion_endpoint ya
-    # usaban borrar_imagen_cloudinary() (definida en database/imagenes.py) sin
-    # importarla — NameError al reemplazar una foto de producto.
-    borrar_imagen_cloudinary,
+    leer_imagen_actual_producto,
+    sincronizar_imagenes_tras_editar_producto,
     listar_imagenes_producto as listar_imagenes_dominio,
     subir_imagen_extra as subir_imagen_extra_negocio,
     eliminar_imagen_extra as eliminar_imagen_extra_negocio,
@@ -37,17 +31,16 @@ from database.categorias import (
 )
 from database.variaciones import (
     listar_variaciones_producto, crear_variacion, actualizar_variacion, eliminar_variacion,
+    eliminar_variacion_verificada,
 )
 from database.recetas import (
     listar_recetas_producto, agregar_material_receta, actualizar_material_receta,
     eliminar_material_receta,
 )
-from database.conexion import query, execute
-from database.helpers import invalidar_zona_tenant
+from database.tenants import leer_config_perfil, actualizar_config_perfil
+from database.posts import guardar_post_override as guardar_post_override_dominio
 from database.movimientos import get_movimientos
 from database import conteos
-from database.clientes import normalizar_campos_cliente
-from dependencies import validar_sesion
 from schemas.inventario import (
     VariacionAlta,
     RecetaAlta,
@@ -73,36 +66,9 @@ from schemas.inventario import (
 router = APIRouter(prefix="/inventario", tags=["Inventario"])
 
 # --- Endpoints ---
-
-def _leer_config_perfil(tenant_id: str) -> dict:
-    """Lee modo_precio_sugerido, zona horaria, método de pago, flag de comisiones
-    y la config de la cartera de clientes + sistema de puntos (migraciones 038/039)."""
-    fila = query(
-        "SELECT modo_precio_sugerido, zona_horaria, metodo_pago_default, gasto_comision_automatico, dias_cerrados, "
-        "clientes_activos, cliente_campos, puntos_activos, puntos_valor_punto, puntos_modo, "
-        "puntos_gasto_monto, puntos_gasto_pts, puntos_fijos "
-        "FROM tenants WHERE id = %s",
-        (tenant_id,)
-    )
-    f = fila[0] if fila else {}
-    return {
-        "modo_precio_sugerido": (f.get("modo_precio_sugerido") if fila else None) or "antiguo",
-        "zona_horaria": (f.get("zona_horaria") if fila else None) or "America/Cancun",
-        "metodo_pago_default": (f.get("metodo_pago_default") if fila else None) or "efectivo",
-        "gasto_comision_automatico": bool(f["gasto_comision_automatico"]) if fila else False,
-        # ── Días de descanso (051): JSONB → lista limpia o lista vacía
-        "dias_cerrados": [d for d in (f.get("dias_cerrados") or []) if isinstance(d, str)] if fila else [],
-        # ── Cartera de clientes (038) ──
-        "clientes_activos": bool(f.get("clientes_activos")) if fila else False,
-        "cliente_campos": normalizar_campos_cliente(f.get("cliente_campos")),
-        # ── Sistema de puntos (039) ──
-        "puntos_activos": bool(f.get("puntos_activos")) if fila else False,
-        "puntos_valor_punto": float(f.get("puntos_valor_punto") or 1) if fila else 1.0,
-        "puntos_modo": (f.get("puntos_modo") or "por_gasto") if fila else "por_gasto",
-        "puntos_gasto_monto": float(f.get("puntos_gasto_monto") or 10) if fila else 10.0,
-        "puntos_gasto_pts": int(f.get("puntos_gasto_pts") or 1) if fila else 1,
-        "puntos_fijos": (int(f["puntos_fijos"]) if f.get("puntos_fijos") is not None else None) if fila else None,
-    }
+# El SQL y las validaciones del perfil viven en database/tenants.py; aquí
+# solo se rutea HTTP y se mapea su dict de dominio ({ok, status, mensaje})
+# a HTTPException (mismo patrón que database/imagenes.py).
 
 
 @router.get("/me")
@@ -113,7 +79,7 @@ def obtener_mi_perfil(tenant_id: str = Depends(get_tenant_id)):
     junto con su configuración de perfil (modo de precio sugerido del POS
     y zona horaria del negocio).
     """
-    return {"tenant_id": tenant_id, **_leer_config_perfil(tenant_id)}
+    return {"tenant_id": tenant_id, **leer_config_perfil(tenant_id)}
 
 
 @router.patch("/me")
@@ -126,134 +92,13 @@ def actualizar_mi_perfil(data: ActualizarPerfil, tenant_id: str = Depends(get_te
     - clientes_* / puntos_*: cartera de clientes y sistema de puntos
       (migraciones 038/039, doc sistemaPuntos.md).
     """
-    if (data.modo_precio_sugerido is None and data.zona_horaria is None
-            and data.metodo_pago_default is None and data.gasto_comision_automatico is None
-            and data.dias_cerrados is None
-            and data.clientes_activos is None and data.cliente_campos is None
-            and data.puntos_activos is None and data.puntos_valor_punto is None
-            and data.puntos_modo is None and data.puntos_gasto_monto is None
-            and data.puntos_gasto_pts is None and data.puntos_fijos is None):
-        # Sin cambios: devolver el valor actual persistido
-        return {"ok": True, **_leer_config_perfil(tenant_id)}
-
-    respuesta = {"ok": True}
-
-    if data.gasto_comision_automatico is not None:
-        execute("UPDATE tenants SET gasto_comision_automatico = %s WHERE id = %s",
-                (bool(data.gasto_comision_automatico), tenant_id))
-        respuesta["gasto_comision_automatico"] = bool(data.gasto_comision_automatico)
-
-    if data.dias_cerrados is not None:
-        # Whitelist: mismos nombres (sin acento, minúscula) que ataja la analítica.
-        DIAS_VALIDOS = ("lunes", "martes", "miercoles", "jueves", "viernes", "sabado", "domingo")
-        if not isinstance(data.dias_cerrados, list):
-            raise HTTPException(status_code=400, detail="dias_cerrados debe ser una lista")
-        dias = [str(d).strip().lower() for d in data.dias_cerrados]
-        desconocidos = [d for d in dias if d not in DIAS_VALIDOS]
-        if desconocidos:
-            raise HTTPException(
-                status_code=400,
-                detail=f"dias_cerrados: días inválidos {desconocidos}; usa: {', '.join(DIAS_VALIDOS)}",
-            )
-        dias = sorted(set(dias))
-        execute("UPDATE tenants SET dias_cerrados = %s::jsonb WHERE id = %s",
-                (json.dumps(dias), tenant_id))
-        respuesta["dias_cerrados"] = dias
-
-    if data.metodo_pago_default is not None:
-        metodo = data.metodo_pago_default.strip().lower()
-        if metodo not in ("efectivo", "tarjeta_debito", "tarjeta_credito"):
-            raise HTTPException(
-                status_code=400,
-                detail="metodo_pago_default debe ser 'efectivo', 'tarjeta_debito' o 'tarjeta_credito'",
-            )
-        execute("UPDATE tenants SET metodo_pago_default = %s WHERE id = %s", (metodo, tenant_id))
-        respuesta["metodo_pago_default"] = metodo
-
-    if data.modo_precio_sugerido is not None:
-        modo = data.modo_precio_sugerido.strip().lower()
-        if modo not in ("antiguo", "maximo", "reciente"):
-            raise HTTPException(
-                status_code=400,
-                detail="modo_precio_sugerido debe ser 'antiguo', 'maximo' o 'reciente'",
-            )
-        execute("UPDATE tenants SET modo_precio_sugerido = %s WHERE id = %s", (modo, tenant_id))
-        respuesta["modo_precio_sugerido"] = modo
-
-    if data.zona_horaria is not None:
-        zona = data.zona_horaria.strip()
-        try:
-            from zoneinfo import ZoneInfo
-            ZoneInfo(zona)
-        except Exception:
-            raise HTTPException(
-                status_code=400,
-                detail=f"'{zona}' no es una zona horaria IANA válida (ej. 'America/Cancun')",
-            )
-        execute("UPDATE tenants SET zona_horaria = %s WHERE id = %s", (zona, tenant_id))
-        # El backend cachea la zona 5 min: invalidarla para que el cambio
-        # surta efecto de inmediato en ventas/gastos/cortes.
-        invalidar_zona_tenant(tenant_id)
-        respuesta["zona_horaria"] = zona
-
-    # ── Cartera de clientes (038) ──
-    if data.clientes_activos is not None:
-        execute("UPDATE tenants SET clientes_activos = %s WHERE id = %s",
-                (bool(data.clientes_activos), tenant_id))
-        respuesta["clientes_activos"] = bool(data.clientes_activos)
-
-    if data.cliente_campos is not None:
-        try:
-            campos = normalizar_campos_cliente(data.cliente_campos)
-        except Exception:
-            raise HTTPException(status_code=422, detail="cliente_campos debe ser un objeto")
-        execute("UPDATE tenants SET cliente_campos = %s::jsonb WHERE id = %s",
-                (json.dumps(campos), tenant_id))
-        respuesta["cliente_campos"] = campos
-
-    # ── Sistema de puntos (039) ──
-    if data.puntos_activos is not None:
-        execute("UPDATE tenants SET puntos_activos = %s WHERE id = %s",
-                (bool(data.puntos_activos), tenant_id))
-        respuesta["puntos_activos"] = bool(data.puntos_activos)
-
-    if data.puntos_valor_punto is not None:
-        valor = float(data.puntos_valor_punto)
-        if valor <= 0:
-            raise HTTPException(status_code=422, detail="puntos_valor_punto debe ser mayor a 0 (ej. 1 = '1 punto vale $1'; 0.01 = '100 puntos valen $1')")
-        execute("UPDATE tenants SET puntos_valor_punto = %s WHERE id = %s", (valor, tenant_id))
-        respuesta["puntos_valor_punto"] = valor
-
-    if data.puntos_modo is not None:
-        modo = data.puntos_modo.strip().lower()
-        if modo not in ("por_gasto", "fijo"):
-            raise HTTPException(status_code=422, detail="puntos_modo debe ser 'por_gasto' o 'fijo'")
-        execute("UPDATE tenants SET puntos_modo = %s WHERE id = %s", (modo, tenant_id))
-        respuesta["puntos_modo"] = modo
-
-    if data.puntos_gasto_monto is not None:
-        monto = float(data.puntos_gasto_monto)
-        if monto <= 0:
-            raise HTTPException(status_code=422, detail="puntos_gasto_monto debe ser mayor a 0 (ej. 10 en '1 punto por cada $10')")
-        execute("UPDATE tenants SET puntos_gasto_monto = %s WHERE id = %s", (monto, tenant_id))
-        respuesta["puntos_gasto_monto"] = monto
-
-    if data.puntos_gasto_pts is not None:
-        pts = int(data.puntos_gasto_pts)
-        if pts < 1:
-            raise HTTPException(status_code=422, detail="puntos_gasto_pts debe ser al menos 1")
-        execute("UPDATE tenants SET puntos_gasto_pts = %s WHERE id = %s", (pts, tenant_id))
-        respuesta["puntos_gasto_pts"] = pts
-
-    if data.puntos_fijos is not None:
-        fijos = int(data.puntos_fijos)
-        if fijos < 0:
-            raise HTTPException(status_code=422, detail="puntos_fijos no puede ser negativo")
-        execute("UPDATE tenants SET puntos_fijos = %s WHERE id = %s", (fijos, tenant_id))
-        respuesta["puntos_fijos"] = fijos
-
-    respuesta.update(_leer_config_perfil(tenant_id))
-    return respuesta
+    resultado = actualizar_config_perfil(data.model_dump(), tenant_id)
+    if not resultado.get("ok"):
+        raise HTTPException(
+            status_code=resultado.get("status", 422),
+            detail=resultado.get("mensaje", "Configuración inválida"),
+        )
+    return resultado
 
 
 @router.get("/")
@@ -389,21 +234,15 @@ def borrar_imagen(data: BorrarImagen, tenant_id: str = Depends(get_tenant_id)):
 
 @router.patch("/{producto}")
 def editar_producto(producto: str, data: ActualizarProducto, tenant_id: str = Depends(get_tenant_id)):
-    """Actualiza metadatos (descripción, imagen, estado) de un producto."""
-    # Foto anterior: se lee ANTES del update (scoped al tenant) para poder
-    # borrarla de Cloudinary SOLO si el guardado tiene éxito, la imagen cambió
-    # y la URL dejó de estar referenciada. Nunca se destruye un asset que sigue
-    # en uso (evita la clase de fotos rotas del catálogo público).
-    old_url = None
-    try:
-        old_meta = query(
-            "SELECT Imagen as imagen FROM productos WHERE Producto=%s AND tenant_id=%s",
-            (producto, tenant_id)
-        )
-        if old_meta:
-            old_url = old_meta[0]["imagen"]
-    except Exception as e:
-        print(f"Error leyendo foto actual del producto: {e}")
+    """
+    Actualiza metadatos (descripción, imagen, estado) de un producto.
+
+    La foto anterior se lee ANTES del update y la sincronización de galería +
+    limpieza de la foto vieja ocurren DESPUÉS, en la capa de imágenes
+    (database/imagenes.py): nunca se destruye un asset que sigue en uso
+    (evita la clase de fotos rotas del catálogo público).
+    """
+    old_url = leer_imagen_actual_producto(producto, tenant_id)
 
     resultado = actualizar_producto(
         producto, data.descripcion, data.imagen, data.estado, data.categoria,
@@ -421,26 +260,11 @@ def editar_producto(producto: str, data: ActualizarProducto, tenant_id: str = De
         precio_servicio=data.precio_servicio
     )
 
-    # ── Sincronizar la foto principal con la galería (plan Plus) ──
-    # La principal vive en productos.imagen y también debe reflejarse en
-    # producto_imagenes (orden 1). Así el editor la ve como una foto con id
-    # y el reordenamiento no la pisa con una URL vieja.
-    nueva_img = (data.imagen or "").strip()
-    try:
-        if _get_tenant_plan(tenant_id) == "plus":
-            fila_id = query(
-                "SELECT id FROM productos WHERE Producto = %s AND tenant_id = %s",
-                (resultado.get("producto") or producto, tenant_id)
-            )
-            if fila_id:
-                _sincronizar_principal_galeria(fila_id[0]["id"], nueva_img, tenant_id)
-    except Exception as e:
-        print(f"Error sincronizando foto principal con la galería: {e}")
-
-    # Borrar la foto anterior SOLO si el guardado tuvo éxito, la imagen cambió
-    # y la URL quedó huérfana (ya no está referenciada en ninguna tabla).
-    if old_url and old_url != nueva_img and not _url_sigue_referenciada(old_url, tenant_id):
-        borrar_imagen_cloudinary(old_url)
+    # ── Sincronizar la foto principal con la galería (plan Plus) y borrar la
+    # foto anterior SOLO si cambió y quedó huérfana ── (todo en database/imagenes.py)
+    sincronizar_imagenes_tras_editar_producto(
+        producto, resultado, (data.imagen or "").strip(), old_url, tenant_id
+    )
 
     return resultado
 
@@ -509,25 +333,8 @@ def reordenar_categorias_endpoint(data: ReordenarCategorias, tenant_id: str = De
 # ── POSTS AUTOMÁTICOS (Fase 1): override de la tarjeta por producto ──────────
 # Un producto sin override (post_override NULL) usa los defaults del negocio
 # (tabla post_config). El override solo existe para la foto rebelde que lo pida.
+# La validación y el SQL viven en database/posts.py.
 # =============================================================================
-
-# Valores permitidos (mismos que en routers/catalogo_gestion.py — post_config)
-_TEMPLATES_POST = ("marco", "overlay")  # 'tarjeta' se eliminó (el render la trata como Marco)
-_FUENTES_POST = ("moderna", "elegante", "redondeada")
-_POSICIONES_POST = ("arriba", "abajo")
-
-# Color de texto personalizable (nombre+negocio = primario, precio = secundario):
-# hex #RRGGBB o '' = automático por plantilla.
-_RE_HEX_COLOR_POST = re.compile(r"^#[0-9a-fA-F]{6}$")
-
-
-def _validar_color_texto_post(valor, campo: str) -> None:
-    """Valida un color de texto del override: hex #RRGGBB o '' (automático)."""
-    if not isinstance(valor, str) or not (valor == "" or _RE_HEX_COLOR_POST.match(valor)):
-        raise HTTPException(
-            status_code=422,
-            detail=f"{campo} debe ser un color hex (#RRGGBB) o una cadena vacía para usar el color por defecto",
-        )
 
 
 @router.patch("/{producto}/post_override")
@@ -542,40 +349,13 @@ def guardar_post_override(producto: str, data: ActualizarPostOverride, tenant_id
 
     Valida los valores contra las listas permitidas (422 si son inválidos).
     """
-    ov = data.post_override
-    if ov is not None:
-        if not isinstance(ov, dict):
-            raise HTTPException(status_code=422, detail="post_override debe ser un objeto o null")
-        if "template" in ov and ov["template"] not in _TEMPLATES_POST:
-            raise HTTPException(status_code=422, detail=f"template debe ser uno de: {', '.join(_TEMPLATES_POST)}")
-        if "font" in ov and ov["font"] not in _FUENTES_POST:
-            raise HTTPException(status_code=422, detail=f"font debe ser uno de: {', '.join(_FUENTES_POST)}")
-        if "posicion" in ov and ov["posicion"] not in _POSICIONES_POST:
-            raise HTTPException(status_code=422, detail=f"posicion debe ser uno de: {', '.join(_POSICIONES_POST)}")
-        if "mostrar" in ov:
-            mostrar = ov["mostrar"]
-            permitidas = {"nombre", "precio", "negocio"}
-            if not isinstance(mostrar, dict) or not set(mostrar.keys()).issubset(permitidas):
-                raise HTTPException(status_code=422, detail="mostrar debe ser un objeto con solo las claves: nombre, precio, negocio")
-        if "color_primario" in ov:
-            _validar_color_texto_post(ov["color_primario"], "color_primario")
-        if "color_secundario" in ov:
-            _validar_color_texto_post(ov["color_secundario"], "color_secundario")
-
-    # Verificar que el producto exista y pertenezca al tenant (evita crear
-    # overrides sobre productos inexistentes/ajenos)
-    existe = query(
-        "SELECT id FROM productos WHERE Producto = %s AND tenant_id = %s",
-        (producto, tenant_id)
-    )
-    if not existe:
-        raise HTTPException(status_code=404, detail="Producto no encontrado")
-
-    execute(
-        "UPDATE productos SET post_override = %s::jsonb WHERE Producto = %s AND tenant_id = %s",
-        (json.dumps(ov) if ov is not None else None, producto, tenant_id)
-    )
-    return {"ok": True, "producto": producto, "post_override": ov}
+    resultado = guardar_post_override_dominio(producto, data.post_override, tenant_id)
+    if not resultado.get("ok"):
+        raise HTTPException(
+            status_code=resultado.get("status", 422),
+            detail=resultado.get("mensaje", "Override inválido"),
+        )
+    return resultado
 
 
 # =============================================================================
@@ -612,32 +392,11 @@ def borrar_variacion_endpoint(variacion_id: int, confirmar: bool = False, tenant
     devuelve un aviso (requiere_confirmacion) para que el frontend muestre el
     modal "mover/desvincular o eliminar de todos modos". Con confirmar=true
     se elimina (sus lotes se borran en cascada: el stock desaparece a propósito).
-    """
-    # Si NO hay confirmación, primero advertir por el stock — aquí NO se borra
-    # nada (la foto de Cloudinary se borra solo si realmente se elimina).
-    if not confirmar:
-        stock_info = query("""
-            SELECT COALESCE(SUM(Stock_Lote), 0) AS unidades, COUNT(*) AS lotes
-            FROM lotes
-            WHERE variacion_id = %s AND tenant_id = %s AND Estado = 'Activo'
-        """, (variacion_id, tenant_id))
-        if stock_info and (float(stock_info[0]["unidades"] or 0) > 0 or int(stock_info[0]["lotes"] or 0) > 0):
-            return {
-                "ok": False,
-                "requiere_confirmacion": True,
-                "unidades": float(stock_info[0]["unidades"] or 0),
-                "lotes": int(stock_info[0]["lotes"] or 0),
-                "mensaje": "Esta variación tiene stock. Puedes moverlo a otra variación o desvincularlo antes de eliminar, o eliminar de todos modos (su stock desaparecerá del inventario).",
-            }
 
-    # Aquí sí se elimina: borrar la foto de Cloudinary y la variación
-    try:
-        fila = query("SELECT foto FROM producto_variaciones WHERE id=%s AND tenant_id=%s", (variacion_id, tenant_id))
-        if fila and fila[0].get("foto"):
-            borrar_imagen_cloudinary(fila[0]["foto"])
-    except Exception as e:
-        print(f"Error borrando foto de variación en Cloudinary: {e}")
-    return eliminar_variacion(variacion_id, tenant_id)
+    La verificación de stock y el SQL viven en database/variaciones.py
+    (eliminar_variacion_verificada).
+    """
+    return eliminar_variacion_verificada(variacion_id, confirmar, tenant_id)
 
 
 @router.post("/variaciones/{variacion_id}/foto")
