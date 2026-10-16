@@ -1300,6 +1300,497 @@ def _reservar_cliente_puntos(cur, tenant_id: str, cliente_id: str | None) -> tup
     return dict(cliente), dict(config), saldo
 
 
+# ==============================================================================
+# ── Cobro de carrito (POS) ────────────────────────────────────────────────────
+# Un cobro = UNA transacción atómica. Antes vivía entera en cobrar_carrito
+# (~450 líneas); ahora cada paso tiene su propia función con nombre y
+# cobrar_carrito solo ORQUESTA, siempre sobre la MISMA conexión/transacción:
+#
+#   _bloquear_mesa → _preparar_renglones_carrito → _procesar_cliente_puntos
+#   → _procesar_pago → _insertar_orden → ledger de puntos/inventario
+#   → _liberar_mesa → commit
+# ==============================================================================
+
+
+def _bloquear_mesa(conn, mesa_id: str | None, tenant_id: str) -> str | None:
+    """
+    Bloquea la mesa del carrito (FOR UPDATE) y devuelve su nombre (snapshot
+    para trazabilidad). None si el carrito no viene de una mesa.
+
+    La liberación real (borrar mesa_items + estado Libre) ocurre AL FINAL del
+    cobro, en la MISMA transacción: si el cobro falla (stock, receta, pago
+    inválido), la orden abierta queda intacta para reintentar.
+    """
+    if not mesa_id:
+        return None
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            "SELECT id, nombre, estado FROM mesas WHERE id = %s::uuid AND tenant_id = %s FOR UPDATE",
+            (mesa_id, tenant_id)
+        )
+        fila_mesa = cur.fetchone()
+        if not fila_mesa:
+            raise ValueError("La mesa no existe o ya no está disponible")
+        return fila_mesa["nombre"]
+
+
+def _leer_producto_cobro(conn, producto: str, tenant_id: str) -> dict:
+    """
+    Lee el tipo/precios del producto DENTRO de la transacción, para decidir
+    si se descuenta inventario o es un servicio (sin stock). Defaults de
+    "stock" si el producto no existe (el PEPS de abajo fallará con su propio
+    error descriptivo).
+    """
+    tipo = "stock"
+    costo_srv = 0.0
+    precio_srv = 0.0
+    fraccionable = False
+    es_generico = False
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            "SELECT tipo_producto, costo_servicio, precio_servicio, fraccionable, es_generico "
+            "FROM productos WHERE Producto = %s AND tenant_id = %s",
+            (producto, tenant_id)
+        )
+        fila = cur.fetchone()
+    if fila:
+        tipo = fila.get("tipo_producto") or "stock"
+        costo_srv = float(fila.get("costo_servicio") or 0)
+        precio_srv = float(fila.get("precio_servicio") or 0)
+        fraccionable = bool(fila.get("fraccionable"))
+        es_generico = bool(fila.get("es_generico"))
+    return {
+        "tipo": tipo, "costo_srv": costo_srv, "precio_srv": precio_srv,
+        "fraccionable": fraccionable, "es_generico": es_generico,
+    }
+
+
+def _validar_cantidad_entera(producto: str, cantidad: float, fraccionable: bool) -> None:
+    """
+    Validación de cantidad fraccionaria: si el producto NO está marcado como
+    fraccionable, solo se vende por unidades enteras. Así un llavero nunca se
+    vende a 0.5, aunque se intente por API (protección real, no solo UX).
+    """
+    if not fraccionable and cantidad != int(cantidad):
+        raise ValueError(
+            f"'{producto}' solo se vende por unidades enteras. "
+            "Corrige la cantidad e inténtalo de nuevo."
+        )
+
+
+def _preparar_venta_compuesto(conn, item: dict, prod: dict, variacion: str, tenant_id: str) -> dict:
+    """
+    Compuesto: consume stock de sus MATERIALES (receta BOM).
+
+    1. Resolver la receta SEGÚN LA VARIACIÓN vendida (si la variación no tiene
+       receta propia, cae a la receta base).
+    2. Por cada material → descontar PEPS y capturar qué lote/costo salió
+       (descontar_stock_peps devuelve los registros de venta; aquí NO se
+       insertan como ventas: solo descuentan lotes).
+    3. costo_unitario = Σ(costo×cantidad) / unidades (costo EN VIVO).
+    4. Devuelve UNA sola venta del compuesto + consumo JSON.
+    """
+    cant_comp = float(item["cantidad"])
+    precio_real = float(item["precio_real"])
+    consumo: list[dict] = []
+    costo_total = 0.0
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        receta = _resolver_receta_compuesto(
+            cur, item["producto"], item.get("variacion"), tenant_id
+        )
+
+    if not receta:
+        # Compuesto sin receta: no se puede cobrar (vendería sin consumir
+        # nada y con costo 0). Frena TODO el carrito.
+        raise ValueError(
+            f"El compuesto '{item['producto']}' no tiene materiales en su receta. "
+            "Agrega materiales antes de cobrarlo."
+        )
+
+    for mat in receta:
+        nombre_mat = mat["material"]
+        # Cantidad de material necesaria: receta × unidades vendidas
+        cant_mat = float(mat["cantidad"] or 0) * cant_comp
+        if cant_mat <= 0:
+            continue
+        # precio_real=0: solo nos interesa descontar lotes y saber cuál salió;
+        # la venta del compuesto se registra aparte con su precio.
+        resultado = descontar_stock_peps(
+            nombre_mat, cant_mat, 0.0, tenant_id, conn=conn
+        )
+        for r in resultado:
+            c = float(r.get("costo_unitario") or 0)
+            cant_r = float(r.get("cantidad") or 0)
+            consumo.append({
+                "material": nombre_mat,
+                "id_lote": r.get("id_lote"),
+                "cantidad": cant_r,
+                "costo": c,
+            })
+            costo_total += c * cant_r
+
+    costo_unitario = costo_total / cant_comp if cant_comp else 0.0
+    return {
+        "fecha"         : str(ahora_negocio(tenant_id)),
+        "producto"      : item["producto"],
+        "cantidad"      : cant_comp,
+        "precio_lista"  : prod["precio_srv"],  # precio de venta del compuesto
+        "precio_real"   : precio_real,
+        "costo_unitario": costo_unitario,
+        "total_venta"   : precio_real * cant_comp,
+        "ganancia_bruta": (precio_real - costo_unitario) * cant_comp,
+        "id_lote"       : None,
+        "tipo_producto" : "compuesto",
+        "variacion"     : variacion,
+        "consumo"       : consumo,
+    }
+
+
+def _preparar_venta_servicio(item: dict, prod: dict, variacion: str, tenant_id: str) -> dict:
+    """
+    Servicio: no tiene inventario (se vende infinito); se registra la venta con
+    el costo/precio del servicio y nada se descuenta de lotes.
+
+    EXCEPCIÓN — Venta libre (migración 036): el producto genérico 'Venta
+    libre' es un servicio comodín cuyo costo/precio se capturan EN LA VENTA
+    (no en el producto): costo = item.costo (default 0) y precio_lista =
+    precio_real (cada venta cuesta lo que se cobró; el producto no tiene
+    "precio de lista").
+    """
+    fecha = str(ahora_negocio(tenant_id))
+    cant = float(item["cantidad"])
+    precio_real = float(item["precio_real"])
+    costo_unit = float(item.get("costo") or 0) if prod["es_generico"] else prod["costo_srv"]
+    precio_lista = precio_real if prod["es_generico"] else prod["precio_srv"]
+    return {
+        "fecha"         : fecha,
+        "producto"      : item["producto"],
+        "cantidad"      : cant,
+        "precio_lista"  : precio_lista,
+        "precio_real"   : precio_real,
+        "costo_unitario": costo_unit,
+        "total_venta"   : precio_real * cant,
+        "ganancia_bruta": (precio_real - costo_unit) * cant,
+        "id_lote"       : None,
+        "tipo_producto" : "servicio",
+        "variacion"     : variacion,
+        "descripcion"   : (str(item.get("descripcion")).strip() or None) if item.get("descripcion") else None,
+    }
+
+
+def _preparar_ventas_stock(conn, item: dict, variacion: str, tenant_id: str) -> list[dict]:
+    """
+    Producto con stock: PEPS normal. ¿Stock por variación? Si el producto
+    activó el flag, el descuento va SOLO a los lotes de ESA variación (Fase 6).
+    """
+    variacion_id = None
+    if variacion:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            variacion_id = _resolver_variacion_venta(
+                cur, {"producto": item["producto"], "variacion": variacion}, tenant_id
+            )
+    resultado = descontar_stock_peps(
+        item["producto"],
+        item["cantidad"],
+        item["precio_real"],
+        tenant_id,
+        id_lote=item.get("id_lote"),
+        variacion_id=variacion_id,
+        conn=conn,
+    )
+    for v in resultado:
+        v["tipo_producto"] = "stock"
+        v["variacion"] = variacion
+    return resultado
+
+
+def _preparar_renglones_carrito(conn, items: list[dict], tenant_id: str) -> list[dict]:
+    """
+    Resuelve el carrito a renglones de venta listos para insertar (dentro de
+    la transacción del cobro). Por cada item consulta el tipo del producto y
+    despacha: compuesto (consume materiales de su receta), servicio (sin
+    inventario) o stock (PEPS con bloqueo de lotes).
+    """
+    ventas_a_guardar: list[dict] = []
+    for item in items:
+        prod = _leer_producto_cobro(conn, item["producto"], tenant_id)
+        variacion = str(item.get("variacion") or "").strip()
+        _validar_cantidad_entera(item["producto"], float(item["cantidad"]), prod["fraccionable"])
+        if prod["tipo"] == "compuesto":
+            ventas_a_guardar.append(
+                _preparar_venta_compuesto(conn, item, prod, variacion, tenant_id)
+            )
+        elif prod["tipo"] == "servicio":
+            ventas_a_guardar.append(
+                _preparar_venta_servicio(item, prod, variacion, tenant_id)
+            )
+        else:
+            ventas_a_guardar.extend(
+                _preparar_ventas_stock(conn, item, variacion, tenant_id)
+            )
+    return ventas_a_guardar
+
+
+def _cargar_terminales(conn, tenant_id: str) -> dict[str, dict]:
+    """Terminales activas del tenant (para las comisiones del cobro, Fase B)."""
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            "SELECT id, nombre, comision_debito_pct, comision_credito_pct, comision_fija "
+            "FROM terminales WHERE tenant_id = %s AND activo = true", (tenant_id,)
+        )
+        return {str(t["id"]): t for t in cur.fetchall()}
+
+
+def _procesar_cliente_puntos(
+    conn,
+    tenant_id: str,
+    cliente_id: str | None,
+    total_productos: float,
+    puntos_usados: int,
+    ajuste_puntos: int,
+    ajuste_concepto: str | None,
+) -> dict:
+    """
+    Bloquea al cliente (FOR UPDATE) dentro de la transacción del cobro, valida
+    su saldo del ledger y calcula canje/ganancia/ajuste según la regla del
+    tenant (migraciones 038/039, Fase B). Todo en la MISMA transacción.
+
+    Sin cliente (o sin cartera) → estado neutral (0 puntos). Errores de regla
+    → ValueError (cobrar_carrito los traduce a 422 vía rollback).
+
+    Devuelve {cliente, saldo, saldo_final, valor_punto, valor_canje,
+    puntos_canjeados, puntos_ganados, ajuste}.
+    """
+    estado = {
+        "cliente": {}, "saldo": 0, "saldo_final": 0, "valor_punto": 0.0,
+        "valor_canje": 0.0, "puntos_canjeados": 0, "puntos_ganados": 0,
+        "ajuste": int(ajuste_puntos or 0),
+    }
+    if not cliente_id:
+        return estado
+
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cliente, config_puntos, saldo = _reservar_cliente_puntos(cur, tenant_id, cliente_id)
+    estado["cliente"] = cliente
+    estado["saldo"] = saldo
+
+    valor_punto = float(config_puntos.get("puntos_valor_punto") or 1.0)
+    if valor_punto <= 0:
+        valor_punto = 1.0
+    estado["valor_punto"] = valor_punto
+
+    if puntos_usados and puntos_usados > 0:
+        if not config_puntos.get("puntos_activos"):
+            raise ValueError("El sistema de puntos está desactivado — actívalo en Ajustes → Mi Negocio")
+        tope_dinero = int(total_productos / valor_punto + 1e-9)
+        tope = min(saldo, tope_dinero)
+        if tope <= 0:
+            raise ValueError(
+                f"Este ticket no admite canje de puntos (saldo del cliente: {saldo} pts)"
+            )
+        # Clamp silencioso: nunca canjea más que el saldo o más que el total
+        puntos_canjeados = min(int(puntos_usados), tope)
+        estado["puntos_canjeados"] = puntos_canjeados
+        estado["valor_canje"] = round(puntos_canjeados * valor_punto, 2)
+
+    # Puntos GANADOS por la regla del negocio, sobre el DINERO pagado
+    # (total de productos − lo que se cubrió con canje). Redondeo al
+    # entero más cercano; lo define el tenant en el panel de config.
+    if config_puntos.get("puntos_activos"):
+        neto_dinero = max(0.0, total_productos - estado["valor_canje"])
+        if config_puntos.get("puntos_modo") == "fijo":
+            puntos_ganados = int(config_puntos.get("puntos_fijos") or 0)
+        else:
+            monto = float(config_puntos.get("puntos_gasto_monto") or 0)
+            pts_x = int(config_puntos.get("puntos_gasto_pts") or 0)
+            puntos_ganados = int(round(neto_dinero / monto * pts_x)) if monto > 0 and pts_x > 0 else 0
+        if puntos_ganados < 0:
+            puntos_ganados = 0
+        estado["puntos_ganados"] = puntos_ganados
+
+    # Ajuste manual del ticket (dar ±/− puntos, ej. promo 50% aplicada a mano)
+    ajuste = estado["ajuste"]
+    if ajuste != 0 and not (ajuste_concepto or "").strip():
+        raise ValueError("Indica el motivo del ajuste de puntos")
+    saldo_final = saldo + estado["puntos_ganados"] - estado["puntos_canjeados"] + ajuste
+    if saldo_final < 0:
+        raise ValueError(
+            f"No puedes quitar puntos de más: el saldo de '{cliente['nombre']}' quedaría en {saldo_final} pts"
+        )
+    estado["saldo_final"] = saldo_final
+    return estado
+
+
+def _turno_abierto_cobro(conn, tenant_id: str) -> str | None:
+    """Turno abierto (Fase C): si existe, el ticket se adscribe a él."""
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            "SELECT id FROM turnos WHERE tenant_id = %s AND estado = 'Abierto' "
+            "ORDER BY abierta_en DESC LIMIT 1", (tenant_id,)
+        )
+        fila_turno = cur.fetchone()
+        return fila_turno["id"] if fila_turno else None
+
+
+def _insertar_orden(
+    conn,
+    tenant_id: str,
+    fecha_orden: str,
+    ventas_a_guardar: list[dict],
+    pago_cols: dict,
+    turno_id: str | None,
+    mesa_id: str | None,
+    mesa_nombre: str | None,
+    cliente_id: str | None,
+) -> tuple[str, str]:
+    """
+    Cabecera de la ORDEN (migración 032): un cobro = un ticket. El folio lo
+    asigna el trigger trigger_folio_ordenes (advisory lock por tenant,
+    concurrente-seguro). Los agregados salen de los renglones.
+    Devuelve (orden_id, n_ticket).
+    """
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            "INSERT INTO ordenes (tenant_id, n_ticket, fecha_ts, total, ganancia, cantidad_items, estado, "
+            "metodo_pago, pagos, propina, monto_recibido, cambio, comision_total, turno_id, mesa_id, mesa_nombre, cliente_id) "
+            "VALUES (%s, NULL, %s, %s, %s, %s, 'Activa', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+            "RETURNING id, n_ticket",
+            (
+                tenant_id,
+                _parsear_ts(fecha_orden),
+                sum(float(v["total_venta"] or 0) for v in ventas_a_guardar),
+                sum(float(v["ganancia_bruta"] or 0) for v in ventas_a_guardar),
+                sum(float(v["cantidad"] or 0) for v in ventas_a_guardar),
+                pago_cols["metodo_pago"],
+                psycopg2.extras.Json(pago_cols["pagos"]),
+                pago_cols["propina"],
+                pago_cols["monto_recibido"],
+                pago_cols["cambio"],
+                pago_cols["comision_total"],
+                turno_id,
+                mesa_id,
+                mesa_nombre,
+                cliente_id,
+            )
+        )
+        fila_orden = cur.fetchone()
+        return fila_orden["id"], fila_orden["n_ticket"]
+
+
+def _registrar_movimientos_puntos(
+    conn,
+    tenant_id: str,
+    cliente_id: str | None,
+    estado_puntos: dict,
+    orden_id: str,
+    n_ticket: str,
+    ajuste_concepto: str | None,
+) -> None:
+    """
+    Movimientos del ledger de puntos (misma transacción): canjeados: −pts con
+    snapshot del valor $; ganados: +pts por la regla; ajuste: ±pts manual con
+    motivo. Nunca se edita ni borra un movimiento previo: la anulación del
+    ticket escribe el movimiento espejo.
+    """
+    if not cliente_id:
+        return
+    concepto_ticket = f"Ticket #{n_ticket}"
+    if estado_puntos["puntos_canjeados"] > 0:
+        registrar_movimiento(
+            tenant_id, cliente_id, "canjeados", -estado_puntos["puntos_canjeados"],
+            concepto=concepto_ticket, orden_id=orden_id,
+            valor_monetario=estado_puntos["valor_canje"], conn=conn,
+        )
+    if estado_puntos["puntos_ganados"] > 0:
+        registrar_movimiento(
+            tenant_id, cliente_id, "ganados", estado_puntos["puntos_ganados"],
+            concepto=concepto_ticket, orden_id=orden_id, conn=conn,
+        )
+    if estado_puntos["ajuste"] != 0:
+        registrar_movimiento(
+            tenant_id, cliente_id, "ajuste", estado_puntos["ajuste"],
+            concepto=(ajuste_concepto or "").strip(), orden_id=orden_id, conn=conn,
+        )
+
+
+def _registrar_gasto_comision(conn, tenant_id: str, n_ticket: str, comision_total: float) -> None:
+    """Gasto automático de comisiones bancarias (si el tenant lo activó)."""
+    if comision_total <= 0:
+        return
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            "SELECT gasto_comision_automatico FROM tenants WHERE id = %s", (tenant_id,)
+        )
+        fila_flag = cur.fetchone()
+    if fila_flag and fila_flag["gasto_comision_automatico"]:
+        with conn.cursor() as cur:
+            fecha_hoy = hoy_negocio(tenant_id).isoformat()
+            cur.execute(
+                "INSERT INTO gastos (Fecha, fecha_negocio, Categoria, Descripcion, Monto, Tenant_ID, Estado) "
+                "VALUES (%s, %s, %s, %s, %s, %s, 'pagado')",
+                (fecha_hoy, fecha_hoy, "Comisiones bancarias",
+                 f"Comisión de terminal — ticket #{n_ticket}",
+                 comision_total, tenant_id)
+            )
+
+
+def _registrar_ledger_inventario(
+    conn,
+    tenant_id: str,
+    ventas_a_guardar: list[dict],
+    orden_id: str | None,
+    n_ticket: str | None,
+) -> None:
+    """
+    Ledger de inventario (migración 040): una salida por renglón. Stock: el
+    id_lote exacto que PEPS asignó. Compuesto: un renglón por material
+    consumido (según su receta). Servicios no tocan inventario. Misma
+    transacción: si el cobro se revierte, los renglones no existen.
+    """
+    for venta in ventas_a_guardar:
+        tipo_v = venta.get("tipo_producto") or "stock"
+        if tipo_v == "servicio":
+            continue
+        ref = str(orden_id) if orden_id else None
+        if tipo_v == "compuesto":
+            for c in venta.get("consumo") or []:
+                registrar_movimiento_inventario(
+                    tenant_id, c.get("material") or "", "salida", "venta",
+                    -float(c.get("cantidad") or 0),
+                    id_lote=c.get("id_lote"),
+                    referencia_id=ref,
+                    concepto=f"Consumo por venta de '{venta['producto']}' (ticket #{n_ticket})",
+                    conn=conn,
+                )
+        else:
+            registrar_movimiento_inventario(
+                tenant_id, venta["producto"], "salida", "venta",
+                -float(venta["cantidad"] or 0),
+                id_lote=venta.get("id_lote"),
+                referencia_id=ref,
+                concepto=f"Ticket #{n_ticket}" if n_ticket else None,
+                conn=conn,
+            )
+
+
+def _liberar_mesa(conn, mesa_id: str, tenant_id: str) -> None:
+    """
+    Libera la mesa (misma transacción). Solo se llama si el cobro llegó hasta
+    el final: borra sus renglones abiertos y la deja Libre. Si algo de arriba
+    falló, el rollback también revierte esto (la orden abierta sobrevive).
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM mesa_items WHERE mesa_id = %s::uuid AND tenant_id = %s",
+            (mesa_id, tenant_id)
+        )
+        cur.execute(
+            "UPDATE mesas SET estado = 'Libre', abierta_en = NULL "
+            "WHERE id = %s::uuid AND tenant_id = %s",
+            (mesa_id, tenant_id)
+        )
+
+
 def cobrar_carrito(
     items: list[dict],
     tenant_id: str,
@@ -1322,6 +1813,11 @@ def cobrar_carrito(
       stock y luego insertar ventas), lo que podía dejar el inventario corrupto
       si algo fallaba a mitad del proceso.
 
+    Orquestación (cada paso en su función, misma conexión/transacción):
+    _bloquear_mesa → _preparar_renglones_carrito → _procesar_cliente_puntos
+    → _procesar_pago → _insertar_orden → ledgers de puntos/inventario →
+    _liberar_mesa → commit.
+
     Args:
         items: lista de dicts con las llaves producto, cantidad, precio_real
                e id_lote (opcional).
@@ -1333,391 +1829,62 @@ def cobrar_carrito(
     """
     conn = get_conn()
     try:
-        # ── Cobro de mesa (Fase 2, migración 037) ──
-        # Si el carrito viene de una mesa, se bloquea y se registra su nombre
-        # (snapshot para trazabilidad). La liberación real (borrar mesa_items +
-        # estado Libre) ocurre AL FINAL de ESTA misma transacción: si el cobro
-        # falla (stock, receta, pago inválido), la orden abierta queda intacta.
-        mesa_nombre = None
-        if mesa_id:
-            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                cur.execute(
-                    "SELECT id, nombre, estado FROM mesas WHERE id = %s::uuid AND tenant_id = %s FOR UPDATE",
-                    (mesa_id, tenant_id)
-                )
-                fila_mesa = cur.fetchone()
-                if not fila_mesa:
-                    raise ValueError("La mesa no existe o ya no está disponible")
-                mesa_nombre = fila_mesa["nombre"]
-
-        ventas_a_guardar = []
-        for item in items:
-            # Consultar el tipo del producto DENTRO de la transacción, para
-            # decidir si se descuenta inventario o es un servicio (sin stock).
-            tipo = "stock"
-            costo_srv = 0.0
-            precio_srv = 0.0
-            fraccionable = False
-            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                cur.execute(
-                    "SELECT tipo_producto, costo_servicio, precio_servicio, fraccionable, es_generico "
-                    "FROM productos WHERE Producto = %s AND tenant_id = %s",
-                    (item["producto"], tenant_id)
-                )
-                fila = cur.fetchone()
-                if fila:
-                    tipo = fila.get("tipo_producto") or "stock"
-                    costo_srv = float(fila.get("costo_servicio") or 0)
-                    precio_srv = float(fila.get("precio_servicio") or 0)
-                    fraccionable = bool(fila.get("fraccionable"))
-                    es_generico = bool(fila.get("es_generico"))
-                else:
-                    es_generico = False
-
-            variacion = str(item.get("variacion") or "").strip()
-
-            # Validación de cantidad fraccionaria: si el producto NO está
-            # marcado como fraccionable (por defecto), solo se vende por
-            # unidades enteras. Así un llavero nunca se vende a 0.5, aunque se
-            # intente por API (protección real, no solo UX).
-            cantidad_item = float(item["cantidad"])
-            if not fraccionable and cantidad_item != int(cantidad_item):
-                raise ValueError(
-                    f"'{item['producto']}' solo se vende por unidades enteras. "
-                    "Corrige la cantidad e inténtalo de nuevo."
-                )
-
-            if tipo == "compuesto":
-                # ── Compuesto: consume stock de sus MATERIALES (receta BOM) ──
-                # 1. Resolver la receta SEGÚN LA VARIACIÓN vendida (si la variación
-                #    no tiene receta propia, cae a la receta base).
-                # 2. Por cada material → descontar PEPS y capturar qué lote/costo
-                #    salió (descontar_stock_peps devuelve los registros de venta,
-                #    aquí NO se insertan como ventas: solo descuentan lotes).
-                # 3. costo_unitario = Σ(costo×cantidad) / unidades (costo EN VIVO).
-                # 4. Insertar UNA sola venta del compuesto + consumo JSON.
-                cant_comp = float(item["cantidad"])
-                precio_real = float(item["precio_real"])
-                consumo: list[dict] = []
-                costo_total = 0.0
-                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                    receta = _resolver_receta_compuesto(
-                        cur, item["producto"], item.get("variacion"), tenant_id
-                    )
-
-                if not receta:
-                    # Compuesto sin receta: no se puede cobrar (vendería sin
-                    # consumir nada y con costo 0). Frena TODO el carrito.
-                    raise ValueError(
-                        f"El compuesto '{item['producto']}' no tiene materiales en su receta. "
-                        "Agrega materiales antes de cobrarlo."
-                    )
-
-                for mat in receta:
-                    nombre_mat = mat["material"]
-                    # Cantidad de material necesaria: receta × unidades vendidas
-                    cant_mat = float(mat["cantidad"] or 0) * cant_comp
-                    if cant_mat <= 0:
-                        continue
-                    # precio_real=0: solo nos interesa descontar lotes y saber cuál
-                    # salió; la venta del compuesto se registra aparte con su precio.
-                    resultado = descontar_stock_peps(
-                        nombre_mat, cant_mat, 0.0, tenant_id, conn=conn
-                    )
-                    for r in resultado:
-                        c = float(r.get("costo_unitario") or 0)
-                        cant_r = float(r.get("cantidad") or 0)
-                        consumo.append({
-                            "material": nombre_mat,
-                            "id_lote": r.get("id_lote"),
-                            "cantidad": cant_r,
-                            "costo": c,
-                        })
-                        costo_total += c * cant_r
-
-                costo_unitario = costo_total / cant_comp if cant_comp else 0.0
-                ventas_a_guardar.append({
-                    "fecha"         : str(ahora_negocio(tenant_id)),
-                    "producto"      : item["producto"],
-                    "cantidad"      : cant_comp,
-                    "precio_lista"  : precio_srv,      # precio de venta del compuesto
-                    "precio_real"   : precio_real,
-                    "costo_unitario": costo_unitario,
-                    "total_venta"   : precio_real * cant_comp,
-                    "ganancia_bruta": (precio_real - costo_unitario) * cant_comp,
-                    "id_lote"       : None,
-                    "tipo_producto" : "compuesto",
-                    "variacion"     : variacion,
-                    "consumo"       : consumo,
-                })
-                continue
-
-            if tipo == "servicio":
-                # ── Servicio: no tiene inventario ──
-                # Se vende infinito; se registra la venta con el costo/precio del
-                # servicio. Nada se descuenta de lotes.
-                #
-                # EXCEPCIÓN — Venta libre (migración 036): el producto genérico
-                # 'Venta libre' es un servicio comodín cuyo costo/precio se
-                # capturan EN LA VENTA (no en el producto): costo = item.costo
-                # (default 0) y precio_lista = precio_real (cada venta cuesta lo
-                # que se cobró; el producto no tiene "precio de lista").
-                fecha = str(ahora_negocio(tenant_id))
-                cant = float(item["cantidad"])
-                precio_real = float(item["precio_real"])
-                costo_unit = float(item.get("costo") or 0) if es_generico else costo_srv
-                precio_lista = precio_real if es_generico else precio_srv
-                ventas_a_guardar.append({
-                    "fecha"         : fecha,
-                    "producto"      : item["producto"],
-                    "cantidad"      : cant,
-                    "precio_lista"  : precio_lista,
-                    "precio_real"   : precio_real,
-                    "costo_unitario": costo_unit,
-                    "total_venta"   : precio_real * cant,
-                    "ganancia_bruta": (precio_real - costo_unit) * cant,
-                    "id_lote"       : None,
-                    "tipo_producto" : "servicio",
-                    "variacion"     : variacion,
-                    "descripcion"   : (str(item.get("descripcion")).strip() or None) if item.get("descripcion") else None,
-                })
-                continue
-
-            # ── Producto con stock: PEPS normal ──
-            # ¿Stock por variación? Si el producto activó el flag, el descuento
-            # va SOLO a los lotes de ESA variación (Fase 6).
-            variacion_id = None
-            if variacion:
-                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                    variacion_id = _resolver_variacion_venta(
-                        cur, {"producto": item["producto"], "variacion": variacion}, tenant_id
-                    )
-            resultado = descontar_stock_peps(
-                item["producto"],
-                item["cantidad"],
-                item["precio_real"],
-                tenant_id,
-                id_lote=item.get("id_lote"),
-                variacion_id=variacion_id,
-                conn=conn,
-            )
-            for v in resultado:
-                v["tipo_producto"] = "stock"
-                v["variacion"] = variacion
-            ventas_a_guardar.extend(resultado)
-
-        # ── Cabecera de la ORDEN (migración 032): un cobro = un ticket ──
-        # El folio lo asigna el trigger trigger_folio_ordenes (advisory lock por
-        # tenant, concurrente-seguro). Los agregados salen de los renglones.
-        orden_id = None
-        n_ticket = None
-        # ── Estado del bloque cliente/puntos (coeficientes de la venta) ──
-        cliente_fila: dict = {}
-        config_puntos: dict = {}
-        saldo_cliente = 0
-        saldo_cliente_final = 0
-        valor_canje = 0.0
-        puntos_canjeados = 0
-        puntos_ganados = 0
-        valor_punto = 0.0
-        ajuste = int(ajuste_puntos or 0)
+        mesa_nombre = _bloquear_mesa(conn, mesa_id, tenant_id)
+        ventas_a_guardar = _preparar_renglones_carrito(conn, items, tenant_id)
         if mesa_id and not ventas_a_guardar:
             raise ValueError("La mesa no tiene artículos que cobrar")
+
+        # ── Estado del bloque cliente/puntos (coeficientes de la venta) ──
+        estado_puntos = {
+            "cliente": {}, "saldo": 0, "saldo_final": 0, "valor_punto": 0.0,
+            "valor_canje": 0.0, "puntos_canjeados": 0, "puntos_ganados": 0,
+            "ajuste": int(ajuste_puntos or 0),
+        }
+        orden_id = None
+        n_ticket = None
+        pago_cols: dict | None = None
+
         if ventas_a_guardar:
             fecha_orden = ventas_a_guardar[0]["fecha"]
             # Pago (Fase A/B): método, propina, mixto, cambio, comisiones de terminal.
             total_productos = sum(float(v["total_venta"] or 0) for v in ventas_a_guardar)
-            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                cur.execute(
-                    "SELECT id, nombre, comision_debito_pct, comision_credito_pct, comision_fija "
-                    "FROM terminales WHERE tenant_id = %s AND activo = true", (tenant_id,)
-                )
-                terminales_map = {str(t["id"]): t for t in cur.fetchall()}
+            terminales_map = _cargar_terminales(conn, tenant_id)
 
             # ── Cliente + canje de puntos (migraciones 038/039, Fase B) ──
-            # Todo dentro de la MISMA transacción: bloquea al cliente, valida el
-            # saldo del ledger, calcula canje/ganancia según la regla del tenant.
-            if cliente_id:
-                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                    cliente_fila, config_puntos, saldo_cliente = _reservar_cliente_puntos(cur, tenant_id, cliente_id)
-
-                valor_punto = float(config_puntos.get("puntos_valor_punto") or 1.0)
-                if valor_punto <= 0:
-                    valor_punto = 1.0
-
-                if puntos_usados and puntos_usados > 0:
-                    if not config_puntos.get("puntos_activos"):
-                        raise ValueError("El sistema de puntos está desactivado — actívalo en Ajustes → Mi Negocio")
-                    tope_dinero = int(total_productos / valor_punto + 1e-9)
-                    tope = min(saldo_cliente, tope_dinero)
-                    if tope <= 0:
-                        raise ValueError(
-                            f"Este ticket no admite canje de puntos (saldo del cliente: {saldo_cliente} pts)"
-                        )
-                    # Clamp silencioso: nunca canjea más que el saldo o más que el total
-                    puntos_canjeados = min(int(puntos_usados), tope)
-                    valor_canje = round(puntos_canjeados * valor_punto, 2)
-
-                # Puntos GANADOS por la regla del negocio, sobre el DINERO pagado
-                # (total de productos − lo que se cubrió con canje). Redondeo al
-                # entero más cercano; decidió el tenant en panel de config.
-                if config_puntos.get("puntos_activos"):
-                    neto_dinero = max(0.0, total_productos - valor_canje)
-                    if config_puntos.get("puntos_modo") == "fijo":
-                        puntos_ganados = int(config_puntos.get("puntos_fijos") or 0)
-                    else:
-                        monto = float(config_puntos.get("puntos_gasto_monto") or 0)
-                        pts_x = int(config_puntos.get("puntos_gasto_pts") or 0)
-                        puntos_ganados = int(round(neto_dinero / monto * pts_x)) if monto > 0 and pts_x > 0 else 0
-                    if puntos_ganados < 0:
-                        puntos_ganados = 0
-
-                # Ajuste manual del ticket (dar ±/− puntos, ej. promo 50% aplicada a mano)
-                if ajuste != 0 and not (ajuste_concepto or "").strip():
-                    raise ValueError("Indica el motivo del ajuste de puntos")
-                saldo_cliente_final = saldo_cliente + puntos_ganados - puntos_canjeados + ajuste
-                if saldo_cliente_final < 0:
-                    raise ValueError(
-                        f"No puedes quitar puntos de más: el saldo de '{cliente_fila['nombre']}' quedaría en {saldo_cliente_final} pts"
-                    )
-
+            estado_puntos = _procesar_cliente_puntos(
+                conn, tenant_id, cliente_id, total_productos,
+                puntos_usados, ajuste_puntos, ajuste_concepto,
+            )
             pago_puntos_dict = None
-            if puntos_canjeados > 0:
+            if estado_puntos["puntos_canjeados"] > 0:
                 pago_puntos_dict = {
                     "metodo": "puntos",
-                    "monto": valor_canje,
-                    "puntos": puntos_canjeados,
-                    "valor_punto": valor_punto,
-                    "referencia": f"Canje de {cliente_fila.get('nombre', '')}",
+                    "monto": estado_puntos["valor_canje"],
+                    "puntos": estado_puntos["puntos_canjeados"],
+                    "valor_punto": estado_puntos["valor_punto"],
+                    "referencia": f"Canje de {estado_puntos['cliente'].get('nombre', '')}",
                 }
             pago_cols = _procesar_pago(pago, total_productos, terminales_map, pago_puntos_dict)
 
-            # Turno abierto (Fase C): si existe, el ticket se adscribe a él
-            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                cur.execute(
-                    "SELECT id FROM turnos WHERE tenant_id = %s AND estado = 'Abierto' "
-                    "ORDER BY abierta_en DESC LIMIT 1", (tenant_id,)
-                )
-                fila_turno = cur.fetchone()
-                turno_id = fila_turno["id"] if fila_turno else None
-
-            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                cur.execute(
-                    "INSERT INTO ordenes (tenant_id, n_ticket, fecha_ts, total, ganancia, cantidad_items, estado, "
-                    "metodo_pago, pagos, propina, monto_recibido, cambio, comision_total, turno_id, mesa_id, mesa_nombre, cliente_id) "
-                    "VALUES (%s, NULL, %s, %s, %s, %s, 'Activa', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
-                    "RETURNING id, n_ticket",
-                    (
-                        tenant_id,
-                        _parsear_ts(fecha_orden),
-                        total_productos,
-                        sum(float(v["ganancia_bruta"] or 0) for v in ventas_a_guardar),
-                        sum(float(v["cantidad"] or 0) for v in ventas_a_guardar),
-                        pago_cols["metodo_pago"],
-                        psycopg2.extras.Json(pago_cols["pagos"]),
-                        pago_cols["propina"],
-                        pago_cols["monto_recibido"],
-                        pago_cols["cambio"],
-                        pago_cols["comision_total"],
-                        turno_id,
-                        mesa_id,
-                        mesa_nombre,
-                        cliente_id,
-                    )
-                )
-                fila_orden = cur.fetchone()
-                orden_id = fila_orden["id"]
-                n_ticket = fila_orden["n_ticket"]
-
-            # ── Movimientos del ledger de puntos (misma transacción) ──
-            # canjeados: −pts con snapshot del valor $; ganados: +pts por la regla;
-            # ajuste: ±pts manual con motivo. La anulación del ticket los revierte.
-            if cliente_id:
-                concepto_ticket = f"Ticket #{n_ticket}"
-                if puntos_canjeados > 0:
-                    registrar_movimiento(
-                        tenant_id, cliente_id, "canjeados", -puntos_canjeados,
-                        concepto=concepto_ticket, orden_id=orden_id,
-                        valor_monetario=valor_canje, conn=conn,
-                    )
-                if puntos_ganados > 0:
-                    registrar_movimiento(
-                        tenant_id, cliente_id, "ganados", puntos_ganados,
-                        concepto=concepto_ticket, orden_id=orden_id, conn=conn,
-                    )
-                if ajuste != 0:
-                    registrar_movimiento(
-                        tenant_id, cliente_id, "ajuste", ajuste,
-                        concepto=(ajuste_concepto or "").strip(), orden_id=orden_id, conn=conn,
-                    )
-
-            # Gasto automático de comisiones (si el tenant lo activó)
-            if pago_cols["comision_total"] > 0:
-                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                    cur.execute(
-                        "SELECT gasto_comision_automatico FROM tenants WHERE id = %s", (tenant_id,)
-                    )
-                    fila_flag = cur.fetchone()
-                if fila_flag and fila_flag["gasto_comision_automatico"]:
-                    with conn.cursor() as cur:
-                        fecha_hoy = hoy_negocio(tenant_id).isoformat()
-                        cur.execute(
-                            "INSERT INTO gastos (Fecha, fecha_negocio, Categoria, Descripcion, Monto, Tenant_ID, Estado) "
-                            "VALUES (%s, %s, %s, %s, %s, %s, 'pagado')",
-                            (fecha_hoy, fecha_hoy, "Comisiones bancarias",
-                             f"Comisión de terminal — ticket #{n_ticket}",
-                             pago_cols["comision_total"], tenant_id)
-                        )
+            turno_id = _turno_abierto_cobro(conn, tenant_id)
+            orden_id, n_ticket = _insertar_orden(
+                conn, tenant_id, fecha_orden, ventas_a_guardar, pago_cols,
+                turno_id, mesa_id, mesa_nombre, cliente_id,
+            )
+            _registrar_movimientos_puntos(
+                conn, tenant_id, cliente_id, estado_puntos, orden_id, n_ticket, ajuste_concepto
+            )
+            _registrar_gasto_comision(conn, tenant_id, n_ticket, pago_cols["comision_total"])
 
         for venta in ventas_a_guardar:
             venta["orden_id"] = orden_id
             venta["n_ticket"] = n_ticket
             insertar_venta(venta, tenant_id, conn=conn)
 
-        # ── Ledger de inventario (migración 040): una salida por renglón ──
-        # Stock: el id_lote exacto que PEPS asignó. Compuesto: un renglón por
-        # material consumido (según su receta). Servicios no tocan inventario.
-        # Misma transacción: si el cobro se revierte, los renglones no existen.
-        for venta in ventas_a_guardar:
-            tipo_v = venta.get("tipo_producto") or "stock"
-            if tipo_v == "servicio":
-                continue
-            ref = str(orden_id) if orden_id else None
-            if tipo_v == "compuesto":
-                for c in venta.get("consumo") or []:
-                    registrar_movimiento_inventario(
-                        tenant_id, c.get("material") or "", "salida", "venta",
-                        -float(c.get("cantidad") or 0),
-                        id_lote=c.get("id_lote"),
-                        referencia_id=ref,
-                        concepto=f"Consumo por venta de '{venta['producto']}' (ticket #{n_ticket})",
-                        conn=conn,
-                    )
-            else:
-                registrar_movimiento_inventario(
-                    tenant_id, venta["producto"], "salida", "venta",
-                    -float(venta["cantidad"] or 0),
-                    id_lote=venta.get("id_lote"),
-                    referencia_id=ref,
-                    concepto=f"Ticket #{n_ticket}" if n_ticket else None,
-                    conn=conn,
-                )
+        _registrar_ledger_inventario(conn, tenant_id, ventas_a_guardar, orden_id, n_ticket)
 
-        # ── Liberar la mesa (misma transacción) ──
-        # Solo si el cobro fue EXITOSO hasta aquí: borramos sus renglones
-        # abiertos y la dejamos Libre. Si algo de arriba falló, el rollback
-        # también revierte esto (la orden abierta sobrevive para reintentar).
         if mesa_id and ventas_a_guardar:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "DELETE FROM mesa_items WHERE mesa_id = %s::uuid AND tenant_id = %s",
-                    (mesa_id, tenant_id)
-                )
-                cur.execute(
-                    "UPDATE mesas SET estado = 'Libre', abierta_en = NULL "
-                    "WHERE id = %s::uuid AND tenant_id = %s",
-                    (mesa_id, tenant_id)
-                )
+            _liberar_mesa(conn, mesa_id, tenant_id)
 
         total = sum(v["total_venta"] for v in ventas_a_guardar)
 
@@ -1738,10 +1905,10 @@ def cobrar_carrito(
             "mesa_nombre": mesa_nombre,
             # ── Cliente + puntos (para el toast del POS) ──
             "cliente_id": cliente_id,
-            "cliente_nombre": cliente_fila.get("nombre"),
-            "puntos_ganados": puntos_ganados,
-            "puntos_canjeados": puntos_canjeados,
-            "saldo_cliente": saldo_cliente_final if cliente_id else None,
+            "cliente_nombre": estado_puntos["cliente"].get("nombre"),
+            "puntos_ganados": estado_puntos["puntos_ganados"],
+            "puntos_canjeados": estado_puntos["puntos_canjeados"],
+            "saldo_cliente": estado_puntos["saldo_final"] if cliente_id else None,
         }
     except ValueError as e:
         # Error de REGLA DE NEGOCIO (ej. compuesto sin receta): se distingue de
