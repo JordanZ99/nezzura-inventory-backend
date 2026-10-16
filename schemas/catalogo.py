@@ -22,7 +22,7 @@ class ActualizarCatalogo(BaseModel):
     titulo: Optional[str] = None
     subtitulo: Optional[str] = None
     # Fuente display del catálogo (migración 044). Claves válidas en frontend
-    # (lib/catalogo-fuentes.ts) — se valida en el router del gestor.
+    # (lib/catalogo-fuentes.ts) — se valida en database/catalogo.py.
     fuente: Optional[str] = None
     mostrar_precios: Optional[bool] = None
     mostrar_stock: Optional[bool] = None
@@ -50,7 +50,8 @@ class ActualizarCatalogo(BaseModel):
     hero_color: Optional[str] = None
     hero_opacidad: Optional[int] = Field(None, ge=0, le=100, description="Opacidad del velo sobre la imagen hero (0-100)")
     # Layout personalizable del hero (migración 049, Fase 1): dict PARCIAL de
-    # reglas bajo el bloque 'hero' del editor. Valores permitidos en el router.
+    # reglas bajo el bloque 'hero' del editor. Valores permitidos en
+    # database/catalogo.py (_validar_hero_layout).
     hero_layout: Optional[dict] = None
 
 
