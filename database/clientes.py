@@ -13,6 +13,7 @@
 
 import hashlib
 import secrets
+from datetime import date
 
 from database.conexion import query, execute
 
@@ -133,11 +134,13 @@ def _duplicado(tenant_id: str, email: str | None, telefono: str | None, excluir_
 
 _SELECT_LISTA = """
 SELECT c.id, c.nombre, c.email, c.telefono, c.notas, c.activo, c.fecha_registro,
+       c.cumpleanos, c.origen,
        COALESCE(p.saldo, 0) AS saldo_puntos,
        COALESCE(e.compras, 0) AS compras,
        COALESCE(e.total_gastado, 0) AS total_gastado,
        CASE WHEN COALESCE(e.compras, 0) > 0 THEN e.total_gastado / e.compras ELSE 0 END AS ticket_promedio,
-       e.ultima_compra
+       e.ultima_compra,
+       COALESCE(tags.etiquetas, '[]'::json) AS etiquetas
 FROM clientes c
 LEFT JOIN (
     SELECT cliente_id, SUM(puntos) AS saldo
@@ -147,6 +150,15 @@ LEFT JOIN (
     SELECT cliente_id, COUNT(*) AS compras, SUM(total) AS total_gastado, MAX(fecha_ts) AS ultima_compra
     FROM ordenes WHERE estado != 'Anulada' AND cliente_id IS NOT NULL GROUP BY cliente_id
 ) e ON e.cliente_id = c.id
+-- CRM: etiquetas asignadas (mig 054) como array de {id, nombre, color}.
+-- El JOIN lateral se resuelve por c.id: barato con el índice de cliente_etiqueta.
+LEFT JOIN LATERAL (
+    SELECT json_agg(json_build_object('id', et.id, 'nombre', et.nombre, 'color', et.color)
+                    ORDER BY et.nombre) AS etiquetas
+    FROM cliente_etiqueta ce
+    JOIN etiquetas et ON et.id = ce.etiqueta_id
+    WHERE ce.cliente_id = c.id
+) tags ON true
 """
 
 
@@ -170,8 +182,12 @@ def listar_clientes(tenant_id: str, q: str | None = None, incluir_inactivos: boo
     return filas
 
 
-def obtener_cliente(tenant_id: str, cliente_id: str, limite_movimientos: int = 50) -> dict:
-    """Detalle de UN cliente: datos + saldo + últimos movimientos y compras."""
+def obtener_cliente(
+    tenant_id: str, cliente_id: str,
+    limite_movimientos: int = 50, limite_interacciones: int = 30,
+) -> dict:
+    """Detalle de UN cliente: datos + saldo + últimos movimientos y compras
+    + etiquetas (vienen en _SELECT_LISTA) + timeline de interacciones (CRM)."""
     filas = query(
         _SELECT_LISTA + "WHERE c.tenant_id = %s AND c.id = %s",
         (tenant_id, cliente_id)
@@ -195,6 +211,13 @@ def obtener_cliente(tenant_id: str, cliente_id: str, limite_movimientos: int = 5
         "ORDER BY fecha_ts DESC LIMIT 20",
         (tenant_id, cliente_id)
     )
+    # CRM (mig 055): timeline de seguimiento, lo más nuevo primero.
+    cliente["interacciones"] = query(
+        "SELECT id, tipo, texto, creado_por, fecha "
+        "FROM crm_interacciones WHERE tenant_id = %s AND cliente_id = %s "
+        "ORDER BY fecha DESC LIMIT %s",
+        (tenant_id, cliente_id, limite_interacciones)
+    )
     return cliente
 
 
@@ -202,11 +225,16 @@ def crear_cliente(
     tenant_id: str, nombre: str,
     email: str | None = None, telefono: str | None = None,
     pin: str | None = None, notas: str | None = None,
+    cumpleanos: date | None = None, origen: str | None = None,
 ) -> dict:
     """Alta de cliente validando la config de campos del tenant."""
     nombre = (nombre or "").strip()
     if not nombre:
         return {"ok": False, "tipo": "validacion", "mensaje": "El nombre del cliente es obligatorio"}
+
+    # Origen CRM: de qué campaña/canal llegó (texto libre; vacío ⇒ NULL).
+    # cumpleanos ya llega como datetime.date (lo parsea el Pydantic del router).
+    origen_n = (origen or "").strip() or None
 
     config = _leer_config(tenant_id)
     email_n = (email or "").strip() or None
@@ -225,10 +253,11 @@ def crear_cliente(
         return {"ok": False, "tipo": "validacion", "mensaje": f"Ya existe un cliente con ese {dup}"}
 
     filas = query(
-        "INSERT INTO clientes (tenant_id, nombre, email, telefono, pin_hash, notas) "
-        "VALUES (%s, %s, %s, %s, %s, %s) "
-        "RETURNING id, nombre, email, telefono, notas, activo, fecha_registro",
-        (tenant_id, nombre, email_n, tel_n, _hash_pin(pin_n) if pin_n else None, (notas or "").strip() or None)
+        "INSERT INTO clientes (tenant_id, nombre, email, telefono, pin_hash, notas, cumpleanos, origen) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
+        "RETURNING id, nombre, email, telefono, notas, activo, fecha_registro, cumpleanos, origen",
+        (tenant_id, nombre, email_n, tel_n, _hash_pin(pin_n) if pin_n else None,
+         (notas or "").strip() or None, cumpleanos, origen_n)
     )
     return {"ok": True, "cliente": filas[0]}
 
@@ -237,15 +266,19 @@ def actualizar_cliente(
     tenant_id: str, cliente_id: str,
     nombre: str | None = None, email: str | None = None, telefono: str | None = None,
     pin: str | None = None, notas: str | None = None, activo: bool | None = None,
+    cumpleanos=None, origen: str | None = None,
 ) -> dict:
     """
     Edición de un cliente. Semántica del pin:
     - None  → no se toca    - ""    → se quita la contraseña
     - valor → se re-hashea
+    Semántica de los campos CRM:
+    - cumpleanos: None = sin cambio, "" = se borra, date = se fija
+    - origen:     None = sin cambio, "" = se borra, texto = se fija
     """
     actual = query(
-        "SELECT id, nombre, email, telefono, pin_hash, notas, activo FROM clientes "
-        "WHERE tenant_id = %s AND id = %s",
+        "SELECT id, nombre, email, telefono, pin_hash, notas, activo, cumpleanos, origen "
+        "FROM clientes WHERE tenant_id = %s AND id = %s",
         (tenant_id, cliente_id)
     )
     if not actual:
@@ -255,6 +288,18 @@ def actualizar_cliente(
     nombre_n = (nombre if nombre is not None else a["nombre"]).strip()
     if not nombre_n:
         return {"ok": False, "tipo": "validacion", "mensaje": "El nombre del cliente es obligatorio"}
+
+    # ── CRM: resolver cumpleanos/origen con la misma lógica del pin ──
+    if cumpleanos is None:
+        cump_nuevo = a["cumpleanos"]          # sin cambio
+    elif cumpleanos == "":
+        cump_nuevo = None                     # borrar
+    else:
+        cump_nuevo = cumpleanos               # date ya parseado por la petición
+    if origen is None:
+        origen_n = a["origen"]                # sin cambio
+    else:
+        origen_n = (origen or "").strip() or None
 
     email_n = (email if email is not None else a["email"])
     email_n = (email_n or "").strip() or None
@@ -295,14 +340,17 @@ def actualizar_cliente(
     if pin_nuevo == "":
         execute(
             "UPDATE clientes SET nombre=%s, email=%s, telefono=%s, pin_hash=NULL, "
-            "notas=%s, activo=COALESCE(%s, activo) WHERE tenant_id=%s AND id=%s",
+            "notas=%s, activo=COALESCE(%s, activo), cumpleanos=%s, origen=%s "
+            "WHERE tenant_id=%s AND id=%s",
             (nombre_n, email_n, tel_n, (notas if notas is not None else a["notas"]) or None,
-             activo, tenant_id, cliente_id)
+             activo, cump_nuevo, origen_n, tenant_id, cliente_id)
         )
     else:
-        sets = "nombre=%s, email=%s, telefono=%s, notas=%s, activo=COALESCE(%s, activo)"
+        sets = ("nombre=%s, email=%s, telefono=%s, notas=%s, activo=COALESCE(%s, activo), "
+                "cumpleanos=%s, origen=%s")
         params: list = [nombre_n, email_n, tel_n,
-                        (notas if notas is not None else a["notas"]) or None, activo]
+                        (notas if notas is not None else a["notas"]) or None, activo,
+                        cump_nuevo, origen_n]
         if pin_nuevo is not None:
             sets += ", pin_hash=%s"
             params.append(_hash_pin(pin_nuevo))
