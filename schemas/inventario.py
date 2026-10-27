@@ -170,6 +170,29 @@ class GuardarCapturasConteo(BaseModel):
     items: list[ConteoCaptura] = Field(..., description="Renglones a actualizar en el autosave")
 
 
+class AlcanceConteo(BaseModel):
+    """Alcance de un conteo PARCIAL (migración 057). Categorías y/o productos
+    (unión). None/vacío = conteo completo."""
+    categorias  : Optional[list[str]] = Field(None, description="Conteo parcial: solo productos de estas categorías (por nombre)")
+    productos   : Optional[list[str]] = Field(None, description="Conteo parcial: solo estos productos (por nombre — la app los identifica por nombre)")
+    producto_ids: Optional[list[int]] = Field(None, description="Conteo parcial: solo estos productos (ids internos; alternativa a 'productos')")
+
+
+class AbrirConteo(BaseModel):
+    """Cuerpo opcional de POST /inventario/conteos. Sin alcance = conteo completo."""
+    alcance: Optional[AlcanceConteo] = Field(None, description="Alcance parcial (categorías y/o productos). Omitir = conteo completo")
+
+
+class RenglonManualConteo(BaseModel):
+    """Alta de un renglón MANUAL dentro del conteo abierto: un producto que
+    nunca se registró en el sistema (POST /inventario/conteos/{id}/items-manual).
+    El producto se da de alta al CERRAR el conteo, con lo contado como lote
+    inicial; si se declara 'inicial', contado < inicial se declara como venta."""
+    producto: str = Field(..., min_length=1, max_length=200, description="Nombre del producto no registrado (no debe existir ya en el inventario)")
+    inicial : Optional[float] = Field(None, ge=0, description="Cuánto había al inicio (para declarar la venta al cerrar). Opcional")
+    contado : Optional[float] = Field(None, ge=0, description="Lo que queda físicamente (también se captura por el autosave). Opcional")
+
+
 class ConteoResolucion(BaseModel):
     """Decisión de cierre para un renglón con diferencia (POST /inventario/conteos/{id}/cerrar)."""
     producto    : str = Field(..., description="Nombre del producto")
@@ -177,6 +200,7 @@ class ConteoResolucion(BaseModel):
     resolucion  : Optional[str] = Field(None, description="merma | venta | error_sistema | entrada_no_registrada. Si se omite: merma para faltantes, error_sistema para sobrantes")
     costo       : Optional[float] = Field(None, description="Solo entrada_no_registrada: costo de la mercancía hallada (default: costo del último lote activo)")
     precio_venta: Optional[float] = Field(None, description="Solo entrada_no_registrada: precio de venta (default: precio del último lote activo)")
+    precio_real : Optional[float] = Field(None, ge=0, description="Solo venta: precio REAL al que se vendió (subasta, descuento, oferta). Default: precio de lista del lote PEPS")
 
 
 class CerrarConteo(BaseModel):

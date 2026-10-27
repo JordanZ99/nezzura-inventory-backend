@@ -12,8 +12,14 @@
 # referencia_id = id del conteo:
 #   - merma / error_sistema (faltante)  → salida PEPS sin venta
 #   - venta                              → orden + ventas retroactivas reales
+#     (cobradas al precio REAL declarado; default: precio de lista del lote)
 #   - entrada_no_registrada              → lote nuevo con el costo indicado
 #   - error_sistema (sobrante)           → ajuste +stock sobre el lote activo
+#
+# Los renglones MANUALES (056, origen='manual') son productos que nunca se
+# registraron: al cerrar se da de alta el producto + lote con lo contado y,
+# si declaró 'inicial', la venta (inicial − contado) se declara con precio
+# REAL; todo dentro de la misma transacción del cierre.
 #
 # Mismo patrón transaccional que cobrar_carrito: todo el cierre ocurre en UNA
 # conexión con commit al final; si algo falla, rollback y nada quedó a medias.
@@ -39,7 +45,9 @@ _EPSILON = 1e-3
 # Stock consolidado por (producto, variación) de los productos de stock ACTIVOS.
 # Incluye los de stock 0: puede "aparecer" mercancía que el sistema ya daba
 # por agotada. Compuestos y servicios no se cuentan (los compuestos se miden
-# por sus materiales).
+# por sus materiales). El alcance (057) permite conteos PARCIALES:
+# {'categorias': [...]} y/o {'producto_ids': [...]} — solo esos productos
+# entran al snapshot y el resto del inventario queda intacto.
 _AGRUPADO_SQL = """
     SELECT p.id AS producto_id,
            p.Producto AS producto,
@@ -106,12 +114,12 @@ def _resolver_fecha_venta(fecha: str | None, tenant_id: str) -> datetime | None:
 
 def _items_de_conteo(conteo_id: str, tenant_id: str) -> list[dict]:
     items = query(
-        "SELECT id, producto_id, producto, variacion, esperado, contado, vivo, delta, resolucion "
+        "SELECT id, producto_id, producto, variacion, esperado, contado, vivo, delta, resolucion, origen, inicial "
         "FROM conteo_items WHERE conteo_id = %s AND tenant_id = %s "
         "ORDER BY producto, variacion",
         (conteo_id, tenant_id))
     for it in items:
-        for col in ("esperado", "contado", "vivo", "delta"):
+        for col in ("esperado", "contado", "vivo", "delta", "inicial"):
             if it.get(col) is not None:
                 it[col] = float(it[col])
     return items
@@ -120,7 +128,7 @@ def _items_de_conteo(conteo_id: str, tenant_id: str) -> list[dict]:
 def get_conteo_activo(tenant_id: str) -> dict:
     """Sesión abierta (si existe) con sus renglones de captura."""
     filas = query(
-        "SELECT id, estado, abierto_at FROM conteos "
+        "SELECT id, estado, abierto_at, alcance FROM conteos "
         "WHERE tenant_id = %s AND estado = 'abierto' ORDER BY abierto_at DESC LIMIT 1",
         (tenant_id,))
     if not filas:
@@ -133,7 +141,7 @@ def get_conteo(conteo_id: str, tenant_id: str) -> dict:
     if not _uuid_valido(conteo_id):
         return {"ok": False, "tipo": "no_encontrado", "mensaje": "Conteo no encontrado"}
     filas = query(
-        "SELECT id, estado, abierto_at, cerrado_at, resumen FROM conteos "
+        "SELECT id, estado, abierto_at, cerrado_at, resumen, alcance FROM conteos "
         "WHERE id = %s::uuid AND tenant_id = %s",
         (conteo_id, tenant_id))
     if not filas:
@@ -144,7 +152,7 @@ def get_conteo(conteo_id: str, tenant_id: str) -> dict:
 def historial_conteos(tenant_id: str, limit: int = 30) -> list[dict]:
     """Sesiones cerradas, la más reciente primero (con su resumen)."""
     return query(
-        "SELECT id, estado, abierto_at, cerrado_at, resumen FROM conteos "
+        "SELECT id, estado, abierto_at, cerrado_at, resumen, alcance FROM conteos "
         "WHERE tenant_id = %s AND estado = 'cerrado' "
         "ORDER BY cerrado_at DESC LIMIT %s",
         (tenant_id, min(max(1, limit), 100)))
@@ -155,26 +163,188 @@ def historial_conteos(tenant_id: str, limit: int = 30) -> list[dict]:
 # ==============================================================================
 
 
-def abrir_conteo(tenant_id: str) -> dict:
+def _alta_producto_manual(conn, nombre: str, tenant_id: str) -> int:
     """
-    Abre una sesión y congela el snapshot: un renglón por producto+variación
-    con el stock consolidado actual (lotes activos).
+    Id del producto para un renglón manual al CERRAR. Si el nombre ya existe:
+    tipo 'stock' activo → se reutiliza (el lote entra a ese producto); otro
+    tipo/estado → error (crearía un duplicado confuso). Si no existe, se crea
+    un producto stock mínimo (nombre + estado): el resto se edita después.
     """
-    if query("SELECT 1 FROM conteos WHERE tenant_id = %s AND estado = 'abierto'", (tenant_id,)):
+    filas = _q(conn,
+        "SELECT id, tipo_producto, Estado FROM productos "
+        "WHERE Producto = %s AND tenant_id = %s",
+        (nombre, tenant_id))
+    if filas:
+        if (filas[0].get("tipo_producto") or "stock") != "stock":
+            raise ValueError(
+                f"Ya existe un producto/servicio no-contable llamado '{nombre}'. "
+                "Usa otro nombre para el renglón no registrado.")
+        return int(filas[0]["id"])
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO productos (Producto, Descripcion, Estado, tipo_producto, tenant_id) "
+            "VALUES (%s, %s, 'Activo', 'stock', %s) RETURNING id",
+            (nombre, "Dado de alta desde un conteo de auditoría", tenant_id))
+        return int(cur.fetchone()[0])
+
+
+def agregar_renglon_manual(conteo_id: str, tenant_id: str, producto: str,
+                           inicial: float | None, contado: float | None) -> dict:
+    """
+    Agrega al conteo abierto un renglón MANUAL para un producto que nunca se
+    registró en el sistema (no aparece en el snapshot porque no tiene lote).
+    `inicial` (opcional): cuánto había al inicio — si al cerrar contado < inicial,
+    la diferencia se declara como venta retroactiva con precio REAL.
+    Idempotente: si el nombre ya tiene renglón en ESTE conteo, se actualiza
+    el inicial (el contado se maneja por el autosave normal).
+    """
+    if not _uuid_valido(conteo_id):
+        return {"ok": False, "tipo": "no_encontrado", "mensaje": "Conteo no encontrado"}
+    nombre = (producto or "").strip()
+    if not nombre:
         return {"ok": False, "tipo": "validacion",
-                "mensaje": "Ya hay un conteo abierto: captura y ciérralo antes de iniciar otro."}
+                "mensaje": "Escribe el nombre del producto no registrado"}
+    if len(nombre) > 200:
+        return {"ok": False, "tipo": "validacion",
+                "mensaje": "El nombre es demasiado largo (máx 200 caracteres)"}
+    if inicial is not None:
+        inicial = round(float(inicial), 3)
+        if inicial < 0:
+            return {"ok": False, "tipo": "validacion",
+                    "mensaje": "El inicial no puede ser negativo"}
+    if contado is not None:
+        contado = round(float(contado), 3)
+        if contado < 0:
+            return {"ok": False, "tipo": "validacion",
+                    "mensaje": "Lo contado no puede ser negativo"}
+
+    estado = query(
+        "SELECT estado FROM conteos WHERE id = %s::uuid AND tenant_id = %s",
+        (conteo_id, tenant_id))
+    if not estado:
+        return {"ok": False, "tipo": "no_encontrado", "mensaje": "Conteo no encontrado"}
+    if estado[0]["estado"] != "abierto":
+        return {"ok": False, "tipo": "cerrado", "mensaje": "El conteo ya está cerrado"}
+
+    # El nombre no debe chocar con un producto existente: ese ya vive en el
+    # snapshot del conteo (o es servicio/compuesto). Duplicarlo confundiría
+    # el alta y la búsqueda.
+    existe = query(
+        "SELECT Producto FROM productos WHERE Producto = %s AND tenant_id = %s",
+        (nombre, tenant_id))
+    if existe:
+        return {"ok": False, "tipo": "validacion",
+                "mensaje": f"'{nombre}' ya existe en tu inventario — cuéntalo en su renglón normal del conteo"}
+
     conn = get_conn()
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
-                "INSERT INTO conteos (tenant_id) VALUES (%s) RETURNING id, abierto_at",
-                (tenant_id,))
+                "SELECT id FROM conteo_items "
+                "WHERE conteo_id = %s AND tenant_id = %s AND producto = %s AND variacion = ''",
+                (conteo_id, tenant_id, nombre))
+            fila = cur.fetchone()
+            if fila:
+                cur.execute(
+                    "UPDATE conteo_items SET inicial = %s, actualizado_at = now() WHERE id = %s",
+                    (inicial, fila["id"]))
+                accion = "actualizado"
+            else:
+                cur.execute(
+                    "INSERT INTO conteo_items (conteo_id, tenant_id, producto_id, producto, "
+                    "variacion, esperado, inicial, contado, origen) "
+                    "VALUES (%s, %s, NULL, %s, '', 0, %s, %s, 'manual') RETURNING id",
+                    (conteo_id, tenant_id, nombre, inicial, contado))
+                accion = "creado"
+        conn.commit()
+        return {"ok": True, "accion": accion, "producto": nombre}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_conn(conn)
+
+
+def _resolver_alcance(conn, alcance: dict, tenant_id: str) -> list[int]:
+    """Traduce el alcance parcial (057) a producto_ids del tenant:
+    'categorias' → los productos de esas categorías; 'producto_ids' tal cual
+    (limitados al tenant). Ambos → unión. Si no incluye ningún producto,
+    el conteo sería un registro vacío: mejor frenarlo con error claro."""
+    categorias = [str(c).strip() for c in (alcance.get("categorias") or []) if str(c).strip()]
+    ids_pedidos = alcance.get("producto_ids") or []
+    nombres = [str(n).strip() for n in (alcance.get("productos") or []) if str(n).strip()]
+    ids: set[int] = set()
+    if ids_pedidos:
+        filas = _q(conn,
+            "SELECT id FROM productos WHERE tenant_id = %s AND id = ANY(%s)",
+            (tenant_id, [int(i) for i in ids_pedidos]))
+        ids.update(int(f["id"]) for f in filas)
+    if nombres:
+        filas = _q(conn,
+            "SELECT id FROM productos WHERE tenant_id = %s AND Producto = ANY(%s)",
+            (tenant_id, nombres))
+        ids.update(int(f["id"]) for f in filas)
+    if categorias:
+        filas = _q(conn,
+            "SELECT DISTINCT pc.producto_id AS id FROM producto_categorias pc "
+            "JOIN categorias c ON c.id = pc.categoria_id "
+            "WHERE c.tenant_id = %s AND c.nombre = ANY(%s)",
+            (tenant_id, categorias))
+        ids.update(int(f["id"]) for f in filas)
+    if not ids:
+        raise ValueError("El alcance del conteo parcial no incluye ningún producto")
+    return sorted(ids)
+
+
+def abrir_conteo(tenant_id: str, alcance: dict | None = None) -> dict:
+    """
+    Abre una sesión y congela el snapshot: un renglón por producto+variación
+    con el stock consolidado actual (lotes activos).
+
+    `alcance` (057) hace el conteo PARCIAL: {'categorias': [...]} y/o
+    {'producto_ids': [...]} (unión). Solo esos productos entran al snapshot;
+    el resto del inventario queda fuera y el cierre no lo toca. None = completo.
+    """
+    if query("SELECT 1 FROM conteos WHERE tenant_id = %s AND estado = 'abierto'", (tenant_id,)):
+        return {"ok": False, "tipo": "validacion",
+                "mensaje": "Ya hay un conteo abierto: captura y ciérralo antes de iniciar otro."}
+    if alcance is not None and not isinstance(alcance, dict):
+        return {"ok": False, "tipo": "validacion", "mensaje": "El alcance del conteo es inválido"}
+    if isinstance(alcance, dict) and not (alcance.get("categorias") or alcance.get("productos")
+                                          or alcance.get("producto_ids")):
+        alcance = None   # alcance vacío = conteo completo
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # Resolución del alcance DENTRO de la transacción: los ids se
+            # congelan con el snapshot (por categoría puede variar si
+            # alguien mueve productos a mitad de segundo).
+            ids_alcance = None
+            if alcance:
+                ids_alcance = _resolver_alcance(conn, alcance, tenant_id)
+            alcance_guardado = None
+            if ids_alcance:
+                alcance_guardado = {
+                    "producto_ids": ids_alcance,
+                    "categorias": [str(c).strip() for c in (alcance.get("categorias") or [])] or None,
+                }
+            cur.execute(
+                "INSERT INTO conteos (tenant_id, alcance) VALUES (%s, %s) RETURNING id, abierto_at, alcance",
+                (tenant_id, psycopg2.extras.Json(alcance_guardado)))
             conteo = dict(cur.fetchone())
             # Snapshot en un solo INSERT...SELECT: atómico y sin lectura previa.
-            cur.execute(
-                "INSERT INTO conteo_items (conteo_id, tenant_id, producto_id, producto, variacion, esperado) "
-                f"SELECT %s, %s, s.producto_id, s.producto, s.variacion, s.stock FROM ({_AGRUPADO_SQL}) s",
-                (conteo["id"], tenant_id, tenant_id))
+            if ids_alcance:
+                snapshot_sql = _AGRUPADO_SQL.replace(
+                    "GROUP BY", "AND p.id = ANY(%s) GROUP BY")   # filtro del alcance
+                cur.execute(
+                    "INSERT INTO conteo_items (conteo_id, tenant_id, producto_id, producto, variacion, esperado) "
+                    f"SELECT %s, %s, s.producto_id, s.producto, s.variacion, s.stock FROM ({snapshot_sql}) s",
+                    (conteo["id"], tenant_id, tenant_id, ids_alcance))
+            else:
+                cur.execute(
+                    "INSERT INTO conteo_items (conteo_id, tenant_id, producto_id, producto, variacion, esperado) "
+                    f"SELECT %s, %s, s.producto_id, s.producto, s.variacion, s.stock FROM ({_AGRUPADO_SQL}) s",
+                    (conteo["id"], tenant_id, tenant_id))
             cur.execute(
                 "SELECT id, producto_id, producto, variacion, esperado, contado "
                 "FROM conteo_items WHERE conteo_id = %s ORDER BY producto, variacion",
@@ -184,6 +354,9 @@ def abrir_conteo(tenant_id: str) -> dict:
             it["esperado"] = float(it["esperado"])
         conn.commit()
         return {"ok": True, "conteo": {**conteo, "estado": "abierto"}, "items": items}
+    except ValueError as e:
+        conn.rollback()
+        return {"ok": False, "tipo": "validacion", "mensaje": str(e)}
     except UniqueViolation:
         # Carrera con otro "abrir" simultáneo: el índice único parcial protege.
         conn.rollback()
@@ -249,15 +422,20 @@ def guardar_capturas(conteo_id: str, tenant_id: str, items: list[dict]) -> dict:
 
 
 def _registrar_entrada_no_registrada(conn, item: dict, cantidad: float, resolucion: dict,
-                                     variacion_id: int | None, tenant_id: str, conteo_id: str) -> None:
+                                     variacion_id: int | None, tenant_id: str, conteo_id: str,
+                                     producto_id: int | None = None,
+                                     concepto: str | None = None) -> None:
     """Sobrante clasificado como mercancía que llegó sin alta: crea un lote
-    nuevo con el costo/precio indicados (o los del último lote activo)."""
+    nuevo con el costo/precio indicados (o los del último lote activo).
+    Los renglones MANUALES la reutilizan pasando producto_id (el producto
+    recién dado de alta) y su concepto."""
     ultimo = _q(conn,
         "SELECT Costo, Precio_Venta FROM lotes "
         "WHERE producto_id = %s AND Estado = 'Activo' AND tenant_id = %s "
         "AND variacion_id IS NOT DISTINCT FROM %s "
         "ORDER BY Fecha_Entrada DESC, id DESC LIMIT 1",
-        (item["producto_id"], tenant_id, variacion_id))
+        (producto_id if producto_id is not None else item["producto_id"],
+         tenant_id, variacion_id))
     costo = resolucion.get("costo")
     if costo is None:
         costo = float(ultimo[0]["costo"]) if ultimo else 0.0
@@ -271,12 +449,12 @@ def _registrar_entrada_no_registrada(conn, item: dict, cantidad: float, resoluci
         INSERT INTO lotes (ID_Lote, Producto, producto_id, Costo, Precio_Venta, Stock_Lote,
                            Fecha_Entrada, fecha_entrada_ts, Estado, tenant_id, etiqueta, variacion_id)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'Activo', %s, 'Conteo', %s)
-    """, (id_lote, item["producto"], item["producto_id"], float(costo or 0), float(precio or 0),
-          cantidad, fecha, _parsear_ts(fecha), tenant_id, variacion_id))
+    """, (id_lote, item["producto"], producto_id if producto_id is not None else item["producto_id"],
+          float(costo or 0), float(precio or 0), cantidad, fecha, _parsear_ts(fecha), tenant_id, variacion_id))
     registrar_movimiento_inventario(
         tenant_id, item["producto"], "entrada", "conteo", cantidad,
         id_lote=id_lote, referencia_id=conteo_id,
-        concepto="Mercancía hallada en conteo (ingreso no registrado)", conn=conn)
+        concepto=concepto or "Mercancía hallada en conteo (ingreso no registrado)", conn=conn)
 
 
 def _ajustar_sobrante(conn, item: dict, cantidad: float, variacion_id: int | None,
@@ -319,11 +497,15 @@ def cerrar_conteo(conteo_id: str, tenant_id: str,
         durante el conteo, la venta del POS ya bajó el stock y aquí cuadra).
       - Faltante (Δ<0): merma (default) | venta | error_sistema.
       - Sobrante (Δ>0): error_sistema (default) | entrada_no_registrada.
+      - Renglón manual (origen='manual', producto no registrado): venta
+        declarada (inicial − contado, precio REAL) + alta del remanente.
 
     'venta' genera una orden retroactiva REAL (mismo camino que un cobro del
     POS: PEPS + insertar_venta + ledger), con la fecha indicada — así las
     ventas del bazar caen al día contable correcto y las estadísticas las
-    cuentan de forma natural.
+    cuentan de forma natural. La resolución 'venta' admite precio_real: el
+    precio REAL al que se vendió (subasta/descuento); sin él se usa el precio
+    de lista del lote PEPS.
 
     Todo en UNA transacción: cualquier fallo revierte stock, ventas, ledger
     y el cierre completo.
@@ -349,7 +531,7 @@ def cerrar_conteo(conteo_id: str, tenant_id: str,
                     "mensaje": "El conteo ya está cerrado; revisa el historial para ver su resultado."}
 
         items = _q(conn,
-            "SELECT id, producto_id, producto, variacion, esperado, contado "
+            "SELECT id, producto_id, producto, variacion, esperado, contado, origen, inicial "
             "FROM conteo_items WHERE conteo_id = %s ORDER BY producto, variacion",
             (conteo_id,))
 
@@ -381,6 +563,78 @@ def cerrar_conteo(conteo_id: str, tenant_id: str,
             if contado is None:
                 actualizaciones.append((None, None, "sin_contar", it["id"]))
                 resumen["sin_contar"] += 1
+                continue
+
+            # ── Renglón MANUAL (producto que nunca se registró): no hay stock
+            # de sistema contra qué comparar. Al cerrar: si declaró 'inicial'
+            # y vendió (inicial > contado) se crea la venta retroactiva con el
+            # precio REAL y el costo capturados; lo que quedó se da de ALTA
+            # como producto nuevo + lote 'Conteo' con costo/precio indicados.
+            # La venta no descuenta stock (nunca hubo) y queda ligada al
+            # producto recién creado (ventas.producto_id es NOT NULL).
+            if (it.get("origen") or "snapshot") == "manual":
+                pedida_m = pedidas.get(key) or {}
+                costo_m = pedida_m.get("costo")
+                costo_m = round(float(costo_m), 2) if costo_m is not None else 0.0
+                if costo_m < 0:
+                    raise ValueError(
+                        f"'{it['producto']}': el costo no puede ser negativo")
+                precio_lote_m = pedida_m.get("precio_venta")
+                precio_real_m = pedida_m.get("precio_real")
+                inicial_m = it.get("inicial")
+                vendidas = (round(float(inicial_m) - contado, 3)
+                            if inicial_m is not None else None)
+
+                producto_id_manual = _alta_producto_manual(conn, it["producto"], tenant_id)
+
+                # Venta declarada (solo si recordó el inicial y vendió algo)
+                if vendidas is not None and vendidas > _EPSILON:
+                    if precio_real_m is None:
+                        raise ValueError(
+                            f"'{it['producto']}': declara el precio REAL al que vendió "
+                            "— al no estar registrado no hay precio de lista")
+                    precio_real_m = round(float(precio_real_m), 2)
+                    if precio_real_m < 0:
+                        raise ValueError(
+                            f"'{it['producto']}': el precio real de la venta declarada "
+                            "no puede ser negativo")
+                    ventas_a_guardar.append({
+                        "fecha": fecha_texto or str(ahora_negocio(tenant_id)),
+                        "producto": it["producto"],
+                        "cantidad": vendidas,
+                        "precio_lista": precio_real_m,
+                        "precio_real": precio_real_m,
+                        "costo_unitario": costo_m,
+                        "total_venta": precio_real_m * vendidas,
+                        "ganancia_bruta": (precio_real_m - costo_m) * vendidas,
+                        "id_lote": None,
+                        "tipo_producto": "stock",
+                        "variacion": "",
+                        "descripcion": "Venta declarada en conteo (producto no registrado)",
+                    })
+                    resumen["ventas"] += 1
+
+                # Alta del remanente físico (si quedó algo que contar)
+                if contado > _EPSILON:
+                    # Sin precio a futuro declarado, el lote hereda el precio
+                    # real de la venta (mejor default que 0: el producto acaba
+                    # de crearse, no hay lotes previos de dónde heredar).
+                    if pedida_m.get("precio_venta") is None and precio_real_m is not None:
+                        pedida_m = {**pedida_m, "precio_venta": precio_real_m}
+                    _registrar_entrada_no_registrada(
+                        conn, it, contado, pedida_m, None, tenant_id, conteo_ref,
+                        producto_id=producto_id_manual,
+                        concepto="Alta desde conteo (producto no registrado)")
+                    resumen["entradas"] += 1
+
+                # Historial autocontenido: vivo=inicial declarado y
+                # delta=contado−vivo (negativo = vendido), igual que la UI.
+                resolucion_manual = ("venta" if vendidas is not None and vendidas > _EPSILON
+                                     else "entrada_no_registrada")
+                vivo_manual = float(inicial_m) if inicial_m is not None else None
+                delta_manual = (round(contado - vivo_manual, 3)
+                                if vivo_manual is not None else None)
+                actualizaciones.append((vivo_manual, delta_manual, resolucion_manual, it["id"]))
                 continue
 
             # El producto desapareció durante el conteo (baja/renombre): no se
@@ -416,18 +670,30 @@ def cerrar_conteo(conteo_id: str, tenant_id: str,
 
             if res == "venta":
                 # Venta declarada: descuenta PEPS (bloqueando lotes) y cada
-                # renglón se cobra al precio de lista del lote que salió.
+                # renglón se cobra al precio REAL declarado por el usuario
+                # (subasta, descuento, oferta…); si no lo declaró, al precio
+                # de lista del lote que salió. El mismo precio por unidad
+                # aplica a todos los chunks: aunque el faltante cruce varios
+                # lotes PEPS, el cliente pagó un solo precio por pieza.
+                precio_declarado = pedida.get("precio_real")
+                if precio_declarado is not None and float(precio_declarado) < 0:
+                    raise ValueError(
+                        f"'{it['producto']}' ({it['variacion'] or 'base'}): "
+                        "el precio real de la venta declarada no puede ser negativo")
                 for chunk in descontar_stock_peps(
                         it["producto"], cantidad, 0.0, tenant_id,
                         variacion_id=variacion_id, conn=conn):
-                    precio = float(chunk.get("precio_lista") or 0)
+                    precio = (round(float(precio_declarado), 2)
+                              if precio_declarado is not None
+                              else float(chunk.get("precio_lista") or 0))
+                    precio_lista = float(chunk.get("precio_lista") or 0)
                     cant = float(chunk["cantidad"])
                     costo = float(chunk.get("costo_unitario") or 0)
                     ventas_a_guardar.append({
                         "fecha": fecha_texto or str(ahora_negocio(tenant_id)),
                         "producto": it["producto"],
                         "cantidad": cant,
-                        "precio_lista": precio,
+                        "precio_lista": precio_lista,
                         "precio_real": precio,
                         "costo_unitario": costo,
                         "total_venta": precio * cant,

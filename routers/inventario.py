@@ -61,6 +61,8 @@ from schemas.inventario import (
     ReordenarCategorias,
     GuardarCapturasConteo,
     CerrarConteo,
+    AbrirConteo,
+    RenglonManualConteo,
 )
 
 router = APIRouter(prefix="/inventario", tags=["Inventario"])
@@ -522,10 +524,11 @@ def reordenar_imagenes(producto: str, data: ReordenarImagenes, tenant_id: str = 
 
 
 # ==============================================================================
-# Conteos de auditoría (conteo físico vs sistema — migración 041)
+# Conteos de auditoría (conteo físico vs sistema — migraciones 041 y 056)
 #
 # Ciclo: POST /conteos (abre y congela snapshot) → PATCH /conteos/{id}/items
-# (autosave acumulativo) → POST /conteos/{id}/cerrar (resuelve diferencias:
+# (autosave acumulativo) y POST /conteos/{id}/items-manual (renglones de
+# productos no registrados) → POST /conteos/{id}/cerrar (resuelve diferencias:
 # merma / venta declarada / ingreso hallado / error del sistema).
 # ==============================================================================
 
@@ -543,13 +546,17 @@ def _traducir_error_conteo(resultado: dict) -> None:
 
 
 @router.post("/conteos")
-def iniciar_conteo(tenant_id: str = Depends(get_tenant_id)):
+def iniciar_conteo(data: AbrirConteo | None = None, tenant_id: str = Depends(get_tenant_id)):
     """
     Abre una sesión de conteo de auditoría congelando el snapshot del stock
     (un renglón por producto+variación, incluidos los de stock 0). Solo puede
     haber UN conteo abierto por tenant a la vez.
+
+    Con `alcance` (categorías y/o producto_ids) el conteo es PARCIAL: solo
+    esos productos entran al snapshot y el resto del inventario no se toca.
     """
-    resultado = conteos.abrir_conteo(tenant_id)
+    alcance = data.alcance.model_dump(exclude_none=True) if (data and data.alcance) else None
+    resultado = conteos.abrir_conteo(tenant_id, alcance)
     if not resultado.get("ok"):
         _traducir_error_conteo(resultado)
     return resultado
@@ -593,6 +600,24 @@ def guardar_capturas_conteo(conteo_id: str, data: GuardarCapturasConteo,
     return resultado
 
 
+@router.post("/conteos/{conteo_id}/items-manual")
+def agregar_renglon_manual(conteo_id: str, data: RenglonManualConteo,
+                           tenant_id: str = Depends(get_tenant_id)):
+    """
+    Agrega al conteo abierto un renglón MANUAL: un producto que nunca se
+    registró en el inventario y por eso no está en el snapshot. Con `inicial`
+    (cuánto había al inicio), al cerrar la diferencia se declara como venta;
+    lo contado se da de alta como producto nuevo + lote 'Conteo'.
+    Idempotente: si el nombre ya tiene renglón en este conteo, actualiza su
+    `inicial`.
+    """
+    resultado = conteos.agregar_renglon_manual(
+        conteo_id, tenant_id, data.producto, data.inicial, data.contado)
+    if not resultado.get("ok"):
+        _traducir_error_conteo(resultado)
+    return resultado
+
+
 @router.post("/conteos/{conteo_id}/cerrar")
 def cerrar_conteo(conteo_id: str, data: CerrarConteo, tenant_id: str = Depends(get_tenant_id)):
     """
@@ -603,6 +628,9 @@ def cerrar_conteo(conteo_id: str, data: CerrarConteo, tenant_id: str = Depends(g
       error_sistema.
     - Sobrante: error_sistema (default) | entrada_no_registrada (crea un lote
       con el costo indicado).
+    - Renglones manuales (056): el producto no registrado se da de alta con
+      lo contado y, si declaró 'inicial', la venta (inicial − contado) con
+      precio REAL.
     - Renglones sin captura o que cuadran no se tocan.
 
     `fecha` ('YYYY-MM-DD') aplica a las ventas declaradas para que caigan al
