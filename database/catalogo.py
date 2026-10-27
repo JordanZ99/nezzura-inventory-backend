@@ -402,6 +402,31 @@ def obtener_catalogo_publico(slug: str) -> dict:
             "stock": float(v["stock"] or 0),
         })
 
+    # 3c. Desglose por PRECIO: lotes activos CON stock agrupados por precio.
+    #     El mismo producto comprado a distinto costo sale a distinto precio
+    #     (ej. plantas: un lote a $120 y otro a $160) — el modal muestra
+    #     "cuántas uds quedan a cada precio". Solo precio y unidades: el costo
+    #     NUNCA se expone en el catálogo público. Los lotes ligados a una
+    #     variación quedan fuera (cada variación ya trae su precio/stock).
+    precios_lote = query("""
+        SELECT p.Producto AS producto, l.Precio_Venta AS precio,
+               SUM(l.Stock_Lote) AS stock
+        FROM lotes l
+        JOIN productos p ON p.id = l.producto_id
+        WHERE l.tenant_id = %s AND p.tenant_id = %s
+          AND p.Estado = 'Activo' AND p.visible_en_catalogo = true
+          AND l.Estado = 'Activo' AND l.Stock_Lote > 0
+          AND l.variacion_id IS NULL
+        GROUP BY p.Producto, l.Precio_Venta
+        ORDER BY p.Producto ASC, l.Precio_Venta ASC
+    """, (tenant_id, tenant_id))
+    precios_por_producto: dict = {}
+    for fila in precios_lote:
+        precios_por_producto.setdefault(fila["producto"], []).append({
+            "precio": round(float(fila["precio"] or 0), 2),
+            "stock": float(fila["stock"] or 0),
+        })
+
     # Armar el campo imagenes (sin duplicados y sin "No hay foto")
     for p in productos:
         galeria: list[str] = []
@@ -412,6 +437,9 @@ def obtener_catalogo_publico(slug: str) -> dict:
                 galeria.append(url)
         p["imagenes"] = galeria
         p["variaciones"] = variaciones_por_producto.get(p["producto"], [])
+        # El desglose por precio solo aplica SIN variaciones (con variaciones
+        # cada una gobierna su propio precio/stock y se muestra "desde $X").
+        p["precios"] = [] if p["variaciones"] else precios_por_producto.get(p["producto"], [])
 
     # Si el tenant oculta los productos agotados, excluirlos de la respuesta.
     if bool(cfg.get("ocultar_agotados")):

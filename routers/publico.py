@@ -38,8 +38,11 @@ def obtener_catalogo_publico(slug: str, response: Response):
     Respuesta (sin tenant_id, sin costos, sin datos sensibles):
     {
       "config": { "titulo", "subtitulo", "tema", "template", "mostrar_precios", ... },
-      "productos": [{ "producto", "descripcion", "imagen", "imagenes", "precio_venta", "precio_min", "precio_max", "stock_total", "categoria", "sufijo_precio", "tamano_cm", "tipo_producto" }]
-        donde "imagenes" es la galería completa (principal + extras de producto_imagenes)
+      "productos": [{ "producto", "descripcion", "imagen", "imagenes", "precio_venta", "precio_min", "precio_max", "stock_total", "categoria", "sufijo_precio", "tamano_cm", "tipo_producto", "precios", "variaciones" }]
+        donde "imagenes" es la galería completa (principal + extras de producto_imagenes),
+        "precios" es el desglose [{precio, stock}] de lotes con stock a distinto
+        precio (solo productos SIN variaciones — el costo nunca se expone) y
+        "variaciones" trae su precio/stock propio por presentación
     }
     """
     # Cache-Control: prohibir caché para garantizar datos frescos
