@@ -492,11 +492,14 @@ def listar_imagenes_producto(producto: str, tenant_id: str) -> list:
     )
     try:
         if _get_tenant_plan(tenant_id) == "plus":
+            # Alias `AS imagen`: la clave del dict viene en minúscula
+            # (PostgreSQL folda `Imagen` → "imagen"). Sin el alias, el repair
+            # nunca detectaba la principal y quedaba como código muerto.
             fila_prod = query(
-                "SELECT Imagen FROM productos WHERE id = %s AND tenant_id = %s",
+                "SELECT Imagen AS imagen FROM productos WHERE id = %s AND tenant_id = %s",
                 (producto_id, tenant_id)
             )
-            principal = (fila_prod[0].get("Imagen") or "").strip() if fila_prod else ""
+            principal = (fila_prod[0].get("imagen") or "").strip() if fila_prod else ""
             tiene_principal = bool(principal) and principal != "No hay foto"
             en_galeria = any(r.get("url") == principal for r in resultado)
             if tiene_principal and not en_galeria:
@@ -581,12 +584,17 @@ def subir_imagen_extra(producto: str, contents: bytes, orden_target, tenant_id: 
         # (Antes la primera extra tomaba el slot 1 y SOBREESCRIBÍA la foto
         #  principal — el bug por el que "la foto 2 reemplazaba a la 1".)
         tiene_principal = False
+        # La clave del dict devuelve en MINÚSCULA (PostgreSQL folda los
+        # identificadores no citados: `SELECT Imagen` llega como "imagen");
+        # leer .get("Imagen") siempre daba "" y la primera extra tomaba el
+        # slot 1, sobrescribiendo la foto principal (bug "la foto 2 pisa a la 1").
+        # Alias `AS imagen` + clave minúscula, mismo patrón que get_productos_meta.
         fila_prod = query(
-            "SELECT Imagen FROM productos WHERE id = %s AND tenant_id = %s",
+            "SELECT Imagen AS imagen FROM productos WHERE id = %s AND tenant_id = %s",
             (producto_id, tenant_id)
         )
         if fila_prod:
-            img = fila_prod[0].get("Imagen") or ""
+            img = fila_prod[0].get("imagen") or ""
             tiene_principal = bool(img) and img != "No hay foto"
 
         conteo = query(
@@ -650,13 +658,15 @@ def subir_imagen_extra(producto: str, contents: bytes, orden_target, tenant_id: 
                     (url, reemplazo_id, tenant_id)
                 )
             else:
-                # Inserción nueva: recomputar slot libre y capacidad bajo el lock
+                # Inserción nueva: recomputar slot libre y capacidad bajo el lock.
+                # Alias `AS imagen`: la clave del dict viene en minúscula
+                # (PostgreSQL folda `Imagen` → "imagen"); ver el pre-check del paso 4.
                 cur.execute(
-                    "SELECT Imagen FROM productos WHERE id=%s AND tenant_id=%s",
+                    "SELECT Imagen AS imagen FROM productos WHERE id=%s AND tenant_id=%s",
                     (producto_id, tenant_id)
                 )
                 fila_lock = cur.fetchone() or {}
-                img_lock = fila_lock.get("Imagen") or ""
+                img_lock = fila_lock.get("imagen") or ""
                 tiene_principal_lock = bool(img_lock) and img_lock != "No hay foto"
 
                 cur.execute(
