@@ -38,6 +38,7 @@ class ActualizarCatalogo(BaseModel):
     banner_texto_color: Optional[str] = None
     banner_mostrar_texto: Optional[bool] = None
     banner_mostrar_logo: Optional[bool] = None
+    banner_mostrar_redes: Optional[bool] = None
     anuncio_texto: Optional[str] = None
     # Fondo del catálogo con imagen (migración 045)
     fondo_url: Optional[str] = None

@@ -26,7 +26,7 @@ FUENTES_CATALOGO = ("serif", "sistema", "playfair", "cormorant", "poppins", "qui
 _SELECT_CONFIG_GESTION = (
     "SELECT cc.id, cc.slug, cc.activo, cc.tema, cc.template, cc.titulo, cc.subtitulo, cc.fuente, "
     "       cc.mostrar_precios, cc.mostrar_stock, cc.mostrar_categorias, cc.agrupar_por_categoria, cc.columnas_movil, cc.permitir_descarga, cc.ocultar_agotados, cc.relacion_imagen, "
-    "       cc.banner_url, cc.banner_url_movil, cc.hero_estilo, cc.banner_texto_color, cc.banner_mostrar_texto, cc.banner_mostrar_logo, cc.anuncio_texto, "
+    "       cc.banner_url, cc.banner_url_movil, cc.hero_estilo, cc.banner_texto_color, cc.banner_mostrar_texto, cc.banner_mostrar_logo, cc.banner_mostrar_redes, cc.anuncio_texto, "
     "       cc.fondo_url, cc.fondo_modo, cc.fondo_opacidad, cc.fondo_color, "
     "       cc.hero_url, cc.hero_url_movil, cc.hero_color, cc.hero_opacidad, cc.hero_layout, "
     "       cc.created_at, "
@@ -229,6 +229,9 @@ def actualizar_config(campos: dict, tenant_id: str) -> dict:
     if campos.get("banner_mostrar_logo") is not None:
         asignaciones.append("banner_mostrar_logo = %s")
         valores.append(campos["banner_mostrar_logo"])
+    if campos.get("banner_mostrar_redes") is not None:
+        asignaciones.append("banner_mostrar_redes = %s")
+        valores.append(campos["banner_mostrar_redes"])
     if campos.get("anuncio_texto") is not None:
         asignaciones.append("anuncio_texto = %s")
         valores.append(campos["anuncio_texto"])
@@ -311,7 +314,7 @@ def obtener_catalogo_publico(slug: str) -> dict:
     config_rows = query(
         "SELECT cc.tenant_id, cc.tema, cc.template, cc.titulo, cc.subtitulo, cc.fuente, "
         "       cc.mostrar_precios, cc.mostrar_stock, cc.mostrar_categorias, cc.agrupar_por_categoria, cc.columnas_movil, cc.permitir_descarga, cc.ocultar_agotados, cc.relacion_imagen, "
-        "       cc.banner_url, cc.banner_url_movil, cc.hero_estilo, cc.banner_texto_color, cc.banner_mostrar_texto, cc.banner_mostrar_logo, cc.anuncio_texto, "
+        "       cc.banner_url, cc.banner_url_movil, cc.hero_estilo, cc.banner_texto_color, cc.banner_mostrar_texto, cc.banner_mostrar_logo, cc.banner_mostrar_redes, cc.anuncio_texto, "
         "       cc.fondo_url, cc.fondo_modo, cc.fondo_opacidad, cc.fondo_color, "
         "       cc.hero_url, cc.hero_url_movil, cc.hero_color, cc.hero_opacidad, cc.hero_layout, "
         "       t.logo, t.telefono, t.correo, t.instagram, t.facebook, t.tiktok, t.sitio_web, t.maps "
@@ -493,6 +496,7 @@ def obtener_catalogo_publico(slug: str) -> dict:
             "banner_texto_color": cfg.get("banner_texto_color") or "#ffffff",
             "banner_mostrar_texto": cfg.get("banner_mostrar_texto") is not False,
             "banner_mostrar_logo": cfg.get("banner_mostrar_logo") is not False,
+            "banner_mostrar_redes": cfg.get("banner_mostrar_redes") is not False,
             "anuncio_texto": cfg.get("anuncio_texto") or "",
             "relacion_imagen": cfg.get("relacion_imagen") or "1:1",
             "logo": cfg.get("logo") or "",
