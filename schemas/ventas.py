@@ -11,8 +11,11 @@ class ItemCarrito(BaseModel):
     # Venta libre (migración 036): renglón del producto genérico 'Venta libre'.
     # descripcion = texto libre para el ticket ("Cereal", "Silla usada");
     # costo = costo opcional capturado en el POS (default 0 → ganancia = precio).
+    # categoria = categoría del tenant elegida en el POS (migración 060); sin
+    # ella el renglón cuenta como "Sin categoría".
     descripcion: Optional[str] = None
     costo      : Optional[float] = None
+    categoria  : Optional[str] = None
 
 
 class PagoItem(BaseModel):

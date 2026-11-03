@@ -247,7 +247,7 @@ def ventas_producto_periodo(tenant_id: str, producto: str, desde_ts, hasta_ts) -
     Mismas columnas que get_ventas para respetar el contrato del frontend."""
     f_v, p_v = _filtro_ventana(desde_ts, hasta_ts, "fecha_ts")
     return query(
-        "SELECT id, n_ticket, fecha, producto, cantidad, precio_lista, precio_real, "
+        "SELECT id, n_ticket, fecha, producto, descripcion, categoria, cantidad, precio_lista, precio_real, "
         "costo_unitario, total_venta, ganancia_bruta, estado, tipo_producto, variacion, consumo, orden_id "
         "FROM ventas WHERE tenant_id = %s AND producto = %s" + f_v +
         " ORDER BY fecha_ts DESC",

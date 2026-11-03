@@ -40,7 +40,7 @@ def listar_mesas(tenant_id: str) -> list[dict]:
     for m in filas:
         m["items"] = []
     items = query(
-        "SELECT id, mesa_id, producto, descripcion, variacion, cantidad, "
+        "SELECT id, mesa_id, producto, descripcion, categoria, variacion, cantidad, "
         "       precio_unitario, costo, notas, creado_en "
         "FROM mesa_items WHERE tenant_id = %s "
         "ORDER BY creado_en ASC, id ASC",
@@ -252,14 +252,15 @@ def agregar_items_mesa(mesa_id: str, tenant_id: str, items: list[dict]) -> dict:
 
             for it in items:
                 cur.execute(
-                    "INSERT INTO mesa_items (tenant_id, mesa_id, producto, descripcion, variacion, "
+                    "INSERT INTO mesa_items (tenant_id, mesa_id, producto, descripcion, categoria, variacion, "
                     "                        cantidad, precio_unitario, costo, notas) "
-                    "VALUES (%s, %s::uuid, %s, %s, %s, %s, %s, %s, %s)",
+                    "VALUES (%s, %s::uuid, %s, %s, %s, %s, %s, %s, %s, %s)",
                     (
                         tenant_id,
                         mesa_id,
                         str(it["producto"]).strip(),
                         (str(it.get("descripcion")).strip() or None) if it.get("descripcion") else None,
+                        (str(it.get("categoria")).strip() or None) if it.get("categoria") else None,
                         (str(it.get("variacion")).strip() or None) if it.get("variacion") else None,
                         float(it["cantidad"]),
                         float(it.get("precio_unitario") or 0),

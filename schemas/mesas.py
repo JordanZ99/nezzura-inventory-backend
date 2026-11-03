@@ -33,6 +33,7 @@ class ItemMesa(BaseModel):
     descripcion    : Optional[str] = None   # texto libre de la venta libre
     variacion      : Optional[str] = None
     costo          : Optional[float] = None  # solo venta libre
+    categoria      : Optional[str] = None    # categoría del tenant (migración 060, solo venta libre)
     notas          : Optional[str] = None
 
 

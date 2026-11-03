@@ -25,7 +25,7 @@ def get_ventas(
     pasa el mes contable actual, evitando transportar todo el historial.
     """
     sql = (
-        "SELECT id, n_ticket, fecha, producto, descripcion, cantidad, precio_lista, precio_real, "
+        "SELECT id, n_ticket, fecha, producto, descripcion, categoria, cantidad, precio_lista, precio_real, "
         "costo_unitario, total_venta, ganancia_bruta, estado, tipo_producto, variacion, consumo, orden_id "
         "FROM ventas WHERE tenant_id = %s"
     )
@@ -216,7 +216,7 @@ def get_ordenes(
                 return []
             ids = [o["id"] for o in ordenes]
             cur.execute(
-                "SELECT id, n_ticket, fecha, producto, descripcion, cantidad, precio_lista, precio_real, "
+                "SELECT id, n_ticket, fecha, producto, descripcion, categoria, cantidad, precio_lista, precio_real, "
                 "       costo_unitario, total_venta, ganancia_bruta, estado, tipo_producto, "
                 "       variacion, consumo, orden_id "
                 "FROM ventas WHERE tenant_id = %s AND orden_id = ANY(%s::uuid[]) "
@@ -318,7 +318,7 @@ def _anidar_renglones(tenant_id: str, ordenes: list[dict]) -> None:
         return
     ids = [o["id"] for o in ordenes]
     renglones = query(
-        "SELECT id, n_ticket, fecha, producto, descripcion, cantidad, precio_lista, precio_real, "
+        "SELECT id, n_ticket, fecha, producto, descripcion, categoria, cantidad, precio_lista, precio_real, "
         "       costo_unitario, total_venta, ganancia_bruta, estado, tipo_producto, "
         "       variacion, consumo, orden_id "
         "FROM ventas WHERE tenant_id = %s AND orden_id = ANY(%s::uuid[]) "
@@ -359,8 +359,8 @@ def insertar_venta(venta: dict, tenant_id: str, conn=None) -> None:
         INSERT INTO ventas
             (Fecha, fecha_ts, Producto, producto_id, Cantidad, Precio_Lista,
              Precio_Real, Costo_Unitario, Total_Venta, Ganancia_Bruta, Estado, ID_Lote, tenant_id,
-             tipo_producto, variacion, consumo, orden_id, n_ticket, descripcion)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'Activo', %s, %s, %s, %s, %s, %s, %s, %s)
+             tipo_producto, variacion, consumo, orden_id, n_ticket, descripcion, categoria)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'Activo', %s, %s, %s, %s, %s, %s, %s, %s, %s)
     """
     params = (
         venta["fecha"],
@@ -381,6 +381,7 @@ def insertar_venta(venta: dict, tenant_id: str, conn=None) -> None:
         venta.get("orden_id"),
         venta.get("n_ticket"),
         (str(venta["descripcion"]).strip() or None) if venta.get("descripcion") else None,
+        (str(venta["categoria"]).strip() or None) if venta.get("categoria") else None,
     )
     if conn is not None:
         with conn.cursor() as cur:
@@ -1475,6 +1476,8 @@ def _preparar_venta_servicio(item: dict, prod: dict, variacion: str, tenant_id: 
         "tipo_producto" : "servicio",
         "variacion"     : variacion,
         "descripcion"   : (str(item.get("descripcion")).strip() or None) if item.get("descripcion") else None,
+        # Categoría del tenant elegida en el POS (migración 060); NULL = sin categoría
+        "categoria"     : (str(item.get("categoria")).strip() or None) if item.get("categoria") else None,
     }
 
 
