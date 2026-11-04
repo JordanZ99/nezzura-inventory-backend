@@ -117,7 +117,8 @@ def listar_cobros(
 
 def resumen(tenant_id: str, periodo: str | None = None) -> dict:
     """KPIs del home: pendiente total por antigüedad (AR aging buckets
-    0-30/31-60/61-90/+90 días de VENCIDO), cobrado del periodo y deudores."""
+    0-30/31-60/61-90/+90 días de VENCIDO), cobrado del periodo, deudores y
+    los próximos pagos por vencer (no vencidos, vencimiento ascendente)."""
     if not periodo:
         hoy = date.today()
         periodo = f"{hoy.year}-{hoy.month:02d}"
@@ -130,6 +131,7 @@ def resumen(tenant_id: str, periodo: str | None = None) -> dict:
     aging = {"actual": 0.0, "d30": 0.0, "d60": 0.0, "d90": 0.0, "mas90": 0.0}
     cobrado_periodo = 0.0
     deudores: dict[str, dict] = {}
+    proximos: list[dict] = []  # próximos pagos por vencer (card del dashboard)
 
     for c in cobros:
         # Dinero entrado en el periodo: los pagos cuya fecha cae en ese mes
@@ -163,9 +165,27 @@ def resumen(tenant_id: str, periodo: str | None = None) -> dict:
         else:
             aging["actual"] += c["saldo"]
 
+        # Próximos pagos: solo los AÚN NO vencidos (los vencidos viven en el
+        # aging y en deudores). El dashboard muestra los 6 más cercanos.
+        if not c["vencido"]:
+            proximos.append({
+                "cliente_id": c["cliente_id"],
+                "cliente_nombre": c["cliente_nombre"],
+                "concepto": c["concepto"],
+                "saldo": c["saldo"],
+                "vencimiento": ref.isoformat() if ref else None,
+                "vencido": False,
+                "dias_vencido": 0,
+            })
+
     deudores_list = sorted(deudores.values(), key=lambda d: -d["saldo"])
     for d in deudores_list:
         d["saldo"] = round(d["saldo"], 2)
+
+    proximos_list = sorted(
+        proximos,
+        key=lambda p: (p["vencimiento"] is None, p["vencimiento"] or "9999-12-31"),
+    )[:6]
 
     return {
         "periodo": periodo,
@@ -174,6 +194,7 @@ def resumen(tenant_id: str, periodo: str | None = None) -> dict:
         "cobrado_periodo": round(cobrado_periodo, 2),
         "aging": {k: round(v, 2) for k, v in aging.items()},
         "deudores": deudores_list,
+        "proximos": proximos_list,
     }
 
 
