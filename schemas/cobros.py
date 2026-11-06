@@ -55,21 +55,31 @@ class AbonoNuevo(BaseModel):
     fecha  : Optional[date] = None
 
 
+# Frecuencias de suscripción (mig 063). Semanal: cada 'dia_semana' del mes
+# (0=Lunes..6=Domingo). Quincenal: día 1 y día 15 de cada mes.
+FrecuenciaCuota = Literal["mensual", "semanal", "quincenal"]
+
+
 class CuotaNueva(BaseModel):
-    """Suscripción mensual: cliente + cuánto + qué día del mes vence (1..28,
-    para no pelear con fechas inexistentes)."""
-    cliente_id : str = Field(..., min_length=1)
-    concepto   : str = Field(..., min_length=1)
-    monto      : float = Field(..., gt=0)
-    dia_cobro  : int = Field(1, ge=1, le=28)
-    notas      : Optional[str] = None
+    """Suscripción recurrente: mensual (día 1..28 del mes), semanal (un día
+    de la semana, se genera en cada aparición del mes) o quincenal (día 1
+    y 15). El generador arma las fechas; el cobro maneja el dinero."""
+    cliente_id  : str = Field(..., min_length=1)
+    concepto    : str = Field(..., min_length=1)
+    monto       : float = Field(..., gt=0)
+    frecuencia  : FrecuenciaCuota = "mensual"
+    dia_cobro   : int = Field(1, ge=1, le=28, description="Solo mensual: día del mes")
+    dia_semana  : Optional[int] = Field(None, ge=0, le=6, description="Solo semanal: 0=Lunes..6=Domingo")
+    notas       : Optional[str] = None
 
 
 class CuotaActualizar(BaseModel):
-    """Todas las columnas son opcionales; el backend valida cada one que llegue."""
-    cliente_id : Optional[str] = None
-    concepto   : Optional[str] = None
-    monto      : Optional[float] = Field(None, gt=0)
-    dia_cobro  : Optional[int] = Field(None, ge=1, le=28)
-    activo     : Optional[bool] = None
-    notas      : Optional[str] = None
+    """Todas las columnas son opcionales; el backend valida cada una que llegue."""
+    cliente_id   : Optional[str] = None
+    concepto     : Optional[str] = None
+    monto        : Optional[float] = Field(None, gt=0)
+    frecuencia   : Optional[FrecuenciaCuota] = None
+    dia_cobro    : Optional[int] = Field(None, ge=1, le=28)
+    dia_semana   : Optional[int] = Field(None, ge=0, le=6)
+    activo       : Optional[bool] = None
+    notas        : Optional[str] = None

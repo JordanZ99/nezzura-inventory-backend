@@ -14,7 +14,7 @@
 
 import json
 import re
-from datetime import date
+from datetime import date, timedelta
 
 import psycopg2.extras
 
@@ -201,15 +201,38 @@ def resumen(tenant_id: str, periodo: str | None = None) -> dict:
 
 # ── Generador de periodos (cuotas → cobros del mes) ──────────────────────────
 
+def _fechas_de_cuota_en_mes(cuota: dict, anio: int, mes: int) -> list:
+    """Fechas de vencimiento de UNA cuota DENTRO del mes (mig 063):
+      mensual   → su dia_cobro (comportamiento de siempre).
+      semanal   → cada aparición del dia_semana en el mes (4-5 fechas).
+      quincenal → día 1 y día 15.
+    Cada fecha es una deuda concreta con su propio vencimiento; el índice
+    único (tenant, cuota, vencimiento) garantiza que no se dupliquen."""
+    f = cuota.get("frecuencia") or "mensual"
+    if f == "semanal":
+        ds = int(cuota["dia_semana"]) if cuota.get("dia_semana") is not None else 0
+        fecha = date(anio, mes, 1)
+        fecha += timedelta(days=(ds - fecha.weekday()) % 7)  # primer día que cae
+        fechas = []
+        while fecha.month == mes:
+            fechas.append(fecha)
+            fecha += timedelta(days=7)
+        return fechas
+    if f == "quincenal":
+        return [date(anio, mes, 1), date(anio, mes, 15)]
+    return [date(anio, mes, int(cuota["dia_cobro"]))]
+
+
 def generar_cobros(tenant_id: str, periodo: str) -> dict:
-    """Crea el cobro del periodo para cada cuota activa. Idempotente: si el
-    cobro ya existe (índice parcial único), no se duplica."""
+    """Crea los cobros del periodo para cada cuota activa (mig 063: mensuales,
+    semanales y quincenales). Idempotente: el par cuota+vencimiento que ya
+    existe no se duplica (índice parcial único)."""
     if not _REGEX_PERIODO.match(periodo or ""):
         return {"ok": False, "tipo": "validacion", "mensaje": "El periodo debe ser 'YYYY-MM' (ej. 2026-11)"}
 
     anio, mes = int(periodo[:4]), int(periodo[5:7])
     cuotas = query(
-        "SELECT id, cliente_id, concepto, monto, dia_cobro, notas "
+        "SELECT id, cliente_id, concepto, monto, dia_cobro, frecuencia, dia_semana, notas "
         "FROM cuotas_clientes WHERE tenant_id = %s AND activo",
         (tenant_id,)
     )
@@ -217,25 +240,28 @@ def generar_cobros(tenant_id: str, periodo: str) -> dict:
         return {"ok": True, "creados": 0, "omitidos": 0, "periodo": periodo,
                 "mensaje": "No hay cuotas activas que generar"}
 
-    existentes = {f["cuota_id"] for f in query(
-        "SELECT cuota_id FROM cobros WHERE tenant_id = %s AND periodo = %s AND cuota_id IS NOT NULL",
+    # existentes por (cuota, fecha): cubre mensual (una fecha al mes) y el
+    # resto (cada vencimiento concreto del mes).
+    existentes = {(f["cuota_id"], f["vencimiento"]) for f in query(
+        "SELECT cuota_id, vencimiento FROM cobros "
+        "WHERE tenant_id = %s AND periodo = %s AND cuota_id IS NOT NULL",
         (tenant_id, periodo)
     )}
 
     creados, omitidos = 0, 0
     for cuota in cuotas:
-        if cuota["id"] in existentes:
-            omitidos += 1
-            continue
-        vencimiento = date(anio, mes, cuota["dia_cobro"])
-        execute(
-            "INSERT INTO cobros (tenant_id, cliente_id, cuota_id, origen, concepto, "
-            "periodo, monto, vencimiento, notas) "
-            "VALUES (%s, %s, %s, 'cuota', %s, %s, %s, %s, %s)",
-            (tenant_id, cuota["cliente_id"], cuota["id"], cuota["concepto"],
-             periodo, cuota["monto"], vencimiento, cuota["notas"])
-        )
-        creados += 1
+        for vencimiento in _fechas_de_cuota_en_mes(cuota, anio, mes):
+            if (cuota["id"], vencimiento) in existentes:
+                omitidos += 1
+                continue
+            execute(
+                "INSERT INTO cobros (tenant_id, cliente_id, cuota_id, origen, concepto, "
+                "periodo, monto, vencimiento, notas) "
+                "VALUES (%s, %s, %s, 'cuota', %s, %s, %s, %s, %s)",
+                (tenant_id, cuota["cliente_id"], cuota["id"], cuota["concepto"],
+                 periodo, cuota["monto"], vencimiento, cuota["notas"])
+            )
+            creados += 1
 
     # Registro de actividad (062): generación del periodo (un solo renglón
     # resumido; cada cobro ya vive en la tabla cobros).
@@ -525,14 +551,33 @@ def _pago_payload(cobro: dict, entrada: dict | None = None) -> dict:
 
 _SELECT_CUOTAS = """
 SELECT q.id, q.tenant_id, q.cliente_id, q.concepto, q.monto, q.dia_cobro,
+       q.frecuencia, q.dia_semana,
        q.activo, q.notas, q.creado_en, cl.nombre AS cliente_nombre
 FROM cuotas_clientes q
 JOIN clientes cl ON cl.id = q.cliente_id
 """
 
+# Frecuencias soportadas (mig 063). Semanal: un cobro por cada dia_semana
+# (0=Lunes..6=Domingo, mismo orden que date.weekday() de Python). Quincenal:
+# dos cobros al mes, día 1 y día 15.
+_FRECUENCIAS = ("mensual", "semanal", "quincenal")
+DIAS_SEMANA = ("Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo")
+
+
+def _resumen_cuota(cuota: dict) -> str:
+    """Texto corto legible: 'el día 10 de cada mes', 'cada Lunes',
+    'los días 1 y 15 de cada mes'."""
+    f = cuota.get("frecuencia") or "mensual"
+    if f == "semanal":
+        ds = int(cuota["dia_semana"]) if cuota.get("dia_semana") is not None else 0
+        return f"cada {DIAS_SEMANA[ds]}"
+    if f == "quincenal":
+        return "los días 1 y 15 de cada mes"
+    return f"el día {int(cuota['dia_cobro'])} de cada mes"
+
 
 def listar_cuotas(tenant_id: str, solo_activas: bool = False) -> list[dict]:
-    """Tus suscripciones: a quién, cuánto, qué día del mes y si sigue vigente."""
+    """Tus suscripciones: a quién, cuánto, con qué frecuencia y si sigue vigente."""
     where = " WHERE q.tenant_id = %s"
     if solo_activas:
         where += " AND q.activo"
@@ -540,30 +585,48 @@ def listar_cuotas(tenant_id: str, solo_activas: bool = False) -> list[dict]:
 
 
 def crear_cuota(tenant_id: str, cliente_id: str, concepto: str, monto: float,
-                dia_cobro: int = 1, notas: str | None = None) -> dict:
+                dia_cobro: int = 1, notas: str | None = None,
+                frecuencia: str = "mensual", dia_semana: int | None = None) -> dict:
     concepto = (concepto or "").strip()
     if not concepto:
         return {"ok": False, "tipo": "validacion", "mensaje": "El concepto es obligatorio"}
     if monto is None or monto <= 0:
         return {"ok": False, "tipo": "validacion", "mensaje": "El monto debe ser mayor a 0"}
-    if dia_cobro is None or not (1 <= int(dia_cobro) <= 28):
-        return {"ok": False, "tipo": "validacion", "mensaje": "El día de cobro debe ser entre 1 y 28"}
+    if frecuencia not in _FRECUENCIAS:
+        return {"ok": False, "tipo": "validacion",
+                "mensaje": "La frecuencia debe ser mensual, semanal o quincenal"}
+    dia_semana_n = None
+    if frecuencia == "mensual":
+        if dia_cobro is None or not (1 <= int(dia_cobro) <= 28):
+            return {"ok": False, "tipo": "validacion", "mensaje": "El día de cobro debe ser entre 1 y 28"}
+    elif frecuencia == "semanal":
+        if dia_semana is None or int(dia_semana) not in (0, 1, 2, 3, 4, 5, 6):
+            return {"ok": False, "tipo": "validacion",
+                    "mensaje": "Elige el día de la semana (Lunes a Domingo)"}
+        dia_semana_n = int(dia_semana)
+        dia_cobro = 1  # placeholder de la col NOT NULL; no se usa en semanal
+    else:  # quincenal: fijo (1 y 15 de cada mes)
+        dia_cobro = 1
     if not query("SELECT 1 FROM clientes WHERE tenant_id = %s AND id = %s", (tenant_id, cliente_id)):
         return {"ok": False, "tipo": "no_encontrado", "mensaje": "Cliente no encontrado"}
     filas = query(
-        "INSERT INTO cuotas_clientes (tenant_id, cliente_id, concepto, monto, dia_cobro, notas) "
-        "VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
-        (tenant_id, cliente_id, concepto, round(monto, 2), int(dia_cobro), (notas or "").strip() or None)
+        "INSERT INTO cuotas_clientes (tenant_id, cliente_id, concepto, monto, dia_cobro, "
+        "frecuencia, dia_semana, notas) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+        (tenant_id, cliente_id, concepto, round(monto, 2), int(dia_cobro),
+         frecuencia, dia_semana_n, (notas or "").strip() or None)
     )
     cuota = query(_SELECT_CUOTAS + " WHERE q.tenant_id = %s AND q.id = %s", (tenant_id, filas[0]["id"]))[0]
-    # Registro de actividad (062): alta de cuota (suscripción mensual).
+    # Registro de actividad (062): alta de cuota (suscripción recurrente).
     try:
         registrar_actividad(
             tenant_id, "cobro", "cuota", "crear",
             resumen=f"Creó la cuota {concepto} de {cuota['cliente_nombre']} "
-                    f"({round(monto, 2):.2f}, día {int(dia_cobro)})",
+                    f"({round(monto, 2):.2f}, {_resumen_cuota(cuota)})",
             entidad_id=filas[0]["id"],
-            detalle={"monto": round(monto, 2), "dia_cobro": int(dia_cobro)},
+            detalle={"monto": round(monto, 2), "frecuencia": frecuencia,
+                     "dia_cobro": int(cuota["dia_cobro"]),
+                     **({"dia_semana": dia_semana_n} if dia_semana_n is not None else {})},
         )
     except Exception:
         pass
@@ -575,9 +638,10 @@ def actualizar_cuota(
     cliente_id: str | None = None, concepto: str | None = None,
     monto: float | None = None, dia_cobro: int | None = None,
     activo: bool | None = None, notas: str | None = None,
+    frecuencia: str | None = None, dia_semana: int | None = None,
 ) -> dict:
     actual = query(
-        "SELECT id, cliente_id, concepto, monto, dia_cobro, activo, notas "
+        "SELECT id, cliente_id, concepto, monto, dia_cobro, frecuencia, dia_semana, activo, notas "
         "FROM cuotas_clientes WHERE tenant_id = %s AND id = %s",
         (tenant_id, cuota_id)
     )
@@ -600,11 +664,32 @@ def actualizar_cuota(
             return {"ok": False, "tipo": "validacion", "mensaje": "El monto debe ser mayor a 0"}
         sets.append("monto = %s")
         params.append(round(monto, 2))
+
+    # ── Frecuencia (063): valida el PAR frecuencia+días que quedará final ──
+    frec_final = (frecuencia if frecuencia is not None else actual["frecuencia"]) or "mensual"
+    if frecuencia is not None and frecuencia not in _FRECUENCIAS:
+        return {"ok": False, "tipo": "validacion",
+                "mensaje": "La frecuencia debe ser mensual, semanal o quincenal"}
+    if frec_final == "semanal":
+        ds_final = dia_semana if dia_semana is not None else actual["dia_semana"]
+        if ds_final is None or int(ds_final) not in (0, 1, 2, 3, 4, 5, 6):
+            return {"ok": False, "tipo": "validacion",
+                    "mensaje": "Elige el día de la semana (Lunes a Domingo)"}
+    if frecuencia is not None:
+        sets.append("frecuencia = %s")
+        params.append(frecuencia)
+    if dia_semana is not None:
+        sets.append("dia_semana = %s")
+        params.append(int(dia_semana))
     if dia_cobro is not None:
         if not (1 <= int(dia_cobro) <= 28):
             return {"ok": False, "tipo": "validacion", "mensaje": "El día de cobro debe ser entre 1 y 28"}
         sets.append("dia_cobro = %s")
         params.append(int(dia_cobro))
+    if frec_final != "semanal" and (dia_semana is not None or actual["dia_semana"] is not None):
+        # Al salir de semanal se limpia el día de semana (CHECK-friendly y
+        # sin datos huérfanos aunque el cliente no mande dia_semana).
+        sets.append("dia_semana = NULL")
     if activo is not None:
         sets.append("activo = %s")
         params.append(bool(activo))
@@ -637,6 +722,14 @@ def actualizar_cuota(
                 diff["monto"] = [round(float(actual["monto"]), 2), round(float(monto), 2)]
             if dia_cobro is not None and int(dia_cobro) != int(actual["dia_cobro"]):
                 diff["dia_cobro"] = [int(actual["dia_cobro"]), int(dia_cobro)]
+            if frecuencia is not None and frecuencia != actual["frecuencia"]:
+                diff["frecuencia"] = [actual["frecuencia"], frecuencia]
+            vieja_ds = int(actual["dia_semana"]) if actual["dia_semana"] is not None else None
+            nueva_ds = int(dia_semana) if (dia_semana is not None and frec_final == "semanal") else None
+            if vieja_ds != nueva_ds:
+                # Siempre legible: 'Lunes' etc.; NULL = (sin día de semana).
+                diff["dia_semana"] = [DIAS_SEMANA[vieja_ds] if vieja_ds is not None else None,
+                                      DIAS_SEMANA[nueva_ds] if nueva_ds is not None else None]
             if activo is not None and bool(activo) != bool(actual["activo"]):
                 diff["activo"] = [bool(actual["activo"]), bool(activo)]
             if notas is not None and ((notas or "").strip() or None) != actual["notas"]:
