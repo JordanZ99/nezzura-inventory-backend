@@ -11,6 +11,7 @@ from psycopg2.extras import RealDictCursor
 
 from database.conexion import query, execute
 from database.helpers import _q, _e
+from database.actividad import registrar_actividad
 
 
 def saldo_cliente(tenant_id: str, cliente_id: str, conn=None) -> int:
@@ -82,6 +83,19 @@ def ajustar_puntos(
         tenant_id, cliente_id, "ajuste", puntos,
         concepto=concepto.strip(),
     )
+    # Registro de actividad (062): ajuste manual de puntos (el ledger
+    # puntos_movimientos ya tiene el movimiento; aquí va la versión legible).
+    try:
+        registrar_actividad(
+            tenant_id, "cliente", "puntos", "ajustar_puntos",
+            resumen=(f"{'Ajustó +' if puntos > 0 else 'Quitó '}{abs(puntos)} puntos a "
+                     f"{existe[0]['nombre']} ({concepto.strip()})"),
+            entidad_id=cliente_id,
+            detalle={"puntos": puntos, "concepto": concepto.strip(),
+                     "saldo_anterior": saldo_actual, "saldo_nuevo": saldo_final},
+        )
+    except Exception:
+        pass
     return {
         "ok": True,
         "saldo_anterior": saldo_actual,

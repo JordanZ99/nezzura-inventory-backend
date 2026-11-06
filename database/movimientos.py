@@ -81,13 +81,15 @@ def get_movimientos(
     limit: int = 50,
     offset: int = 0,
     tipo: str | None = None,
+    origen: str | None = None,
     producto: str | None = None,
     desde: str | None = None,
     hasta: str | None = None,
 ) -> dict:
     """
     Historial paginado para la tab 'Historial de cambios' de Estadísticas.
-    Filtros opcionales: tipo, texto de producto (ILIKE) y rango de fechas.
+    Filtros opcionales: tipo, origen (venta/restock/...), texto de producto
+    (ILIKE) y rango de fechas.
     """
     limit = max(1, min(int(limit or 50), 200))
     offset = max(0, int(offset or 0))
@@ -97,6 +99,9 @@ def get_movimientos(
     if tipo:
         where.append("tipo = %s")
         params.append(tipo)
+    if origen:
+        where.append("origen = %s")
+        params.append(origen)
     if producto and producto.strip():
         where.append("producto ILIKE %s")
         params.append(f"%{producto.strip()}%")

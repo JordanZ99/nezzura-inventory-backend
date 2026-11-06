@@ -19,6 +19,7 @@ from datetime import date
 import psycopg2.extras
 
 from database.conexion import execute, query
+from database.actividad import registrar_actividad
 
 _EPSILON = 0.005  # tolerancia de centavos para 'saldo 0' (floats + NUMERIC)
 _REGEX_PERIODO = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
@@ -236,6 +237,21 @@ def generar_cobros(tenant_id: str, periodo: str) -> dict:
         )
         creados += 1
 
+    # Registro de actividad (062): generación del periodo (un solo renglón
+    # resumido; cada cobro ya vive en la tabla cobros).
+    try:
+        if creados or omitidos:
+            detalle_gen: dict = {"cuotas": len(cuotas)}
+            if omitidos:
+                detalle_gen["omitidos"] = omitidos
+            registrar_actividad(
+                tenant_id, "cobro", "cobro", "generar",
+                resumen=f"Generó {creados} cobro(s) de cuota(s) del periodo {periodo}",
+                detalle=detalle_gen if creados else None,
+            )
+    except Exception:
+        pass
+
     return {
         "ok": True,
         "creados": creados,
@@ -293,6 +309,24 @@ def _crear_cobro(
          round(monto, 2), vencimiento, psycopg2.extras.Json(programa_n),
          (notas or "").strip() or None)
     )
+    # Registro de actividad (062): alta de cobro (extra o manual).
+    try:
+        nombre_cliente = query(
+            "SELECT nombre FROM clientes WHERE tenant_id = %s AND id = %s",
+            (tenant_id, cliente_id)
+        )
+        registrar_actividad(
+            tenant_id, "cobro", "cobro", "crear",
+            resumen=(f"Creó el cobro {concepto} por {round(monto, 2):.2f} para "
+                     f"{nombre_cliente[0]['nombre']}") if nombre_cliente
+                    else f"Creó el cobro {concepto} por {round(monto, 2):.2f}",
+            entidad_id=filas[0]["id"],
+            detalle={"monto": round(monto, 2),
+                     **({"vencimiento": str(vencimiento)} if vencimiento else {}),
+                     **({"programa": len(programa_n)} if programa_n else {})},
+        )
+    except Exception:
+        pass
     return {"ok": True, "cobro": _cobro_por_id(tenant_id, filas[0]["id"])}
 
 
@@ -350,6 +384,35 @@ def actualizar_cobro(
     if sets:
         params += [tenant_id, cobro_id]
         execute(f"UPDATE cobros SET {', '.join(sets)} WHERE tenant_id = %s AND id = %s", tuple(params))
+        # Registro de actividad (062): diff de la edición del cobro.
+        try:
+            diff: dict = {}
+            if concepto is not None and concepto.strip() and concepto.strip() != actual["concepto"]:
+                diff["concepto"] = [actual["concepto"], concepto.strip()]
+            if monto is not None and round(float(monto), 2) != float(actual["monto"]):
+                diff["monto"] = [float(actual["monto"]), round(float(monto), 2)]
+            if vencimiento is not None:
+                vieja_venc = str(actual["vencimiento"])[:10] if actual["vencimiento"] else None
+                nueva_venc = None if vencimiento == "" else str(vencimiento)[:10]
+                if vieja_venc != nueva_venc:
+                    diff["vencimiento"] = [vieja_venc, nueva_venc]
+            if notas is not None:
+                viejas_notas = actual.get("notas") or None
+                nuevas_notas = (notas or "").strip() or None
+                if viejas_notas != nuevas_notas:
+                    diff["notas"] = [viejas_notas, nuevas_notas]
+            if programa is not None:
+                diff["programa"] = [[
+                    {k: (float(p.get("monto", 0)) if k == "monto" else p.get(k)) for k in p}
+                    for p in (actual["programa"] or [])], programa_n]
+            if diff:
+                registrar_actividad(
+                    tenant_id, "cobro", "cobro", "editar",
+                    resumen=f"Editó el cobro {concepto if concepto is not None else actual['concepto']}",
+                    entidad_id=cobro_id, detalle=diff,
+                )
+        except Exception:
+            pass
     return {"ok": True, "cobro": _cobro_por_id(tenant_id, cobro_id)}
 
 
@@ -362,6 +425,15 @@ def eliminar_cobro(tenant_id: str, cobro_id: str) -> dict:
     )
     if not filas:
         return {"ok": False, "tipo": "no_encontrado", "mensaje": "Cobro no encontrado"}
+    # Registro de actividad (062): baja del cobro.
+    try:
+        registrar_actividad(
+            tenant_id, "cobro", "cobro", "eliminar",
+            resumen=f"Eliminó el cobro {filas[0]['concepto']}",
+            entidad_id=cobro_id,
+        )
+    except Exception:
+        pass
     return {"ok": True, "mensaje": f"Cobro '{filas[0]['concepto']}' eliminado"}
 
 
@@ -389,6 +461,21 @@ def agregar_pago(tenant_id: str, cobro_id: str, monto: float,
         (psycopg2.extras.Json(pagos_nuevos), tenant_id, cobro_id)
     )
     cobro = _cobro_por_id(tenant_id, cobro_id)
+    # Registro de actividad (062): abono al cobro (el dinero vive en `pagos`).
+    try:
+        registrar_actividad(
+            tenant_id, "cobro", "abono", "abonar",
+            resumen=(f"Abonó {round(monto, 2):.2f} al cobro {actual['concepto']} "
+                     f"de {actual['cliente_nombre']}"),
+            entidad_id=cobro_id,
+            detalle={"monto": round(monto, 2),
+                     "fecha": entrada["fecha"],
+                     **({"metodo": entrada["metodo"]} if entrada["metodo"] else {}),
+                     "saldo_despues": cobro["saldo"] if cobro else None,
+                     "estado_despues": cobro["estado"] if cobro else None},
+        )
+    except Exception:
+        pass
     return {"ok": True, **_pago_payload(cobro, entrada)}
 
 
@@ -407,6 +494,18 @@ def quitar_pago(tenant_id: str, cobro_id: str, indice: int) -> dict:
         (psycopg2.extras.Json(actual["pagos"]), tenant_id, cobro_id)
     )
     cobro = _cobro_por_id(tenant_id, cobro_id)
+    # Registro de actividad (062): corrección — el abono se quitó de `pagos`.
+    try:
+        registrar_actividad(
+            tenant_id, "cobro", "abono", "quitar_abono",
+            resumen=(f"Quitó el abono de {float(eliminado.get('monto') or 0):.2f} del cobro "
+                     f"{actual['concepto']} de {actual['cliente_nombre']}"),
+            entidad_id=cobro_id,
+            detalle={"quitar": eliminado,
+                     "saldo_despues": cobro["saldo"] if cobro else None},
+        )
+    except Exception:
+        pass
     return {"ok": True, **_pago_payload(cobro), "eliminado": eliminado}
 
 
@@ -457,6 +556,17 @@ def crear_cuota(tenant_id: str, cliente_id: str, concepto: str, monto: float,
         (tenant_id, cliente_id, concepto, round(monto, 2), int(dia_cobro), (notas or "").strip() or None)
     )
     cuota = query(_SELECT_CUOTAS + " WHERE q.tenant_id = %s AND q.id = %s", (tenant_id, filas[0]["id"]))[0]
+    # Registro de actividad (062): alta de cuota (suscripción mensual).
+    try:
+        registrar_actividad(
+            tenant_id, "cobro", "cuota", "crear",
+            resumen=f"Creó la cuota {concepto} de {cuota['cliente_nombre']} "
+                    f"({round(monto, 2):.2f}, día {int(dia_cobro)})",
+            entidad_id=filas[0]["id"],
+            detalle={"monto": round(monto, 2), "dia_cobro": int(dia_cobro)},
+        )
+    except Exception:
+        pass
     return {"ok": True, "cuota": cuota}
 
 
@@ -467,7 +577,8 @@ def actualizar_cuota(
     activo: bool | None = None, notas: str | None = None,
 ) -> dict:
     actual = query(
-        "SELECT id, cliente_id, concepto FROM cuotas_clientes WHERE tenant_id = %s AND id = %s",
+        "SELECT id, cliente_id, concepto, monto, dia_cobro, activo, notas "
+        "FROM cuotas_clientes WHERE tenant_id = %s AND id = %s",
         (tenant_id, cuota_id)
     )
     if not actual:
@@ -504,6 +615,40 @@ def actualizar_cuota(
     if sets:
         params += [tenant_id, cuota_id]
         execute(f"UPDATE cuotas_clientes SET {', '.join(sets)} WHERE tenant_id = %s AND id = %s", tuple(params))
+        # Registro de actividad (062): diff de la cuota.
+        try:
+            diff: dict = {}
+            if cliente_id is not None:
+                viejo_nombre = query(
+                    "SELECT nombre FROM clientes WHERE tenant_id = %s AND id = %s",
+                    (tenant_id, actual["cliente_id"])
+                )
+                nuevo_nombre = query(
+                    "SELECT nombre FROM clientes WHERE tenant_id = %s AND id = %s",
+                    (tenant_id, cliente_id)
+                )
+                viejo_n = viejo_nombre[0]["nombre"] if viejo_nombre else str(actual["cliente_id"])
+                nuevo_n = nuevo_nombre[0]["nombre"] if nuevo_nombre else str(cliente_id)
+                if viejo_n != nuevo_n:
+                    diff["cliente"] = [viejo_n, nuevo_n]
+            if concepto is not None and concepto.strip() != actual["concepto"]:
+                diff["concepto"] = [actual["concepto"], concepto.strip()]
+            if monto is not None and round(float(monto), 2) != round(float(actual["monto"]), 2):
+                diff["monto"] = [round(float(actual["monto"]), 2), round(float(monto), 2)]
+            if dia_cobro is not None and int(dia_cobro) != int(actual["dia_cobro"]):
+                diff["dia_cobro"] = [int(actual["dia_cobro"]), int(dia_cobro)]
+            if activo is not None and bool(activo) != bool(actual["activo"]):
+                diff["activo"] = [bool(actual["activo"]), bool(activo)]
+            if notas is not None and ((notas or "").strip() or None) != actual["notas"]:
+                diff["notas"] = [actual["notas"], (notas or "").strip() or None]
+            if diff:
+                registrar_actividad(
+                    tenant_id, "cobro", "cuota", "editar",
+                    resumen=f"Editó la cuota {concepto if concepto is not None else actual['concepto']}",
+                    entidad_id=cuota_id, detalle=diff,
+                )
+        except Exception:
+            pass
 
     cuota = query(_SELECT_CUOTAS + " WHERE q.tenant_id = %s AND q.id = %s", (tenant_id, cuota_id))[0]
     return {"ok": True, "cuota": cuota}
@@ -518,4 +663,13 @@ def eliminar_cuota(tenant_id: str, cuota_id: str) -> dict:
     )
     if not filas:
         return {"ok": False, "tipo": "no_encontrado", "mensaje": "Cuota no encontrada"}
+    # Registro de actividad (062): baja de cuota (los cobros generados quedan).
+    try:
+        registrar_actividad(
+            tenant_id, "cobro", "cuota", "eliminar",
+            resumen=f"Eliminó la cuota {filas[0]['concepto']}",
+            entidad_id=cuota_id,
+        )
+    except Exception:
+        pass
     return {"ok": True, "mensaje": f"Cuota '{filas[0]['concepto']}' eliminada (los cobros generados se conservan)"}

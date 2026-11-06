@@ -13,6 +13,7 @@ from psycopg2.errors import UniqueViolation
 from database.conexion import query
 from database.helpers import _resolver_producto_id, ahora_negocio, _parsear_ts
 from database.movimientos import registrar_movimiento_inventario
+from database.actividad import registrar_actividad
 from database.imagenes import borrar_imagen_cloudinary
 
 
@@ -127,6 +128,17 @@ def crear_variacion(producto: str, nombre: str, precio: float, tenant_id: str, f
                 tenant_id, producto, "entrada", "restock", stock_final,
                 id_lote=id_lote_var, conn=None,
             )
+    # Registro de actividad (062): alta de variación.
+    try:
+        registrar_actividad(
+            tenant_id, "producto", "variacion", "crear",
+            resumen=f"Creó la variación {nombre} de {producto}",
+            entidad_id=v["id"],
+            detalle={"precio": round(float(precio or 0), 2),
+                     **({"stock_inicial": stock_final} if stock_final else {})},
+        )
+    except Exception:
+        pass
     return {"ok": True, "variacion": {"id": v["id"], "nombre": v["nombre"], "precio": float(v["precio"] or 0), "foto": v.get("foto") or "", "stock": stock_final}}
 
 
@@ -136,6 +148,14 @@ def actualizar_variacion(variacion_id: int, nombre: str, precio: float, tenant_i
     nombre = (nombre or "").strip()
     if not nombre:
         return {"ok": False, "mensaje": "El nombre de la variación es obligatorio"}
+    # Snapshot ANTES del UPDATE: diff para el registro de actividad (062).
+    vieja = query(
+        "SELECT v.nombre, v.precio, v.foto, p.Producto AS producto "
+        "FROM producto_variaciones v JOIN productos p ON p.id = v.producto_id "
+        "WHERE v.id = %s AND v.tenant_id = %s",
+        (variacion_id, tenant_id)
+    )
+    a = vieja[0] if vieja else None
     try:
         result = query("""
             UPDATE producto_variaciones
@@ -148,11 +168,36 @@ def actualizar_variacion(variacion_id: int, nombre: str, precio: float, tenant_i
     if not result:
         return {"ok": False, "mensaje": "Variación no encontrada"}
     v = result[0]
+    # Registro de actividad (062): diff de lo que cambió.
+    try:
+        if a:
+            diff: dict = {}
+            if a["nombre"].strip() != nombre:
+                diff["nombre"] = [a["nombre"], nombre]
+            if round(float(a["precio"] or 0), 2) != round(float(precio or 0), 2):
+                diff["precio"] = [round(float(a["precio"] or 0), 2), round(float(precio or 0), 2)]
+            nueva_foto = a["foto"] if foto is None else foto
+            if (a["foto"] or "") != (nueva_foto or ""):
+                diff["foto"] = [(a["foto"] or "")[:60], (nueva_foto or "")[:60]]
+            if diff:
+                registrar_actividad(
+                    tenant_id, "producto", "variacion", "editar",
+                    resumen=f"Editó la variación {nombre} de {a['producto']}",
+                    entidad_id=variacion_id, detalle=diff,
+                )
+    except Exception:
+        pass
     return {"ok": True, "variacion": {"id": v["id"], "nombre": v["nombre"], "precio": float(v["precio"] or 0), "foto": v.get("foto") or ""}}
 
 
 def eliminar_variacion(variacion_id: int, tenant_id: str) -> dict:
     """Elimina una variación (validando pertenencia del tenant)."""
+    # Contexto ANTES del DELETE (el borrado en cascada se lleva los lotes).
+    contexto = query("""
+        SELECT v.nombre, p.Producto AS producto
+        FROM producto_variaciones v JOIN productos p ON p.id = v.producto_id
+        WHERE v.id = %s AND v.tenant_id = %s
+    """, (variacion_id, tenant_id))
     result = query("""
         DELETE FROM producto_variaciones
         WHERE id = %s AND tenant_id = %s
@@ -160,6 +205,16 @@ def eliminar_variacion(variacion_id: int, tenant_id: str) -> dict:
     """, (variacion_id, tenant_id))
     if not result:
         return {"ok": False, "mensaje": "Variación no encontrada"}
+    # Registro de actividad (062).
+    try:
+        if contexto:
+            registrar_actividad(
+                tenant_id, "producto", "variacion", "eliminar",
+                resumen=f"Eliminó la variación {contexto[0]['nombre']} de {contexto[0]['producto']}",
+                entidad_id=variacion_id,
+            )
+    except Exception:
+        pass
     return {"ok": True, "id": variacion_id}
 
 

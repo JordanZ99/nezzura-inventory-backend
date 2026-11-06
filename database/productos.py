@@ -18,6 +18,7 @@ from database.helpers import _q, _e, _obtener_categorias_subquery, _sincronizar_
 from database.variaciones import _adjuntar_variaciones
 from database.recetas import _adjuntar_recetas, _calcular_disponibilidad_compuestos
 from database.movimientos import registrar_movimiento_inventario
+from database.actividad import registrar_actividad
 
 
 def get_productos_meta(tenant_id: str) -> list[dict]:
@@ -454,6 +455,26 @@ def crear_producto_completo(
                 return error
 
         conn.commit()
+
+        # Registro de actividad (062): alta de producto (luego del commit, la
+        # operación ya está hecha y el log es best-effort).
+        try:
+            registrar_actividad(
+                tenant_id, "producto", "producto", "crear",
+                resumen=f"Creó el producto {producto} ({tipo})",
+                entidad_id=product_id,
+                detalle={
+                    "tipo": tipo,
+                    "costo": round(float(costo or 0), 2),
+                    "precio": round(float(precio_venta or 0), 2),
+                    "stock": float(stock or 0),
+                    "categorias": categoria or ["General"],
+                    **({"variaciones": len(variaciones_list)} if variaciones_list else {}),
+                },
+            )
+        except Exception:
+            pass
+
         return {
             "ok": True,
             "accion": accion,
@@ -492,6 +513,20 @@ def actualizar_producto(
 ) -> dict:
     producto = producto.strip()
     descripcion = descripcion.strip()
+
+    # ── Snapshot ANTES del UPDATE para el diff del registro de actividad (062) ──
+    viejo = query(
+        "SELECT * FROM productos WHERE Producto=%s AND tenant_id=%s",
+        (producto, tenant_id)
+    )
+    a = viejo[0] if viejo else None
+    lote_ref = query(
+        "SELECT Costo, Precio_Venta FROM lotes WHERE producto_id = "
+        "(SELECT id FROM productos WHERE Producto=%s AND tenant_id=%s) "
+        "AND Estado='Activo' AND tenant_id=%s "
+        "ORDER BY Fecha_Entrada DESC LIMIT 1",
+        (producto, tenant_id, tenant_id)
+    )
     """
     Actualiza metadatos de un producto y sus categorías (Many-to-Many).
     Si pasa a Inactivo, desactiva todos sus lotes.
@@ -605,5 +640,62 @@ def actualizar_producto(
             "(SELECT id FROM productos WHERE Producto=%s AND tenant_id=%s) AND tenant_id = %s",
             (producto, tenant_id, tenant_id)
         )
+
+    # ── Registro de actividad (062): diff de SOLO los campos que cambiaron ──
+    try:
+        def _par(actual_v, nuevo_v):
+            """[antes, después] si cambió de verdad; None si no (o no se envió)."""
+            if nuevo_v is None:
+                return None
+            if isinstance(nuevo_v, float):
+                nuevo_v = round(nuevo_v, 2)
+            if isinstance(actual_v, float):
+                actual_v = round(actual_v, 2)
+            if isinstance(nuevo_v, bool) or isinstance(actual_v, bool):
+                nuevo_v, actual_v = bool(nuevo_v), bool(actual_v) if actual_v is not None else None
+            return [actual_v, nuevo_v] if actual_v != nuevo_v else None
+
+        diff: dict = {}
+        if a is not None:
+            for key, actual_v, nuevo_v in [
+                ("descripcion", a["Descripcion"], descripcion),
+                ("imagen", a["Imagen"], imagen),
+                ("estado", a["Estado"], estado),
+                ("codigo_interno", a["codigo_interno"], codigo_interno),
+                ("codigo_barras", a["codigo_barras"], codigo_barras),
+                ("ubicacion", a["ubicacion"], ubicacion),
+                ("visible_en_catalogo", a["visible_en_catalogo"], visible_en_catalogo),
+                ("sufijo_precio", a["sufijo_precio"], sufijo_precio),
+                ("fraccionable", a["fraccionable"], fraccionable),
+                ("tamano_cm", a["tamano_cm"], tamano_cm),
+                ("tipo_producto", a["tipo_producto"], tipo_producto),
+                ("costo_servicio", a["costo_servicio"], costo_servicio),
+                ("precio_servicio", a["precio_servicio"], precio_servicio),
+            ]:
+                par = _par(actual_v, nuevo_v)
+                if par:
+                    diff[key] = par
+            if costo is not None and lote_ref:
+                par = _par(lote_ref[0]["Costo"], float(costo))
+                if par:
+                    diff["costo_lote"] = par
+            if precio_venta is not None and lote_ref:
+                par = _par(lote_ref[0]["Precio_Venta"], float(precio_venta))
+                if par:
+                    diff["precio_venta"] = par
+        if a is not None and nombre_final != str(a["Producto"]):
+            diff["nombre"] = [a["Producto"], nombre_final]
+        if categoria:
+            diff["categorias"] = list(categoria)
+
+        if diff:
+            registrar_actividad(
+                tenant_id, "producto", "producto", "editar",
+                resumen=f"Editó el producto {producto}",
+                entidad_id=(prod[0]["id"] if prod else None),
+                detalle=diff,
+            )
+    except Exception:
+        pass
 
     return {"ok": True, "producto": producto, "estado": estado}

@@ -16,6 +16,7 @@ import secrets
 from datetime import date
 
 from database.conexion import query, execute
+from database.actividad import registrar_actividad
 
 # Defaults de la migración 038 (nombre siempre obligatorio, fuera de este dict).
 CAMPOS_DEFAULT = {
@@ -259,6 +260,21 @@ def crear_cliente(
         (tenant_id, nombre, email_n, tel_n, _hash_pin(pin_n) if pin_n else None,
          (notas or "").strip() or None, cumpleanos, origen_n)
     )
+    # Registro de actividad (062): alta de cliente.
+    try:
+        registrar_actividad(
+            tenant_id, "cliente", "cliente", "crear",
+            resumen=f"Creó el cliente {nombre}",
+            entidad_id=filas[0]["id"],
+            detalle={
+                **({"email": email_n} if email_n else {}),
+                **({"telefono": tel_n} if tel_n else {}),
+                **({"origen": origen_n} if origen_n else {}),
+                **({"cumpleanos": str(cumpleanos)} if cumpleanos else {}),
+            },
+        )
+    except Exception:
+        pass
     return {"ok": True, "cliente": filas[0]}
 
 
@@ -357,6 +373,53 @@ def actualizar_cliente(
         params += [tenant_id, cliente_id]
         execute(f"UPDATE clientes SET {sets} WHERE tenant_id=%s AND id=%s", tuple(params))
 
+    # Registro de actividad (062): diff de SOLO lo que cambió. Sin PII sensible:
+    # el pin solo se reporta como fijado/quitar, jamás su valor.
+    try:
+        diff: dict = {}
+
+        def _nueva(v, n):
+            if n is None or v == n:
+                return None
+            vn = (v or "").strip() if isinstance(v, str) else v
+            nn = (n or "").strip() if isinstance(n, str) else n
+            return [vn, nn] if vn != nn else None
+
+        par = _nueva(a["nombre"], nombre_n)
+        if par:
+            diff["nombre"] = par
+        par = _nueva(a["email"], email_n)
+        if par:
+            diff["email"] = par
+        par = _nueva(a["telefono"], tel_n)
+        if par:
+            diff["telefono"] = par
+        par = _nueva(a["notas"], (notas if notas is not None else a["notas"]))
+        if par:
+            diff["notas"] = par
+        par = _nueva(str(a["cumpleanos"]) if a["cumpleanos"] else None,
+                     str(cump_nuevo) if cump_nuevo else None)
+        if par:
+            diff["cumpleanos"] = par
+        par = _nueva(a["origen"], origen_n)
+        if par:
+            diff["origen"] = par
+        if activo is not None and bool(a["activo"]) != bool(activo):
+            diff["activo"] = [bool(a["activo"]), bool(activo)]
+        if pin_nuevo == "":
+            diff["pin"] = ["fijado", "quitado"]
+        elif pin_nuevo is not None:
+            diff["pin"] = [bool(a["pin_hash"]), "fijado"]
+
+        if diff:
+            registrar_actividad(
+                tenant_id, "cliente", "cliente", "editar",
+                resumen=f"Editó el cliente {nombre_n}",
+                entidad_id=cliente_id, detalle=diff,
+            )
+    except Exception:
+        pass
+
     return {"ok": True, "cliente": obtener_cliente(tenant_id, cliente_id)}
 
 
@@ -368,6 +431,15 @@ def eliminar_cliente(tenant_id: str, cliente_id: str) -> dict:
     )
     if not filas:
         return {"ok": False, "tipo": "no_encontrado", "mensaje": "Cliente no encontrado"}
+    # Registro de actividad (062): baja de cliente.
+    try:
+        registrar_actividad(
+            tenant_id, "cliente", "cliente", "eliminar",
+            resumen=f"Dio de baja al cliente {filas[0]['nombre']}",
+            entidad_id=cliente_id,
+        )
+    except Exception:
+        pass
     return {"ok": True, "mensaje": f"Cliente {filas[0]['nombre']} dado de baja (historial conservado)"}
 
 

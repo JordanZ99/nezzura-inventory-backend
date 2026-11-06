@@ -123,6 +123,7 @@ def listar_movimientos(
     limit: int = 50,
     offset: int = 0,
     tipo: Optional[str] = None,
+    origen: Optional[str] = None,
     producto: Optional[str] = None,
     desde: Optional[str] = None,
     hasta: Optional[str] = None,
@@ -134,10 +135,11 @@ def listar_movimientos(
     restock, ajuste manual, edición de venta, anulación o baja de lote, con
     el stock resultante del lote al momento del movimiento.
 
-    Filtros opcionales: tipo (entrada|salida|ajuste), texto de producto y
-    rango de fechas (YYYY-MM-DD, en zona horaria del negocio).
+    Filtros opcionales: tipo (entrada|salida|ajuste), origen (venta|restock|
+    ajuste_manual|edicion_venta|anulacion|baja_lote|conteo), texto de producto
+    y rango de fechas (YYYY-MM-DD, en zona horaria del negocio).
     """
-    return get_movimientos(tenant_id, limit=limit, offset=offset, tipo=tipo, producto=producto, desde=desde, hasta=hasta)
+    return get_movimientos(tenant_id, limit=limit, offset=offset, tipo=tipo, origen=origen, producto=producto, desde=desde, hasta=hasta)
 
 
 @router.get("/lotes/{producto}")

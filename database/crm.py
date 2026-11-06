@@ -20,6 +20,7 @@ import statistics
 from datetime import date, datetime, timedelta, timezone
 
 from database.conexion import query, execute
+from database.actividad import registrar_actividad
 
 _TIPOS_INTERACCION = ("nota", "llamada", "visita", "promo")
 _RE_COLOR_HEX = re.compile(r"^#[0-9a-fA-F]{6}$")
@@ -84,6 +85,16 @@ def crear_etiqueta(tenant_id: str, nombre: str, color: str | None = None) -> dic
         "RETURNING id, nombre, color",
         (tenant_id, nombre, _color_valido(color))
     )
+    # Registro de actividad (062): alta de etiqueta.
+    try:
+        registrar_actividad(
+            tenant_id, "cliente", "etiqueta", "crear",
+            resumen=f"Creó la etiqueta {filas[0]['nombre']}",
+            entidad_id=filas[0]["id"],
+            detalle={"color": filas[0]["color"]},
+        )
+    except Exception:
+        pass
     return {"ok": True, "etiqueta": filas[0]}
 
 
@@ -116,6 +127,21 @@ def actualizar_etiqueta(tenant_id: str, etiqueta_id: str,
         "WHERE tenant_id = %s AND id = %s RETURNING id, nombre, color",
         (nombre_n, color_n, tenant_id, etiqueta_id)
     )
+    # Registro de actividad (062): diff de la etiqueta.
+    try:
+        diff: dict = {}
+        if str(a["nombre"]) != nombre_n:
+            diff["nombre"] = [a["nombre"], nombre_n]
+        if a["color"] != color_n:
+            diff["color"] = [a["color"], color_n]
+        if diff:
+            registrar_actividad(
+                tenant_id, "cliente", "etiqueta", "editar",
+                resumen=f"Editó la etiqueta {nombre_n}",
+                entidad_id=etiqueta_id, detalle=diff,
+            )
+    except Exception:
+        pass
     return {"ok": True, "etiqueta": filas[0]}
 
 
@@ -127,6 +153,15 @@ def eliminar_etiqueta(tenant_id: str, etiqueta_id: str) -> dict:
     )
     if not filas:
         return {"ok": False, "tipo": "no_encontrado", "mensaje": "Etiqueta no encontrada"}
+    # Registro de actividad (062): baja de etiqueta (se desasigna de todos).
+    try:
+        registrar_actividad(
+            tenant_id, "cliente", "etiqueta", "eliminar",
+            resumen=f"Eliminó la etiqueta {filas[0]['nombre']}",
+            entidad_id=etiqueta_id,
+        )
+    except Exception:
+        pass
     return {"ok": True, "mensaje": f"Etiqueta '{filas[0]['nombre']}' eliminada (se desasignó de todos los clientes)"}
 
 
@@ -159,12 +194,48 @@ def asignar_etiquetas(tenant_id: str, cliente_id: str, etiqueta_ids: list[str]) 
             return {"ok": False, "tipo": "validacion",
                     "mensaje": "Hay etiquetas que no existen en este negocio"}
 
+    # Set ANTES del replace-all, para el diff del registro de actividad (062).
+    previas = query(
+        "SELECT e.nombre AS nombre FROM cliente_etiqueta ce "
+        "JOIN etiquetas e ON e.id = ce.etiqueta_id WHERE ce.cliente_id = %s",
+        (cliente_id,)
+    )
+    prev_nombres = {f["nombre"] for f in previas}
+
     execute("DELETE FROM cliente_etiqueta WHERE cliente_id = %s", (cliente_id,))
     for eid in pedidos:
         execute(
             "INSERT INTO cliente_etiqueta (cliente_id, etiqueta_id) VALUES (%s, %s)",
             (cliente_id, eid)
         )
+    # Registro de actividad (062): diff de sets por nombres legibles.
+    try:
+        finales = etiquetas_de_cliente(cliente_id)
+        final_nombres = {f["nombre"] for f in finales}
+        agregadas = sorted(final_nombres - prev_nombres)
+        desasignadas = sorted(prev_nombres - final_nombres)
+        if agregadas or desasignadas:
+            detalle: dict = {}
+            if agregadas:
+                detalle["asignadas"] = agregadas
+            if desasignadas:
+                detalle["desasignadas"] = desasignadas
+            partes: list[str] = []
+            if agregadas:
+                partes.append(f"agregó {', '.join(agregadas)}")
+            if desasignadas:
+                partes.append(f"quitó {', '.join(desasignadas)}")
+            nombre_cliente = query(
+                "SELECT nombre FROM clientes WHERE tenant_id = %s AND id = %s",
+                (tenant_id, cliente_id)
+            )
+            registrar_actividad(
+                tenant_id, "cliente", "etiqueta", "editar",
+                resumen=f"Editó etiquetas de {nombre_cliente[0]['nombre']} ({'; '.join(partes)})",
+                entidad_id=cliente_id, detalle=detalle,
+            )
+    except Exception:
+        pass
     return {"ok": True, "etiquetas": etiquetas_de_cliente(cliente_id)}
 
 
@@ -186,6 +257,21 @@ def crear_interaccion(tenant_id: str, cliente_id: str, tipo: str,
         "VALUES (%s, %s, %s, %s, %s) RETURNING id, tipo, texto, creado_por, fecha",
         (tenant_id, cliente_id, tipo, texto, (creado_por or "").strip())
     )
+    # Registro de actividad (062): nueva interacción del timeline.
+    try:
+        nombre_cliente = query(
+            "SELECT nombre FROM clientes WHERE tenant_id = %s AND id = %s",
+            (tenant_id, cliente_id)
+        )
+        registrar_actividad(
+            tenant_id, "cliente", "interaccion", "crear",
+            resumen=("Registró " + tipo + " de " + nombre_cliente[0]["nombre"]) if nombre_cliente
+                    else f"Registró interacción {tipo}",
+            entidad_id=filas[0]["id"],
+            detalle={"tipo": tipo, "texto": texto[:60]},
+        )
+    except Exception:
+        pass
     return {"ok": True, "interaccion": filas[0]}
 
 
