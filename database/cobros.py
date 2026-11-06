@@ -232,7 +232,8 @@ def generar_cobros(tenant_id: str, periodo: str) -> dict:
 
     anio, mes = int(periodo[:4]), int(periodo[5:7])
     cuotas = query(
-        "SELECT id, cliente_id, concepto, monto, dia_cobro, frecuencia, dia_semana, notas "
+        "SELECT id, cliente_id, concepto, monto, dia_cobro, frecuencia, dia_semana, "
+        "monto_meta, notas "
         "FROM cuotas_clientes WHERE tenant_id = %s AND activo",
         (tenant_id,)
     )
@@ -241,27 +242,49 @@ def generar_cobros(tenant_id: str, periodo: str) -> dict:
                 "mensaje": "No hay cuotas activas que generar"}
 
     # existentes por (cuota, fecha): cubre mensual (una fecha al mes) y el
-    # resto (cada vencimiento concreto del mes).
-    existentes = {(f["cuota_id"], f["vencimiento"]) for f in query(
-        "SELECT cuota_id, vencimiento FROM cobros "
+    # resto (cada vencimiento concreto del mes). El monto se usa para descontar
+    # del restante de las cuotas con meta (064).
+    existentes = {(f["cuota_id"], f["vencimiento"]): float(f["monto"] or 0) for f in query(
+        "SELECT cuota_id, vencimiento, monto FROM cobros "
         "WHERE tenant_id = %s AND periodo = %s AND cuota_id IS NOT NULL",
         (tenant_id, periodo)
+    )}
+    # Lo ya PROGRAMADO por cuota (todas las generadas a la cuenta, cualquier
+    # mes): el restante contra la meta.
+    ya_programado = {f["cuota_id"]: round(float(f["ya"] or 0), 2) for f in query(
+        "SELECT cuota_id, SUM(monto) AS ya FROM cobros "
+        "WHERE tenant_id = %s AND cuota_id IS NOT NULL GROUP BY cuota_id",
+        (tenant_id,)
     )}
 
     creados, omitidos = 0, 0
     for cuota in cuotas:
+        meta = cuota["monto_meta"]
+        restante = round(float(meta), 2) if meta is not None else None
         for vencimiento in _fechas_de_cuota_en_mes(cuota, anio, mes):
+            if restante is not None and restante <= _EPSILON:
+                # Cuenta finita cubierta: no genera más (064).
+                break
             if (cuota["id"], vencimiento) in existentes:
                 omitidos += 1
+                if restante is not None:
+                    restante = round(restante - existentes[(cuota["id"], vencimiento)], 2)
                 continue
+            monto_cobro = float(cuota["monto"])
+            if restante is not None:
+                # Último abono del plan finito: se recorta al restante para
+                # que el total programado sea EXACTAMENTE la meta.
+                monto_cobro = min(monto_cobro, restante)
             execute(
                 "INSERT INTO cobros (tenant_id, cliente_id, cuota_id, origen, concepto, "
                 "periodo, monto, vencimiento, notas) "
                 "VALUES (%s, %s, %s, 'cuota', %s, %s, %s, %s, %s)",
                 (tenant_id, cuota["cliente_id"], cuota["id"], cuota["concepto"],
-                 periodo, cuota["monto"], vencimiento, cuota["notas"])
+                 periodo, round(monto_cobro, 2), vencimiento, cuota["notas"])
             )
             creados += 1
+            if restante is not None:
+                restante = round(restante - monto_cobro, 2)
 
     # Registro de actividad (062): generación del periodo (un solo renglón
     # resumido; cada cobro ya vive en la tabla cobros).
@@ -551,8 +574,13 @@ def _pago_payload(cobro: dict, entrada: dict | None = None) -> dict:
 
 _SELECT_CUOTAS = """
 SELECT q.id, q.tenant_id, q.cliente_id, q.concepto, q.monto, q.dia_cobro,
-       q.frecuencia, q.dia_semana,
-       q.activo, q.notas, q.creado_en, cl.nombre AS cliente_nombre
+       q.frecuencia, q.dia_semana, q.monto_meta,
+       q.activo, q.notas, q.creado_en, cl.nombre AS cliente_nombre,
+       -- Derivados para la UI (cuentas finitas, 064): SOLO lectura.
+       (SELECT COALESCE(SUM(x.monto), 0) FROM cobros x WHERE x.cuota_id = q.id) AS programado_meta,
+       (SELECT COALESCE(SUM((pg->>'monto')::numeric), 0)
+          FROM cobros y, jsonb_array_elements(y.pagos) AS pg
+         WHERE y.cuota_id = q.id) AS abonado_meta
 FROM cuotas_clientes q
 JOIN clientes cl ON cl.id = q.cliente_id
 """
@@ -586,7 +614,8 @@ def listar_cuotas(tenant_id: str, solo_activas: bool = False) -> list[dict]:
 
 def crear_cuota(tenant_id: str, cliente_id: str, concepto: str, monto: float,
                 dia_cobro: int = 1, notas: str | None = None,
-                frecuencia: str = "mensual", dia_semana: int | None = None) -> dict:
+                frecuencia: str = "mensual", dia_semana: int | None = None,
+                monto_meta: float | None = None) -> dict:
     concepto = (concepto or "").strip()
     if not concepto:
         return {"ok": False, "tipo": "validacion", "mensaje": "El concepto es obligatorio"}
@@ -595,6 +624,10 @@ def crear_cuota(tenant_id: str, cliente_id: str, concepto: str, monto: float,
     if frecuencia not in _FRECUENCIAS:
         return {"ok": False, "tipo": "validacion",
                 "mensaje": "La frecuencia debe ser mensual, semanal o quincenal"}
+    meta_n = round(float(monto_meta), 2) if monto_meta is not None else None
+    if meta_n is not None and meta_n <= 0:
+        return {"ok": False, "tipo": "validacion",
+                "mensaje": "La meta total debe ser mayor a 0 (déjala vacía para cuota infinita)"}
     dia_semana_n = None
     if frecuencia == "mensual":
         if dia_cobro is None or not (1 <= int(dia_cobro) <= 28):
@@ -611,10 +644,10 @@ def crear_cuota(tenant_id: str, cliente_id: str, concepto: str, monto: float,
         return {"ok": False, "tipo": "no_encontrado", "mensaje": "Cliente no encontrado"}
     filas = query(
         "INSERT INTO cuotas_clientes (tenant_id, cliente_id, concepto, monto, dia_cobro, "
-        "frecuencia, dia_semana, notas) "
-        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+        "frecuencia, dia_semana, monto_meta, notas) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
         (tenant_id, cliente_id, concepto, round(monto, 2), int(dia_cobro),
-         frecuencia, dia_semana_n, (notas or "").strip() or None)
+         frecuencia, dia_semana_n, meta_n, (notas or "").strip() or None)
     )
     cuota = query(_SELECT_CUOTAS + " WHERE q.tenant_id = %s AND q.id = %s", (tenant_id, filas[0]["id"]))[0]
     # Registro de actividad (062): alta de cuota (suscripción recurrente).
@@ -622,11 +655,12 @@ def crear_cuota(tenant_id: str, cliente_id: str, concepto: str, monto: float,
         registrar_actividad(
             tenant_id, "cobro", "cuota", "crear",
             resumen=f"Creó la cuota {concepto} de {cuota['cliente_nombre']} "
-                    f"({round(monto, 2):.2f}, {_resumen_cuota(cuota)})",
+                    f"({round(monto, 2):.2f}, {_resumen_cuota(cuota)}{f', hasta {meta_n:.2f}' if meta_n is not None else ''})",
             entidad_id=filas[0]["id"],
             detalle={"monto": round(monto, 2), "frecuencia": frecuencia,
                      "dia_cobro": int(cuota["dia_cobro"]),
-                     **({"dia_semana": dia_semana_n} if dia_semana_n is not None else {})},
+                     **({"dia_semana": dia_semana_n} if dia_semana_n is not None else {}),
+                     **({"monto_meta": meta_n} if meta_n is not None else {})},
         )
     except Exception:
         pass
@@ -639,9 +673,11 @@ def actualizar_cuota(
     monto: float | None = None, dia_cobro: int | None = None,
     activo: bool | None = None, notas: str | None = None,
     frecuencia: str | None = None, dia_semana: int | None = None,
+    monto_meta: float | None = None,
 ) -> dict:
     actual = query(
-        "SELECT id, cliente_id, concepto, monto, dia_cobro, frecuencia, dia_semana, activo, notas "
+        "SELECT id, cliente_id, concepto, monto, dia_cobro, frecuencia, dia_semana, "
+        "monto_meta, activo, notas "
         "FROM cuotas_clientes WHERE tenant_id = %s AND id = %s",
         (tenant_id, cuota_id)
     )
@@ -686,6 +722,14 @@ def actualizar_cuota(
             return {"ok": False, "tipo": "validacion", "mensaje": "El día de cobro debe ser entre 1 y 28"}
         sets.append("dia_cobro = %s")
         params.append(int(dia_cobro))
+    if monto_meta is not None:
+        # Sentinel de la UI: 0 = quitar la meta (cuota vuelve a ser infinita);
+        # >0 = fijar/ajustar la meta del plan finito. Nunca negativo.
+        meta_nueva = round(float(monto_meta), 2)
+        if meta_nueva < 0:
+            return {"ok": False, "tipo": "validacion", "mensaje": "La meta no puede ser negativa"}
+        sets.append("monto_meta = %s")
+        params.append(meta_nueva if meta_nueva > 0 else None)
     if frec_final != "semanal" and (dia_semana is not None or actual["dia_semana"] is not None):
         # Al salir de semanal se limpia el día de semana (CHECK-friendly y
         # sin datos huérfanos aunque el cliente no mande dia_semana).
@@ -734,6 +778,14 @@ def actualizar_cuota(
                 diff["activo"] = [bool(actual["activo"]), bool(activo)]
             if notas is not None and ((notas or "").strip() or None) != actual["notas"]:
                 diff["notas"] = [actual["notas"], (notas or "").strip() or None]
+            if monto_meta is not None:
+                vieja_meta = float(actual["monto_meta"]) if actual["monto_meta"] is not None else None
+                nueva_meta = float(monto_meta)
+                if vieja_meta != nueva_meta:
+                    diff["monto_meta"] = [
+                        f"{vieja_meta:.2f}" if vieja_meta is not None else "sin límite",
+                        f"{nueva_meta:.2f}" if nueva_meta > 0 else "sin límite",
+                    ]
             if diff:
                 registrar_actividad(
                     tenant_id, "cobro", "cuota", "editar",
