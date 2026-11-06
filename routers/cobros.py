@@ -85,10 +85,15 @@ def actualizar_cuota(cuota_id: str, data: CuotaActualizar, tenant_id: str = Depe
 
 
 @router.delete("/cuotas/{cuota_id}")
-def eliminar_cuota(cuota_id: str, tenant_id: str = Depends(get_tenant_id)):
-    """Baja de la cuota: los cobros ya generados se conservan (cuota_id pasa a
-    NULL por el ON DELETE SET NULL); el dinero histórico nunca se pierde."""
-    resultado = db_cobros.eliminar_cuota(tenant_id, cuota_id)
+def eliminar_cuota(
+    cuota_id: str,
+    borrar_pendientes: bool = False,
+    tenant_id: str = Depends(get_tenant_id),
+):
+    """Baja de la cuota: los cobros YA abonados se conservan (dinero histórico,
+    cuota_id pasa a NULL por el ON DELETE SET NULL). Con borrar_pendientes=true
+    (mig 065) también se eliminan los cobros sin abonos."""
+    resultado = db_cobros.eliminar_cuota(tenant_id, cuota_id, borrar_pendientes=borrar_pendientes)
     _revisar(resultado, "Cuota no encontrada")
     return resultado
 

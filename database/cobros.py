@@ -226,14 +226,20 @@ def _fechas_de_cuota_en_mes(cuota: dict, anio: int, mes: int) -> list:
 def generar_cobros(tenant_id: str, periodo: str) -> dict:
     """Crea los cobros del periodo para cada cuota activa (mig 063: mensuales,
     semanales y quincenales). Idempotente: el par cuota+vencimiento que ya
-    existe no se duplica (índice parcial único)."""
+    existe no se duplica (índice parcial único).
+
+    Mig 065 (comportamiento, sin columnas): cada corrida emite solo lo
+    VENCIDO/HOY más el PRÓXIMO vencimiento por venir — el resto del calendario
+    no existe hasta que llega su fecha. Y nunca cobra hacia atrás: los
+    vencimientos ANTERIORES a la fecha de alta de la cuota se descartan."""
     if not _REGEX_PERIODO.match(periodo or ""):
         return {"ok": False, "tipo": "validacion", "mensaje": "El periodo debe ser 'YYYY-MM' (ej. 2026-11)"}
 
     anio, mes = int(periodo[:4]), int(periodo[5:7])
+    hoy = date.today()
     cuotas = query(
         "SELECT id, cliente_id, concepto, monto, dia_cobro, frecuencia, dia_semana, "
-        "monto_meta, notas "
+        "monto_meta, creado_en, notas "
         "FROM cuotas_clientes WHERE tenant_id = %s AND activo",
         (tenant_id,)
     )
@@ -261,7 +267,20 @@ def generar_cobros(tenant_id: str, periodo: str) -> dict:
     for cuota in cuotas:
         meta = cuota["monto_meta"]
         restante = round(float(meta), 2) if meta is not None else None
-        for vencimiento in _fechas_de_cuota_en_mes(cuota, anio, mes):
+        # ── Mig 065: fechas a emitir ──
+        # 1) Descarta los vencimientos ANTERIORES al alta de la cuota:
+        #    crearla hoy no genera deudas de días que ya pasaron.
+        creado_en = cuota.get("creado_en")
+        alta = creado_en.date() if creado_en is not None else None
+        fechas = [f for f in _fechas_de_cuota_en_mes(cuota, anio, mes)
+                  if alta is None or f >= alta]
+        # 2) Emite lo ya vencido/hoy + SOLO el próximo pago por venir; los
+        #    futuros más allá del primero no existen hasta que su fecha llegue.
+        ya_pasadas = [f for f in fechas if f <= hoy]
+        emision = list(ya_pasadas)
+        if len(ya_pasadas) < len(fechas):
+            emision.append(fechas[len(ya_pasadas)])  # primera fecha futura
+        for vencimiento in emision:
             if restante is not None and restante <= _EPSILON:
                 # Cuenta finita cubierta: no genera más (064).
                 break
@@ -580,7 +599,12 @@ SELECT q.id, q.tenant_id, q.cliente_id, q.concepto, q.monto, q.dia_cobro,
        (SELECT COALESCE(SUM(x.monto), 0) FROM cobros x WHERE x.cuota_id = q.id) AS programado_meta,
        (SELECT COALESCE(SUM((pg->>'monto')::numeric), 0)
           FROM cobros y, jsonb_array_elements(y.pagos) AS pg
-         WHERE y.cuota_id = q.id) AS abonado_meta
+         WHERE y.cuota_id = q.id) AS abonado_meta,
+       -- Mig 065: cobros generados de esta cuota SIN abonos (borrables junto
+       -- con la cuota; los que ya recibieron dinero se conservan siempre).
+       (SELECT COUNT(*) FROM cobros z
+         WHERE z.cuota_id = q.id
+           AND (z.pagos IS NULL OR jsonb_array_length(z.pagos) = 0)) AS cobros_pendientes
 FROM cuotas_clientes q
 JOIN clientes cl ON cl.id = q.cliente_id
 """
@@ -799,22 +823,51 @@ def actualizar_cuota(
     return {"ok": True, "cuota": cuota}
 
 
-def eliminar_cuota(tenant_id: str, cuota_id: str) -> dict:
-    """Borrado temporal: los cobros ya generados quedan (cuota_id pasa a NULL).
-    El historial de dinero nunca se borra por editar la suscripción."""
+def eliminar_cuota(tenant_id: str, cuota_id: str, borrar_pendientes: bool = False) -> dict:
+    """Baja de la cuota. El dinero histórico nunca se borra:
+      - Los cobros que YA recibieron abonos quedan huérfanos (cuota_id pasa a
+        NULL por el ON DELETE SET NULL) con su saldo y pagos intactos.
+      - mig 065: si borrar_pendientes, los cobros SIN abonos se eliminan
+        (borrado duro) — deudas de una suscripción que ya no existe.
+    Borrar primero los cobros y DESPUÉS la cuota: el SET NULL del FK se
+    aplicaría antes de poder distinguirlos."""
     filas = query(
-        "DELETE FROM cuotas_clientes WHERE tenant_id = %s AND id = %s RETURNING concepto",
+        "SELECT concepto FROM cuotas_clientes WHERE tenant_id = %s AND id = %s",
         (tenant_id, cuota_id)
     )
     if not filas:
         return {"ok": False, "tipo": "no_encontrado", "mensaje": "Cuota no encontrada"}
-    # Registro de actividad (062): baja de cuota (los cobros generados quedan).
+    concepto = filas[0]["concepto"]
+
+    borrados = 0
+    if borrar_pendientes:
+        filas_b = query(
+            "DELETE FROM cobros WHERE tenant_id = %s AND cuota_id = %s "
+            "AND (pagos IS NULL OR jsonb_array_length(pagos) = 0) RETURNING id",
+            (tenant_id, cuota_id)
+        )
+        borrados = len(filas_b)
+
+    query(
+        "DELETE FROM cuotas_clientes WHERE tenant_id = %s AND id = %s",
+        (tenant_id, cuota_id)
+    )
+    # Registro de actividad (062): baja de cuota.
     try:
+        detalle = {"borrados_pendientes": borrados} if borrar_pendientes else None
         registrar_actividad(
             tenant_id, "cobro", "cuota", "eliminar",
-            resumen=f"Eliminó la cuota {filas[0]['concepto']}",
+            resumen=(f"Eliminó la cuota {concepto}" +
+                     (f" (y {borrados} cobro(s) pendientes sin abonos)" if borrar_pendientes else "")),
             entidad_id=cuota_id,
+            detalle=detalle,
         )
     except Exception:
         pass
-    return {"ok": True, "mensaje": f"Cuota '{filas[0]['concepto']}' eliminada (los cobros generados se conservan)"}
+    mensaje = f"Cuota '{concepto}' eliminada"
+    if borrar_pendientes:
+        mensaje += (f" con {borrados} cobro(s) pendientes borrados"
+                    if borrados else "; sus cobros con abonos se conservan")
+    else:
+        mensaje += " (los cobros generados se conservan)"
+    return {"ok": True, "cobros_borrados": borrados, "mensaje": mensaje}
