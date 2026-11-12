@@ -274,11 +274,14 @@ def _crear_variaciones_y_lotes(
         if not vnombre:
             continue
         vprecio = float(v.get("precio") or 0)
+        # Tamaño propio de la variación (066): opcional, pill "X cm" en catálogo.
+        vtamano = v.get("tamano_cm")
+        vtamano = float(vtamano) if vtamano not in (None, "", 0) else None
         try:
             r_var = _q(conn,
-                "INSERT INTO producto_variaciones (producto_id, nombre, precio, tenant_id) "
-                "VALUES (%s, %s, %s, %s) RETURNING id",
-                (product_id, vnombre, vprecio, tenant_id))
+                "INSERT INTO producto_variaciones (producto_id, nombre, precio, tenant_id, tamano_cm) "
+                "VALUES (%s, %s, %s, %s, %s) RETURNING id",
+                (product_id, vnombre, vprecio, tenant_id, vtamano))
         except UniqueViolation:
             conn.rollback()
             return {"ok": False, "tipo": "validacion",

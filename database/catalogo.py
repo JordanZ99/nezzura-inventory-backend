@@ -386,7 +386,7 @@ def obtener_catalogo_publico(slug: str) -> dict:
     # Suma el stock de los lotes ligados a cada variación (cada variación
     # lleva su propio inventario).
     variaciones = query("""
-        SELECT p.Producto AS producto, v.id, v.nombre, v.precio, v.foto,
+        SELECT p.Producto AS producto, v.id, v.nombre, v.precio, v.foto, v.tamano_cm,
                COALESCE((SELECT SUM(l.Stock_Lote) FROM lotes l
                          WHERE l.variacion_id = v.id AND l.Estado='Activo'
                            AND l.tenant_id = v.tenant_id), 0) AS stock
@@ -402,6 +402,8 @@ def obtener_catalogo_publico(slug: str) -> dict:
             "nombre": v["nombre"],
             "precio": float(v["precio"] or 0),
             "foto": v.get("foto") or "",
+            # Tamaño propio de la variación (066): pill "X cm" del modal.
+            "tamano_cm": float(v["tamano_cm"]) if v.get("tamano_cm") is not None else None,
             "stock": float(v["stock"] or 0),
         })
 

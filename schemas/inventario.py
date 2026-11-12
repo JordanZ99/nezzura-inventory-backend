@@ -10,6 +10,7 @@ class VariacionAlta(BaseModel):
     precio: float = Field(0, description="Precio propio de la variación")
     stock_inicial: Optional[float] = Field(None, description="Stock inicial propio de esta variación (crea su lote)")
     costo: Optional[float] = Field(None, description="Costo del lote inicial de esta variación (si se omite, usa el costo del producto)")
+    tamano_cm: Optional[float] = Field(None, gt=0, description="Tamaño de la variación en cm (pill del catálogo, ej. peluches 30/40/50 cm)")
 
 
 class RecetaAlta(BaseModel):
@@ -97,12 +98,14 @@ class NuevaVariacion(BaseModel):
     foto    : str = Field("", description="URL de Cloudinary de la foto propia de la variación (opcional)")
     stock_inicial: Optional[float] = Field(None, description="Stock inicial propio de esta variación")
     costo   : Optional[float] = Field(None, description="Costo del lote inicial (si se omite, usa 0)")
+    tamano_cm: Optional[float] = Field(None, gt=0, description="Tamaño de la variación en cm (pill del catálogo)")
 
 
 class ActualizarVariacion(BaseModel):
     nombre : str = Field(..., description="Nuevo nombre de la variación")
     precio : float = Field(0, description="Nuevo precio de la variación")
     foto   : Optional[str] = Field(None, description="URL de la foto; None = conservar, '' = quitar")
+    tamano_cm: Optional[float] = Field(None, gt=0, description="Tamaño en cm; None = conservar")
 
 
 class NuevoMaterialReceta(BaseModel):

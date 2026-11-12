@@ -29,7 +29,7 @@ def _adjuntar_variaciones(filas: list[dict], tenant_id: str) -> None:
     if not filas:
         return
     variaciones = query("""
-        SELECT p.Producto AS producto, v.producto_id, v.id, v.nombre, v.precio, v.foto
+        SELECT p.Producto AS producto, v.producto_id, v.id, v.nombre, v.precio, v.foto, v.tamano_cm
         FROM producto_variaciones v
         JOIN productos p ON p.id = v.producto_id
         WHERE p.tenant_id = %s
@@ -54,6 +54,9 @@ def _adjuntar_variaciones(filas: list[dict], tenant_id: str) -> None:
             "nombre": v["nombre"],
             "precio": float(v["precio"] or 0),
             "foto": v.get("foto") or "",
+            # Tamaño propio de la variación (066): pill "X cm" en el catálogo
+            # (ej. peluche vendido en 30/40/50 cm). None = sin tamaño.
+            "tamano_cm": float(v["tamano_cm"]) if v.get("tamano_cm") is not None else None,
             "stock": stock_por_var.get((v["producto_id"], v["id"]), 0),
         })
     for f in filas:
@@ -66,7 +69,7 @@ def listar_variaciones_producto(producto: str, tenant_id: str) -> list[dict]:
     if not pid:
         return []
     return query("""
-        SELECT v.id, v.nombre, v.precio, v.foto,
+        SELECT v.id, v.nombre, v.precio, v.foto, v.tamano_cm,
                COALESCE((SELECT SUM(l.Stock_Lote) FROM lotes l
                          WHERE l.variacion_id = v.id AND l.Estado='Activo'
                            AND l.tenant_id = v.tenant_id), 0) AS stock
@@ -76,7 +79,7 @@ def listar_variaciones_producto(producto: str, tenant_id: str) -> list[dict]:
     """, (pid, tenant_id))
 
 
-def crear_variacion(producto: str, nombre: str, precio: float, tenant_id: str, foto: str = "", stock_inicial: float | None = None, costo: float | None = None) -> dict:
+def crear_variacion(producto: str, nombre: str, precio: float, tenant_id: str, foto: str = "", stock_inicial: float | None = None, costo: float | None = None, tamano_cm: float | None = None) -> dict:
     """
     Crea una variación nueva para un producto.
     Si ya existe una variación con el mismo nombre, devuelve error (UNIQUE).
@@ -95,10 +98,11 @@ def crear_variacion(producto: str, nombre: str, precio: float, tenant_id: str, f
         return {"ok": False, "mensaje": "Producto no encontrado"}
     try:
         result = query("""
-            INSERT INTO producto_variaciones (producto_id, nombre, precio, tenant_id, foto)
-            VALUES (%s, %s, %s, %s, %s)
-            RETURNING id, nombre, precio, foto
-        """, (pid, nombre, float(precio or 0), tenant_id, foto or ""))
+            INSERT INTO producto_variaciones (producto_id, nombre, precio, tenant_id, foto, tamano_cm)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            RETURNING id, nombre, precio, foto, tamano_cm
+        """, (pid, nombre, float(precio or 0), tenant_id, foto or "",
+              tamano_cm if tamano_cm is not None else None))
     except UniqueViolation:
         return {"ok": False, "mensaje": "Ya existe una variación con ese nombre"}
     if not result:
@@ -139,18 +143,19 @@ def crear_variacion(producto: str, nombre: str, precio: float, tenant_id: str, f
         )
     except Exception:
         pass
-    return {"ok": True, "variacion": {"id": v["id"], "nombre": v["nombre"], "precio": float(v["precio"] or 0), "foto": v.get("foto") or "", "stock": stock_final}}
+    return {"ok": True, "variacion": {"id": v["id"], "nombre": v["nombre"], "precio": float(v["precio"] or 0), "foto": v.get("foto") or "", "tamano_cm": float(v["tamano_cm"]) if v.get("tamano_cm") is not None else None, "stock": stock_final}}
 
 
-def actualizar_variacion(variacion_id: int, nombre: str, precio: float, tenant_id: str, foto: str | None = None) -> dict:
+def actualizar_variacion(variacion_id: int, nombre: str, precio: float, tenant_id: str, foto: str | None = None, tamano_cm: float | None = None) -> dict:
     """Actualiza nombre y/o precio de una variación (validando pertenencia del tenant).
-    foto: None = conservar la actual; '' = quitar la foto."""
+    foto: None = conservar la actual; '' = quitar la foto.
+    tamano_cm: None = conservar el actual (mismo patrón que foto)."""
     nombre = (nombre or "").strip()
     if not nombre:
         return {"ok": False, "mensaje": "El nombre de la variación es obligatorio"}
     # Snapshot ANTES del UPDATE: diff para el registro de actividad (062).
     vieja = query(
-        "SELECT v.nombre, v.precio, v.foto, p.Producto AS producto "
+        "SELECT v.nombre, v.precio, v.foto, v.tamano_cm, p.Producto AS producto "
         "FROM producto_variaciones v JOIN productos p ON p.id = v.producto_id "
         "WHERE v.id = %s AND v.tenant_id = %s",
         (variacion_id, tenant_id)
@@ -159,10 +164,11 @@ def actualizar_variacion(variacion_id: int, nombre: str, precio: float, tenant_i
     try:
         result = query("""
             UPDATE producto_variaciones
-            SET nombre = %s, precio = %s, foto = COALESCE(%s, foto)
+            SET nombre = %s, precio = %s, foto = COALESCE(%s, foto),
+                tamano_cm = COALESCE(%s, tamano_cm)
             WHERE id = %s AND tenant_id = %s
-            RETURNING id, nombre, precio, foto
-        """, (nombre, float(precio or 0), foto, variacion_id, tenant_id))
+            RETURNING id, nombre, precio, foto, tamano_cm
+        """, (nombre, float(precio or 0), foto, tamano_cm, variacion_id, tenant_id))
     except UniqueViolation:
         return {"ok": False, "mensaje": "Ya existe una variación con ese nombre"}
     if not result:
@@ -179,6 +185,12 @@ def actualizar_variacion(variacion_id: int, nombre: str, precio: float, tenant_i
             nueva_foto = a["foto"] if foto is None else foto
             if (a["foto"] or "") != (nueva_foto or ""):
                 diff["foto"] = [(a["foto"] or "")[:60], (nueva_foto or "")[:60]]
+            # Tamaño (066): solo se reporta si llegó un valor nuevo (None = conservar).
+            if tamano_cm is not None:
+                viejo_t = float(a["tamano_cm"]) if a.get("tamano_cm") is not None else None
+                nuevo_t = float(tamano_cm)
+                if viejo_t != nuevo_t:
+                    diff["tamano_cm"] = [viejo_t, nuevo_t]
             if diff:
                 registrar_actividad(
                     tenant_id, "producto", "variacion", "editar",
@@ -187,7 +199,7 @@ def actualizar_variacion(variacion_id: int, nombre: str, precio: float, tenant_i
                 )
     except Exception:
         pass
-    return {"ok": True, "variacion": {"id": v["id"], "nombre": v["nombre"], "precio": float(v["precio"] or 0), "foto": v.get("foto") or ""}}
+    return {"ok": True, "variacion": {"id": v["id"], "nombre": v["nombre"], "precio": float(v["precio"] or 0), "foto": v.get("foto") or "", "tamano_cm": float(v["tamano_cm"]) if v.get("tamano_cm") is not None else None}}
 
 
 def eliminar_variacion(variacion_id: int, tenant_id: str) -> dict:

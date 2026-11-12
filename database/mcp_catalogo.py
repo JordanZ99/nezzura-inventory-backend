@@ -201,7 +201,7 @@ def obtener_producto(tenant_id: str, producto_id: int) -> dict | None:
     # público: lotes activos ligados a cada variación).
     variaciones = query(
         """
-        SELECT v.nombre, v.precio,
+        SELECT v.nombre, v.precio, v.tamano_cm,
                COALESCE((SELECT SUM(l2.Stock_Lote) FROM lotes l2
                          WHERE l2.variacion_id = v.id AND l2.Estado = 'Activo'
                            AND l2.tenant_id = v.tenant_id), 0) AS stock
@@ -227,7 +227,9 @@ def obtener_producto(tenant_id: str, producto_id: int) -> dict | None:
         # la corrige al revisar la publicación.
         "condicion_sugerida": "nuevo",
         "variaciones": [
-            {"nombre": v["nombre"], "precio": _num(v["precio"]), "stock": _stock(v["stock"])}
+            {"nombre": v["nombre"], "precio": _num(v["precio"]),
+             "tamano_cm": float(v["tamano_cm"]) if v.get("tamano_cm") is not None else None,
+             "stock": _stock(v["stock"])}
             for v in variaciones
         ],
     }

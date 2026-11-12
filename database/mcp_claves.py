@@ -33,8 +33,8 @@ def _hashear(clave: str) -> str:
 
 
 def _generar_clave() -> str:
-    """Clave en claro con prefijo reconocible en logs: goy_mcp_<48 hex>."""
-    return f"goy_mcp_{secrets.token_hex(24)}"
+    """Clave en claro con prefijo reconocible en logs: nezzura_mcp_<48 hex>."""
+    return f"nezzura_mcp_{secrets.token_hex(24)}"
 
 
 def crear_clave(tenant_id: str, nombre: str | None) -> dict:

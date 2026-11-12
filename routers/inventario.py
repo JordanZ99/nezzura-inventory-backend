@@ -378,13 +378,13 @@ def obtener_variaciones(producto: str, tenant_id: str = Depends(get_tenant_id)):
 def crear_variacion_endpoint(data: NuevaVariacion, tenant_id: str = Depends(get_tenant_id)):
     """Crea una variación nueva para un producto (nombre + precio propio + foto opcional).
     Si stock_inicial > 0, crea el lote de la variación (como en el ALTA)."""
-    return crear_variacion(data.producto, data.nombre, data.precio, tenant_id, foto=data.foto, stock_inicial=data.stock_inicial, costo=data.costo)
+    return crear_variacion(data.producto, data.nombre, data.precio, tenant_id, foto=data.foto, stock_inicial=data.stock_inicial, costo=data.costo, tamano_cm=data.tamano_cm)
 
 
 @router.patch("/variaciones/{variacion_id}")
 def editar_variacion_endpoint(variacion_id: int, data: ActualizarVariacion, tenant_id: str = Depends(get_tenant_id)):
-    """Actualiza nombre, precio y/o foto de una variación."""
-    return actualizar_variacion(variacion_id, data.nombre, data.precio, tenant_id, foto=data.foto)
+    """Actualiza nombre, precio, foto y/o tamaño de una variación."""
+    return actualizar_variacion(variacion_id, data.nombre, data.precio, tenant_id, foto=data.foto, tamano_cm=data.tamano_cm)
 
 
 @router.delete("/variaciones/{variacion_id}")

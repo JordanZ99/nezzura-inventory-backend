@@ -42,7 +42,7 @@ from database import mcp_catalogo as cat
 from muse.auth import AutenticacionAPIKey, tenant_de_request
 
 servidor = MCPServer(
-    "Goyangi Inventario",
+    "Nezzura Inventario",
     instructions=(
         "Catálogo de SOLO LECTURA del inventario de este negocio. Contiene "
         "productos físicos con su precio de venta al público, descripción, "
