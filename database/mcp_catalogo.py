@@ -71,17 +71,17 @@ def buscar_productos(
     filtro_stock = "HAVING COALESCE(SUM(l.Stock_Lote), 0) > 0" if solo_con_stock else ""
     filas = query(
         f"""
-        SELECT p.id, p."Producto" AS nombre, p.sufijo_precio,
+        SELECT p.id, p.producto AS nombre, p.sufijo_precio,
                {_PRECIO_VENTA} AS precio_venta,
                COALESCE(SUM(l.Stock_Lote), 0) AS stock_disponible,
                {_CATEGORIAS}
         FROM productos p
         {_JOIN_LOTES}
         WHERE {_FILTRO_ALCANCE}
-          AND (p."Producto" ILIKE %s OR p.codigo_interno ILIKE %s OR p.codigo_barras ILIKE %s)
+          AND (p.producto ILIKE %s OR p.codigo_interno ILIKE %s OR p.codigo_barras ILIKE %s)
         GROUP BY p.id
         {filtro_stock}
-        ORDER BY p."Producto" ASC
+        ORDER BY p.producto ASC
         LIMIT %s
         """,
         (tenant_id, patron, patron, patron, limite),
@@ -105,7 +105,7 @@ def obtener_producto(tenant_id: str, producto_id: int) -> dict | None:
     """Ficha completa para publicar. None si no existe / no es del tenant."""
     filas = query(
         f"""
-        SELECT p.id, p."Producto" AS nombre, p.Descripcion AS descripcion,
+        SELECT p.id, p.producto AS nombre, p.descripcion AS descripcion,
                p.sufijo_precio, p.tamano_cm,
                {_PRECIO_VENTA} AS precio_venta,
                COALESCE(SUM(l.Stock_Lote), 0) AS stock_disponible,
@@ -168,7 +168,7 @@ def obtener_fotos(tenant_id: str, producto_id: int) -> dict | None:
     """
     filas = query(
         """
-        SELECT p."Imagen" AS imagen
+        SELECT p.imagen AS imagen
         FROM productos p
         WHERE p.id = %s AND p.tenant_id = %s
           AND p.Estado = 'Activo' AND p.tipo_producto = 'stock'
@@ -209,7 +209,7 @@ def stock_actual(
     if producto_id is not None:
         filas = query(
             f"""
-            SELECT p.id, p."Producto" AS nombre,
+            SELECT p.id, p.producto AS nombre,
                    COALESCE(SUM(l.Stock_Lote), 0) AS stock_disponible
             FROM productos p
             {_JOIN_LOTES}
@@ -222,13 +222,13 @@ def stock_actual(
         patron = f"%{(consulta or '').strip()}%"
         filas = query(
             f"""
-            SELECT p.id, p."Producto" AS nombre,
+            SELECT p.id, p.producto AS nombre,
                    COALESCE(SUM(l.Stock_Lote), 0) AS stock_disponible
             FROM productos p
             {_JOIN_LOTES}
-            WHERE {_FILTRO_ALCANCE} AND p."Producto" ILIKE %s
+            WHERE {_FILTRO_ALCANCE} AND p.producto ILIKE %s
             GROUP BY p.id
-            ORDER BY p."Producto" ASC
+            ORDER BY p.producto ASC
             LIMIT %s
             """,
             (tenant_id, patron, limite),
