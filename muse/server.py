@@ -60,10 +60,13 @@ SOLO_LECTURA = ToolAnnotations(readOnlyHint=True)
 
 @servidor.tool(annotations=SOLO_LECTURA)
 def buscar_productos(consulta: str, solo_con_stock: bool = False, limite: int = 15) -> dict:
-    """Busca productos físicos del inventario por nombre o código (interno o de
-    barras). Devuelve id, nombre, precio de venta al público, stock disponible
-    y categoría. NUNCA incluye costos internos. Úsalo para encontrar el id de
-    un producto antes de obtener sus detalles o fotos."""
+    """Busca productos físicos del inventario. La búsqueda es tolerante:
+    ignora mayúsculas, acentos y espacios ("My Melody" encuentra "MyMelody"),
+    divide la consulta en palabras y busca cada una en el nombre, la
+    descripción, la categoría y los códigos ("Sanrio" trae todo lo de esa
+    categoría). Devuelve id, nombre, precio de venta al público, stock
+    disponible y categoría. NUNCA incluye costos internos. Úsalo para
+    encontrar el id de un producto antes de obtener sus detalles o fotos."""
     tenant = tenant_de_request()
     try:
         productos = cat.buscar_productos(tenant, consulta, solo_con_stock, limite)
@@ -113,8 +116,9 @@ def obtener_fotos_producto(producto_id: int) -> dict:
 @servidor.tool(annotations=SOLO_LECTURA)
 def stock_actual(producto_id: int | None = None, consulta: str | None = None) -> dict:
     """Devuelve el stock disponible actual de uno o varios productos: por id
-    exacto o buscando por nombre (todas las coincidencias). Úsalo cuando el
-    dueño pregunte cuántas unidades quedan de algo."""
+    exacto o buscando por nombre, descripción o categoría (búsqueda tolerante:
+    ignora acentos, mayúsculas y espacios; funciona por palabras). Úsalo
+    cuando el dueño pregunte cuántas unidades quedan de algo."""
     tenant = tenant_de_request()
     try:
         if producto_id is None and not (consulta or "").strip():

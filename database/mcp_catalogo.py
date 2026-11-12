@@ -20,6 +20,8 @@
 #     distinto del catálogo web; el agente ve todos los físicos activos.
 # ==============================================================================
 
+import unicodedata
+
 from database.conexion import query
 from database.helpers import _obtener_categorias_subquery
 
@@ -60,14 +62,87 @@ def _stock(valor) -> float:
         return 0.0
 
 
+# ── Búsqueda tolerante ────────────────────────────────────────────────────────
+# El dueño escribe "My Melody" y el producto se llama "MyMelody", o escribe
+# "pokemon" y el producto dice "Pokémon". Normalizamos AMBOS lados:
+#   - En Python: la consulta del agente (minúsculas, sin acentos, por palabras).
+#   - En SQL: los campos del catálogo (translate baja acentos sin extensiones).
+# Cada palabra debe aparecer en ALGUNO de estos campos: nombre, descripción,
+# código interno, código de barras o categoría. Así "Sanrio" y "FNAF" traen
+# todo lo de esa categoría aunque no tengan la palabra en el nombre.
+
+_ACCENTES = "áàäâãéèëêíìïîóòöôõúùüûñçÁÀÄÂÃÉÈÍÌÏÎÓÒÖÔÕÚÙÜÛÑÇ"
+_PLANO = "aaaaaeeeeiiiiooooouuuunccAAAAAEEEEIIIIOOOOOUUUUNCC"
+
+
+def _norm(expr: str) -> str:
+    """Expresión SQL que da la versión minúscula y sin acentos de un campo."""
+    return f"translate(lower({expr}), '{_ACCENTES}', '{_PLANO}')"
+
+
+def _normalizar(texto: str) -> str:
+    """La consulta del agente: minúsculas y sin acentos (lado Python)."""
+    texto = unicodedata.normalize("NFD", (texto or "").lower())
+    return "".join(c for c in texto if not unicodedata.combining(c))
+
+
+def _match_token(token: str) -> tuple[str, list[str]]:
+    """Condición SQL: la palabra aparece en cualquier campo de búsqueda."""
+    patron = f"%{token}%"
+    campo_desc = "COALESCE(p.descripcion, '')"
+    campo_codigo = "COALESCE(p.codigo_interno, '')"
+    sql = (
+        f"({_norm('p.producto')} LIKE %s"
+        f" OR {_norm(campo_desc)} LIKE %s"
+        f" OR {_norm(campo_codigo)} LIKE %s"
+        f" OR COALESCE(p.codigo_barras, '') LIKE %s"
+        " OR EXISTS (SELECT 1 FROM producto_categorias pcx"
+        "             JOIN categorias cx ON cx.id = pcx.categoria_id"
+        "             WHERE pcx.producto_id = p.id"
+        f"              AND {_norm('cx.nombre')} LIKE %s))"
+    )
+    return sql, [patron, patron, patron, patron, patron]
+
+
+def _condicion_busqueda(consulta: str) -> tuple[str, list[str], str, list[str]]:
+    """
+    Devuelve (filtro_where, params_where, orden, params_orden):
+      - filtro_where: AND de tokens; cada token en cualquier campo.
+      - orden: relevancia — empieza igual > contiene la frase > el resto,
+        y con stock antes que agotados.
+    """
+    tokens = [t for t in _normalizar(consulta).split() if t]
+    frase = _normalizar(consulta).replace(" ", "")
+    partes: list[str] = []
+    params: list[str] = []
+    for t in tokens:
+        sql_t, params_t = _match_token(t)
+        partes.append(sql_t)
+        params += params_t
+    nombre_plano = f"replace({_norm('p.producto')}, ' ', '')"
+    orden = (
+        "CASE "
+        f"WHEN {nombre_plano} LIKE %s THEN 0 "  # empieza igual a la frase
+        f"WHEN {nombre_plano} LIKE %s THEN 1 "  # la contiene
+        "ELSE 2 END, "
+        "CASE WHEN COALESCE(SUM(l.Stock_Lote), 0) > 0 THEN 0 ELSE 1 END, "
+        "p.producto ASC"
+    )
+    params_orden = [f"%{frase}%", f"%{frase}%"]
+    return " AND ".join(partes), params, orden, params_orden
+
+
 # ── Tool: buscar_productos ────────────────────────────────────────────────────
 
 def buscar_productos(
     tenant_id: str, consulta: str, solo_con_stock: bool = False, limite: int = 15
 ) -> list[dict]:
-    """Búsqueda por nombre o código (interno / barras)."""
-    consulta = (consulta or "").strip()
-    patron = f"%{consulta}%"
+    """
+    Búsqueda tolerante: por palabras (no frase completa), en nombre,
+    descripción, códigos y categoría, ignorando acentos, mayúsculas y
+    espacios. Ordenada por relevancia.
+    """
+    filtro_tokens, params_tokens, orden, params_orden = _condicion_busqueda(consulta)
     filtro_stock = "HAVING COALESCE(SUM(l.Stock_Lote), 0) > 0" if solo_con_stock else ""
     filas = query(
         f"""
@@ -78,13 +153,13 @@ def buscar_productos(
         FROM productos p
         {_JOIN_LOTES}
         WHERE {_FILTRO_ALCANCE}
-          AND (p.producto ILIKE %s OR p.codigo_interno ILIKE %s OR p.codigo_barras ILIKE %s)
+          {f"AND {filtro_tokens}" if filtro_tokens else ""}
         GROUP BY p.id
         {filtro_stock}
-        ORDER BY p.producto ASC
+        ORDER BY {orden}
         LIMIT %s
         """,
-        (tenant_id, patron, patron, patron, limite),
+        tuple([tenant_id] + params_tokens + params_orden + [limite]),
     )
     return [
         {
@@ -219,19 +294,20 @@ def stock_actual(
             (tenant_id, producto_id),
         )
     else:
-        patron = f"%{(consulta or '').strip()}%"
+        filtro_tokens, params_tokens, orden, params_orden = _condicion_busqueda(consulta or "")
         filas = query(
             f"""
             SELECT p.id, p.producto AS nombre,
                    COALESCE(SUM(l.Stock_Lote), 0) AS stock_disponible
             FROM productos p
             {_JOIN_LOTES}
-            WHERE {_FILTRO_ALCANCE} AND p.producto ILIKE %s
+            WHERE {_FILTRO_ALCANCE}
+              {f"AND {filtro_tokens}" if filtro_tokens else ""}
             GROUP BY p.id
-            ORDER BY p.producto ASC
+            ORDER BY {orden}
             LIMIT %s
             """,
-            (tenant_id, patron, limite),
+            tuple([tenant_id] + params_tokens + params_orden + [limite]),
         )
     return [
         {
