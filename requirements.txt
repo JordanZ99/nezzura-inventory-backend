@@ -6,3 +6,4 @@ python-multipart
 cloudinary
 PyJWT[crypto]
 openpyxl
+mcp>=1.9
