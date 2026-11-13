@@ -374,6 +374,7 @@ def crear_producto_completo(
     visible_en_catalogo: bool | None = None,
     variaciones: list[dict] | None = None,   # [{nombre, precio, stock_inicial?, costo?}] — aplica a cualquier tipo
     recetas: list[dict] | None = None,       # [{material, cantidad}] — solo compuestos
+    origen: str = "",                        # 'agente_ia' si el alta viene del conector MCP (nivel 3)
 ) -> dict:
     """
     Crea un producto con TODO en una sola transacción (todo-o-nada):
@@ -460,20 +461,27 @@ def crear_producto_completo(
         conn.commit()
 
         # Registro de actividad (062): alta de producto (luego del commit, la
-        # operación ya está hecha y el log es best-effort).
+        # operación ya está hecha y el log es best-effort). Si el alta vino del
+        # agente IA (conector MCP nivel 3), el resumen lo deja explícito para
+        # que el Historial del gestor muestre quién hizo el cambio.
+        resumen_actividad = f"Creó el producto {producto} ({tipo})"
+        detalle_actividad = {
+            "tipo": tipo,
+            "costo": round(float(costo or 0), 2),
+            "precio": round(float(precio_venta or 0), 2),
+            "stock": float(stock or 0),
+            "categorias": categoria or ["General"],
+            **({"variaciones": len(variaciones_list)} if variaciones_list else {}),
+        }
+        if origen:
+            resumen_actividad = f"El agente IA creó el producto {producto} ({tipo})"
+            detalle_actividad["origen"] = origen
         try:
             registrar_actividad(
                 tenant_id, "producto", "producto", "crear",
-                resumen=f"Creó el producto {producto} ({tipo})",
+                resumen=resumen_actividad,
                 entidad_id=product_id,
-                detalle={
-                    "tipo": tipo,
-                    "costo": round(float(costo or 0), 2),
-                    "precio": round(float(precio_venta or 0), 2),
-                    "stock": float(stock or 0),
-                    "categorias": categoria or ["General"],
-                    **({"variaciones": len(variaciones_list)} if variaciones_list else {}),
-                },
+                detalle=detalle_actividad,
             )
         except Exception:
             pass

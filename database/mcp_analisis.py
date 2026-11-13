@@ -1,0 +1,115 @@
+# ==============================================================================
+# backend/database/mcp_analisis.py
+# Tools de análisis del negocio para claves de nivel 2 (solo lectura).
+#
+# NO calcula nada nuevo: reutiliza EXACTAMENTE las mismas funciones que el
+# Análisis Inteligente del gestor (database/analitica.py + analisis/reglas.py),
+# así el agente y la pantalla del dueño ven los mismos números. Los hallazgos
+# salen del motor de reglas, no del LLM: análisis no alucinativo.
+#
+# Privacidad (decisión del dueño):
+#   - SÍ se exponen agregados (ingresos, ganancia, margen, gastos, valor de
+#     inventario a costo).
+#   - NUNCA se exponen costos unitarios por producto ni lotes con su costo.
+#
+# Costo backend: generar() es UNA query pesada. Ambos tools comparten un caché
+# TTL de 5 minutos por tenant+rango: una ráfaga de preguntas del agente
+# ("cómo voy", "y mis pendientes?", "y el stock?") golpea la base UNA vez.
+# ==============================================================================
+
+import threading
+import time
+from datetime import timedelta
+
+from analisis.reglas import evaluar
+from database.analitica import generar
+from database.helpers import resolver_rango_q, ventana_ts_de_rango, hoy_negocio
+from database.imagenes import _get_tenant_plan
+
+# Periodos que aceptan los tools (nombres pensados para un agente IA).
+PERIODOS = {"mes", "30dias", "90dias", "todo"}
+
+# Filtros de hallazgos: cada categoría agrupa los tipos del motor de reglas.
+# Filtrar es gratis (Python); NUNCA significa otra query a la base.
+_FILTROS_TIPO = {
+    "todos": None,
+    "dinero": {"margen_bajo", "gastos_comodin", "gastos_pendientes", "concentracion_dias"},
+    "stock": {"quiebre_best_seller", "stock_muerto", "lotes_inconsistentes", "vendido_sin_lote"},
+    "ventas": {"tendencia_baja", "venta_nocturna", "mes_pico", "ticket_gap"},
+}
+
+_CACHE_TTL_SEG = 300  # 5 minutos
+_cache: dict[str, tuple[float, dict]] = {}
+_lock = threading.Lock()
+
+
+def _rango_dias(tenant_id: str, periodo: str):
+    desde_d = None
+    if periodo in ("30dias", "90dias"):
+        dias = 30 if periodo == "30dias" else 90
+        desde_d = hoy_negocio(tenant_id) - timedelta(days=dias - 1)
+    return desde_d, None, False
+
+
+def _analisis_completo(tenant_id: str, periodo: str) -> dict:
+    """generar() + evaluar() con caché TTL. Lanza ValueError si el plan no es Plus."""
+    if _get_tenant_plan(tenant_id) != "plus":
+        raise ValueError("El Análisis Inteligente es exclusivo del plan Plus.")
+
+    cache_key = f"{tenant_id}:{periodo}"
+    ahora = time.monotonic()
+    with _lock:
+        cached = _cache.get(cache_key)
+        if cached and ahora - cached[0] < _CACHE_TTL_SEG:
+            return cached[1]
+
+    if periodo == "todo":
+        desde_d, hasta_d = None, None
+    elif periodo == "mes":
+        desde_d, hasta_d = resolver_rango_q(tenant_id, None, None)
+    else:
+        desde_d, hasta_d = _rango_dias(tenant_id, periodo)
+    desde_ts, hasta_ts = ventana_ts_de_rango(tenant_id, desde_d, hasta_d)
+
+    paquete = generar(tenant_id, desde_ts, hasta_ts, desde_d, hasta_d)
+    hechos = paquete.pop("hechos", {})
+    paquete["hallazgos"] = evaluar(hechos)
+
+    with _lock:
+        # Un tenant puede pedir dos periodos en la misma ráfaga; el caché
+        # crece acotado (4 periodos por tenant) y se refresca por TTL.
+        if len(_cache) > 500:
+            _cache.clear()
+        _cache[cache_key] = (ahora, paquete)
+    return paquete
+
+
+def resumen_negocio(tenant_id: str, periodo: str = "mes") -> dict:
+    """KPIs agregados del periodo. Sin costos unitarios ni lotes."""
+    paquete = _analisis_completo(tenant_id, periodo)
+    return {
+        "rango_analizado": paquete.get("rango_analizado"),
+        "mensaje": paquete.get("mensaje") or "",
+        "metricas": paquete.get("metricas") or {},
+    }
+
+
+def hallazgos_inteligentes(tenant_id: str, periodo: str = "mes", tipo: str = "todos") -> dict:
+    """Hallazgos del motor de reglas (puntos ciegos + recomendaciones)."""
+    tipo = (tipo or "todos").strip().lower()
+    if tipo not in _FILTROS_TIPO:
+        raise ValueError(
+            f"Tipo inválido: '{tipo}'. Usa 'todos', 'dinero', 'stock' o 'ventas'."
+        )
+    paquete = _analisis_completo(tenant_id, periodo)
+    tipos_permitidos = _FILTROS_TIPO[tipo]
+    hallazgos = paquete.get("hallazgos") or []
+    if tipos_permitidos is not None:
+        hallazgos = [h for h in hallazgos if h.get("tipo") in tipos_permitidos]
+    return {
+        "rango_analizado": paquete.get("rango_analizado"),
+        "mensaje": paquete.get("mensaje") or "",
+        "tipo_filtro": tipo,
+        "total": len(hallazgos),
+        "hallazgos": hallazgos,
+    }

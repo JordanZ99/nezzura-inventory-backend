@@ -24,8 +24,23 @@ from database.conexion import query, execute
 # crear claves en bucle para evadir el rate limit individual.
 MAX_CLAVES_POR_TENANT = 5
 
-# Rate limit diario POR CLAVE (POST al /mcp: llamadas reales del agente).
+# Niveles de permiso de una clave (migrations/066):
+#   1 Lectura básica    → catálogo para publicar.
+#   2 Lectura avanzada  → + análisis del negocio (requiere plan Plus).
+#   3 Escritura básica  → + crear productos (borrador → confirmar).
+NIVELES_VALIDOS = (1, 2, 3)
+
+# Rate limit diario POR CLAVE, según su nivel. Los tools de análisis corren
+# queries más pesadas que el catálogo, así que una clave nivel 2 gasta más
+# por llamada y su cuota es menor.
 LIMITE_LLAMADAS_DIARIO = 300
+_LIMITE_POR_NIVEL = {1: 300, 2: 100, 3: 50}
+
+# Escrituras por día (solo nivel 3, contadas desde el día 1). Valor inicial
+# generoso para probar el agente sin topar; bajarlo después es cambiar ESTA
+# constante, sin código nuevo. Además de este límite, confirmar_producto es
+# destructiveHint=True: Muse pide aprobación humana en cada llamada.
+LIMITE_ESCRITURAS_DIARIO = 1000
 
 
 def _hashear(clave: str) -> str:
@@ -37,12 +52,23 @@ def _generar_clave() -> str:
     return f"nezzura_mcp_{secrets.token_hex(24)}"
 
 
-def crear_clave(tenant_id: str, nombre: str | None) -> dict:
+def crear_clave(tenant_id: str, nombre: str | None, nivel: int = 1) -> dict:
     """
     Genera una clave nueva para el tenant.
     Devuelve {ok: True, clave} — la clave en claro viaja UNA sola vez al
     frontend; de aquí en adelante solo existe su hash.
     """
+    try:
+        nivel = int(nivel)
+    except (TypeError, ValueError):
+        nivel = 1
+    if nivel not in NIVELES_VALIDOS:
+        return {
+            "ok": False,
+            "status": 422,
+            "mensaje": "Nivel inválido: usa 1 (lectura básica), 2 (lectura avanzada) o 3 (escritura básica).",
+        }
+
     activas = query(
         "SELECT COUNT(*) AS c FROM mcp_api_keys "
         "WHERE tenant_id = %s AND revocada_en IS NULL",
@@ -60,9 +86,9 @@ def crear_clave(tenant_id: str, nombre: str | None) -> dict:
 
     clave = _generar_clave()
     execute(
-        "INSERT INTO mcp_api_keys (tenant_id, nombre, key_hash, key_prefix) "
-        "VALUES (%s, %s, %s, %s)",
-        (tenant_id, (nombre or "").strip() or "Mi IA", _hashear(clave), clave[:12] + "…"),
+        "INSERT INTO mcp_api_keys (tenant_id, nombre, key_hash, key_prefix, nivel) "
+        "VALUES (%s, %s, %s, %s, %s)",
+        (tenant_id, (nombre or "").strip() or "Mi IA", _hashear(clave), clave[:12] + "…", nivel),
     )
     return {"ok": True, "clave": clave}
 
@@ -70,8 +96,9 @@ def crear_clave(tenant_id: str, nombre: str | None) -> dict:
 def listar_claves(tenant_id: str) -> list[dict]:
     """Claves del tenant SIN el hash (la UI muestra solo el prefijo)."""
     return query(
-        """SELECT id, nombre, key_prefix, creada_en, ultimo_uso_en,
-                  llamadas_hoy, dia_uso, revocada_en
+        """SELECT id, nombre, key_prefix, nivel, creada_en, ultimo_uso_en,
+                  llamadas_hoy, dia_uso, escrituras_hoy, dia_escrituras,
+                  revocada_en
            FROM mcp_api_keys
            WHERE tenant_id = %s
            ORDER BY revocada_en IS NOT NULL, creada_en DESC""",
@@ -92,31 +119,34 @@ def revocar_clave(clave_id: int, tenant_id: str) -> bool:
     return True
 
 
-def validar_clave(clave: str, contar_uso: bool = True) -> tuple[str | None, int | None]:
+def validar_clave(clave: str, contar_uso: bool = True):
     """
     Valida una clave para el middleware del servidor MCP.
-    Devuelve (tenant_id, None) si es válida, o (None, status_http) si no:
+    Devuelve (tenant_id, nivel, clave_id, None) si es válida, o
+    (None, None, None, status_http) si no:
       401 = no existe o está revocada · 429 = límite diario agotado.
 
     contar_uso: solo los POST (llamadas reales) gastan cuota; GET (SSE) y
     DELETE (cerrar sesión) se validan sin contar.
     """
     if not clave:
-        return None, 401
+        return None, None, None, 401
 
     filas = query(
-        "SELECT id, tenant_id, revocada_en, llamadas_hoy, dia_uso "
+        "SELECT id, tenant_id, nivel, revocada_en, llamadas_hoy, dia_uso "
         "FROM mcp_api_keys WHERE key_hash = %s",
         (_hashear(clave),),
     )
     if not filas or filas[0]["revocada_en"]:
-        return None, 401
+        return None, None, None, 401
 
     fila = filas[0]
+    nivel = int(fila["nivel"] or 1)
     hoy = date.today()
     usadas = fila["llamadas_hoy"] if fila["dia_uso"] == hoy else 0
-    if contar_uso and usadas >= LIMITE_LLAMADAS_DIARIO:
-        return None, 429
+    limite = _LIMITE_POR_NIVEL.get(nivel, LIMITE_LLAMADAS_DIARIO)
+    if contar_uso and usadas >= limite:
+        return None, None, None, 429
 
     if contar_uso:
         execute(
@@ -124,4 +154,29 @@ def validar_clave(clave: str, contar_uso: bool = True) -> tuple[str | None, int 
             "ultimo_uso_en = now() WHERE id = %s",
             (usadas + 1, hoy, fila["id"]),
         )
-    return str(fila["tenant_id"]), None
+    return str(fila["tenant_id"]), nivel, int(fila["id"]), None
+
+
+def contar_escritura(clave_id: int) -> bool:
+    """
+    Reserva una cuota de escritura para una clave nivel 3.
+    Devuelve False si ya alcanzó el límite diario. La escritura SE cuenta
+    aunque luego falle la creación: el costo de intentarlo ya se pagó.
+    """
+    filas = query(
+        "SELECT escrituras_hoy, dia_escrituras FROM mcp_api_keys WHERE id = %s",
+        (clave_id,),
+    )
+    if not filas:
+        return False
+    fila = filas[0]
+    hoy = date.today()
+    usadas = fila["escrituras_hoy"] if fila["dia_escrituras"] == hoy else 0
+    if usadas >= LIMITE_ESCRITURAS_DIARIO:
+        return False
+    execute(
+        "UPDATE mcp_api_keys SET escrituras_hoy = %s, dia_escrituras = %s "
+        "WHERE id = %s",
+        (usadas + 1, hoy, clave_id),
+    )
+    return True

@@ -34,7 +34,7 @@ def crear_clave(data: CrearClaveMcp, tenant_id: str = Depends(get_tenant_id)):
     vez: el backend solo guardó su hash. Si el dueño la pierde, revoca y
     genera otra.
     """
-    resultado = mcp_claves.crear_clave(tenant_id, data.nombre)
+    resultado = mcp_claves.crear_clave(tenant_id, data.nombre, data.nivel)
     if resultado.get("ok") is False:
         raise HTTPException(
             status_code=resultado.get("status", 422),

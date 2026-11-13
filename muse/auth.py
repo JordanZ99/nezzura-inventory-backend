@@ -18,15 +18,27 @@ from starlette.responses import JSONResponse
 
 from database.mcp_claves import validar_clave
 
-# Tenant del request actual. Los tools son síncronos y corren en threadpool:
-# anyio copia los contextvars al saltar de async → thread, así que el valor
-# fijado acá es visible dentro de cada tool.
+# Contexto del request actual. Los tools son síncronos y corren en threadpool:
+# anyio copia los contextvars al saltar de async → thread, así que los valores
+# fijados acá son visibles dentro de cada tool.
 tenant_actual: ContextVar[str] = ContextVar("muse_tenant", default="")
+nivel_actual: ContextVar[int] = ContextVar("muse_nivel", default=0)
+clave_actual: ContextVar[int] = ContextVar("muse_clave", default=0)
 
 
 def tenant_de_request() -> str:
     """Tenant validado por el middleware. Vacío = request sin autenticar."""
     return tenant_actual.get()
+
+
+def nivel_de_request() -> int:
+    """Nivel de permiso de la clave (1, 2 o 3). 0 = request sin autenticar."""
+    return nivel_actual.get()
+
+
+def clave_de_request() -> int:
+    """Id de la clave usada (para borradores y auditoría). 0 = sin clave."""
+    return clave_actual.get()
 
 
 class AutenticacionAPIKey:
@@ -49,7 +61,9 @@ class AutenticacionAPIKey:
         # Solo los POST (llamadas reales) gastan cuota del rate limit;
         # GET (stream SSE) y DELETE (cerrar sesión) se validan sin contar.
         contar = scope.get("method") == "POST"
-        tenant_id, error = await run_in_threadpool(validar_clave, clave_api, contar)
+        tenant_id, nivel, clave_id, error = await run_in_threadpool(
+            validar_clave, clave_api, contar
+        )
 
         if error is not None:
             mensajes = {
@@ -64,4 +78,6 @@ class AutenticacionAPIKey:
             return
 
         tenant_actual.set(tenant_id)
+        nivel_actual.set(int(nivel or 1))
+        clave_actual.set(int(clave_id or 0))
         await self.app(scope, receive, send)

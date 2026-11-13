@@ -1,13 +1,24 @@
 # ==============================================================================
 # backend/muse/server.py
-# Servidor MCP (Model Context Protocol) de SOLO LECTURA — conector para
-# agentes IA como Muse de Meta.
+# Servidor MCP (Model Context Protocol) — conector para agentes IA como Muse
+# de Meta, con NIVELES de permiso por clave.
 #
 # Usa el SDK oficial `mcp` v2 (MCPServer, antes FastMCP). Transporte:
 # streamable HTTP (el que soportan los custom connectors de Muse).
 #
 #   URL:     https://<backend>/mcp
 #   Header:  X-API-Key: <clave del tenant>
+#
+# NIVELES (el dueño elige al crear la clave, con advertencia en el gestor):
+#   1 "Lectura básica"    → catálogo para publicar (6 tools). Nunca costos.
+#   2 "Lectura avanzada"  → + análisis del negocio con datos REALES
+#                           (resumen_negocio, hallazgos_inteligentes). Agregados
+#                           sí, costos unitarios nunca. Requiere plan Plus.
+#   3 "Escritura básica"  → + crear productos con patrón borrador→confirmar
+#                           (proponer_producto, confirmar_producto). La
+#                           confirmación es destructiveHint: Muse debe pedir
+#                           aprobación humana en cada llamada, y cada alta
+#                           queda en el Historial como hecha por el agente.
 #
 # Modo del transporte:
 #   - stateless_http=True: cada POST es autosuficiente (sin sesiones en el
@@ -21,14 +32,16 @@
 #     para localhost y rompería requests con el Host de producción.
 #
 # Seguridad (en capas):
-#   1. TODOS los tools son de solo lectura (readOnlyHint) — no escriben nada.
-#      La publicación en Marketplace/redes es acción sensible del LADO del
-#      agente, con su gate de aprobación: nunca escondemos un "publish"
-#      dentro de un tool descrito como lectura.
-#   2. El tenant se resuelve desde la clave (muse/auth.py), nunca desde datos
-#      que envíe el agente.
-#   3. Las queries (database/mcp_catalogo.py) usan columnas explícitas: los
-#      costos internos no salen de la base de datos.
+#   1. Nivel de la clave: el tenant y el nivel se resuelven en muse/auth.py
+#      desde la clave, NUNCA desde datos que envíe el agente.
+#   2. tools/list filtrado por nivel (ServidorMuse) + re-verificación DENTRO
+#      de cada tool (defensa en profundidad: si el filtro falla, el tool
+#      responde error en vez de ejecutar).
+#   3. Las queries usan columnas explícitas: los costos unitarios nunca salen
+#      de la base de datos (el nivel 2 solo expone agregados).
+#   4. La escritura (nivel 3) pasa por borrador con token de un solo uso:
+#      confirmar crea SOLO desde lo guardado, el agente no puede alterar
+#      datos entre mensajes.
 #
 # Las descripciones de los tools están en español y son explícitas para que
 # el agente sepa CUÁNDO usar cada uno sin adivinar.
@@ -36,26 +49,81 @@
 
 from mcp.server.mcpserver import MCPServer
 from mcp.server.streamable_http_manager import TransportSecuritySettings
-from mcp.types import ToolAnnotations
+from mcp.types import Tool, ToolAnnotations
 
+from database import mcp_analisis
+from database import mcp_borradores
 from database import mcp_catalogo as cat
-from muse.auth import AutenticacionAPIKey, tenant_de_request
+from database import mcp_escritura
+from database.mcp_claves import contar_escritura
+from muse.auth import (
+    AutenticacionAPIKey,
+    clave_de_request,
+    nivel_de_request,
+    tenant_de_request,
+)
 
-servidor = MCPServer(
+# Nivel mínimo por tool (los 6 de catálogo son nivel 1: los ve cualquier clave).
+_NIVEL_MINIMO = {
+    "resumen_negocio": 2,
+    "hallazgos_inteligentes": 2,
+    "proponer_producto": 3,
+    "confirmar_producto": 3,
+}
+
+
+class ServidorMuse(MCPServer):
+    """MCPServer que filtra tools/list según el nivel de la clave: una clave
+    nivel 1 (catálogo) jamás ve los tools de análisis o escritura, así el
+    agente solo conoce lo que puede usar."""
+
+    async def list_tools(self) -> list[Tool]:
+        nivel = nivel_de_request() or 1
+        tools = await super().list_tools()
+        return [t for t in tools if _NIVEL_MINIMO.get(t.name, 1) <= nivel]
+
+
+servidor = ServidorMuse(
     "Nezzura Inventario",
     instructions=(
-        "Catálogo de SOLO LECTURA del inventario de este negocio. Contiene "
-        "productos físicos con su precio de venta al público, descripción, "
-        "tamaño, stock disponible y fotos. NO incluye costos internos. "
-        "Cuando el dueño pida publicar un producto en Marketplace o redes "
-        "sociales, obtén los datos con estos tools en lugar de pedírselos: "
-        "busca el producto, luego usa datos_para_publicar con su id."
+        "Conector del gestor de inventario de este negocio. Las herramientas "
+        "disponibles dependen del nivel de permiso de la clave: TODAS las "
+        "claves pueden leer el catálogo (productos físicos con precio de "
+        "venta al público, descripción, tamaño, stock y fotos). Las claves "
+        "nivel 2 pueden además leer el análisis del negocio: métricas y "
+        "hallazgos calculados sobre datos reales — úsalos cuando el dueño "
+        "pregunte cómo va el negocio, nunca inventes cifras. Las claves "
+        "nivel 3 pueden además crear productos nuevos, SIEMPRE con "
+        "proponer_producto primero y confirmar_producto después. Ninguna "
+        "clave ve costos unitarios por producto. Cuando el dueño pida "
+        "publicar un producto en Marketplace o redes sociales, obtén los "
+        "datos con estos tools en lugar de pedírselos: busca el producto, "
+        "luego usa datos_para_publicar con su id."
     ),
 )
 
 # Anotación MCP estándar: tools 100% de lectura (las guías de conectores de
 # Meta clasifican los tools en Read / Write / Sensitive write).
 SOLO_LECTURA = ToolAnnotations(readOnlyHint=True)
+
+# confirmar_producto modifica el inventario: la flag le indica al cliente
+# (Muse) que pida aprobación humana ANTES de cada llamada — la red anti-bucle
+# del nivel 3. proponer_producto NO es destructive: solo guarda un borrador.
+CONFIRMACION = ToolAnnotations(destructiveHint=True)
+
+
+def _requiere_nivel(minimo: int) -> dict | None:
+    """Verificación interna por tool (defensa en profundidad)."""
+    if nivel_de_request() < minimo:
+        etiqueta = "2 (lectura avanzada)" if minimo == 2 else "3 (escritura básica)"
+        return {
+            "error": (
+                "Tu clave no tiene permiso para esta herramienta. Pídele al "
+                f"dueño una clave de nivel {etiqueta} en Ajustes → Negocio → "
+                "Conectar mi IA."
+            )
+        }
+    return None
 
 
 @servidor.tool(annotations=SOLO_LECTURA)
@@ -163,6 +231,147 @@ def datos_para_publicar(producto_id: int) -> dict:
             )
         }
     return paquete
+
+
+# ── Nivel 2: análisis del negocio con datos reales ───────────────────────────
+# Los números salen del MISMO motor que el Análisis Inteligente del gestor
+# (database/analitica.py + analisis/reglas.py): el agente no calcula nada,
+# solo narra. Agregados sí, costos unitarios por producto nunca.
+
+@servidor.tool(annotations=SOLO_LECTURA)
+def resumen_negocio(periodo: str = "mes") -> dict:
+    """KPIs del negocio con datos REALES, calculados por el gestor: ingresos,
+    ganancia bruta, margen, gastos, utilidad neta, ticket promedio, mejor día
+    y mejor mes, proyección del mes y valor del inventario. NUNCA incluye
+    costos unitarios por producto. Periodo: 'mes' (contable actual, por
+    defecto), '30dias', '90dias' o 'todo'. Úsalo cuando el dueño pregunte
+    cómo va el negocio."""
+    nivel = _requiere_nivel(2)
+    if nivel:
+        return nivel
+    tenant = tenant_de_request()
+    try:
+        return mcp_analisis.resumen_negocio(tenant, periodo)
+    except ValueError as e:
+        return {"error": str(e)}
+    except Exception as e:
+        return {"error": f"No se pudo calcular el resumen: {e}"}
+
+
+@servidor.tool(annotations=SOLO_LECTURA)
+def hallazgos_inteligentes(tipo: str = "todos", periodo: str = "mes") -> dict:
+    """Puntos ciegos del negocio detectados por el motor de análisis del
+    gestor, con severidad (rojo/amarillo/verde), detalle y recomendación:
+    quiebres de stock de best sellers, dinero dormido en inventario,
+    tendencias a la baja, márgenes bajos, gastos pendientes de confirmar,
+    días de concentración de ventas, etc. Cada hallazgo es un cálculo sobre
+    datos reales, no una opinión. 'tipo' filtra: 'todos', 'dinero' (márgenes
+    y gastos), 'stock' (inventario) o 'ventas' (tendencias). Úsalo para dar
+    consejos concretos al dueño."""
+    nivel = _requiere_nivel(2)
+    if nivel:
+        return nivel
+    tenant = tenant_de_request()
+    try:
+        return mcp_analisis.hallazgos_inteligentes(tenant, periodo, tipo)
+    except ValueError as e:
+        return {"error": str(e)}
+    except Exception as e:
+        return {"error": f"No se pudo calcular los hallazgos: {e}"}
+
+
+# ── Nivel 3: escritura básica (borrador → confirmar) ─────────────────────────
+# Patrón de escritura segura: proponer valida y guarda un borrador con token
+# (NADA toca el inventario); confirmar crea el producto DESDE LO GUARDADO en
+# el borrador — el agente no puede alterar los datos entre mensajes — y
+# devuelve al agente un error si los datos son inválidos en vez de crear algo
+# a medias. El alta queda en el Historial con origen 'agente_ia'.
+
+@servidor.tool(annotations=SOLO_LECTURA)
+def proponer_producto(
+    nombre: str,
+    precio_venta: float,
+    costo: float = 0.0,
+    stock: float = 0.0,
+    descripcion: str = "",
+    categoria: list[str] | None = None,
+    variaciones: list[dict] | None = None,
+    imagen: str = "",
+    codigo_interno: str = "",
+    codigo_barras: str = "",
+    tamano_cm: float | None = None,
+    ubicacion: str = "",
+    sufijo_precio: str = "",
+    fraccionable: bool = False,
+) -> dict:
+    """PRIMER paso para crear un producto nuevo (requiere clave nivel 3):
+    valida los datos y guarda un borrador — NO crea nada todavía. Si algún
+    dato falta o es inválido, devuelve el error exacto para corregirlo.
+    Devuelve un borrador_id que DEBE confirmarse con confirmar_producto.
+    Reglas: solo productos físicos; si defines variaciones [{nombre, precio,
+    stock_inicial, costo}], el stock general debe ir en cada variación, no en
+    'stock'. El costo es interno y solo se usa para el lote: nunca lo cites
+    al público."""
+    nivel = _requiere_nivel(3)
+    if nivel:
+        return nivel
+    tenant = tenant_de_request()
+    try:
+        return mcp_escritura.proponer(tenant, clave_de_request(), {
+            "nombre": nombre,
+            "precio_venta": precio_venta,
+            "costo": costo,
+            "stock": stock,
+            "descripcion": descripcion,
+            "categoria": categoria,
+            "variaciones": variaciones,
+            "imagen": imagen,
+            "codigo_interno": codigo_interno,
+            "codigo_barras": codigo_barras,
+            "tamano_cm": tamano_cm,
+            "ubicacion": ubicacion,
+            "sufijo_precio": sufijo_precio,
+            "fraccionable": fraccionable,
+        })
+    except Exception as e:
+        return {"error": f"No se pudo proponer el producto: {e}"}
+
+
+@servidor.tool(annotations=CONFIRMACION)
+def confirmar_producto(borrador_id: str) -> dict:
+    """SEGUNDO y último paso para crear un producto (requiere clave nivel 3):
+    crea el producto en el inventario DESDE el borrador que el dueño ya
+    revisó. Usa SIEMPRE el borrador_id que devolvió proponer_producto — no
+    reenvíes los datos. El borrador se consume: cada uno solo puede
+    confirmarse una vez y expira a los 15 minutos. El alta queda registrada
+    en el Historial del gestor como creada por el agente IA."""
+    nivel = _requiere_nivel(3)
+    if nivel:
+        return nivel
+    tenant = tenant_de_request()
+    try:
+        datos = mcp_borradores.consumir_borrador(
+            tenant, clave_de_request(), (borrador_id or "").strip()
+        )
+    except Exception as e:
+        return {"error": f"No se pudo recuperar el borrador: {e}"}
+    if datos is None:
+        return {
+            "error": (
+                "El borrador no existe, ya se confirmó antes o expiró (15 min). "
+                "Vuelve a proponer el producto con proponer_producto."
+            )
+        }
+    # Cuota de escrituras: contada desde el día 1 (valor inicial generoso;
+    # bajarlo luego es cambiar LIMITE_ESCRITURAS_DIARIO en database/mcp_claves).
+    if not contar_escritura(clave_de_request()):
+        return {
+            "error": (
+                "Límite diario de escrituras alcanzado para esta clave. "
+                "El dueño puede ajustarlo o revocarla."
+            )
+        }
+    return mcp_escritura.confirmar(tenant, datos)
 
 
 # ── App ASGI: streamable HTTP + middleware de API key ────────────────────────
