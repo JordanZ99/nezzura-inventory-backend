@@ -27,7 +27,32 @@ from database.helpers import resolver_rango_q, ventana_ts_de_rango, hoy_negocio
 from database.imagenes import _get_tenant_plan
 
 # Periodos que aceptan los tools (nombres pensados para un agente IA).
+# Se normalizan con _normalizar_periodo: el agente puede escribir variantes
+# naturales ("30 días", "este mes", "histórico") y todas caen bien.
 PERIODOS = {"mes", "30dias", "90dias", "todo"}
+
+_ALIASES_PERIODO = {
+    "": "mes", "mes actual": "mes", "este mes": "mes", "1mes": "mes",
+    "30 dias": "30dias", "30 días": "30dias", "1 mes": "30dias",
+    "90 dias": "90dias", "90 días": "90dias", "3 meses": "90dias",
+    "historico": "todo", "histórico": "todo", "historial": "todo", "todo el negocio": "todo",
+}
+
+
+def _normalizar_periodo(periodo: str) -> str:
+    p = (periodo or "mes").strip().lower()
+    return _ALIASES_PERIODO.get(p, p)
+
+
+def _rango_periodo(tenant_id: str, periodo: str) -> tuple:
+    """(desde_d, hasta_d) según el periodo ya normalizado."""
+    if periodo == "todo":
+        return None, None
+    if periodo == "mes":
+        return resolver_rango_q(tenant_id, None, None)  # mes contable actual
+    dias = 30 if periodo == "30dias" else 90
+    return hoy_negocio(tenant_id) - timedelta(days=dias - 1), None
+
 
 # Filtros de hallazgos: cada categoría agrupa los tipos del motor de reglas.
 # Filtrar es gratis (Python); NUNCA significa otra query a la base.
@@ -38,23 +63,29 @@ _FILTROS_TIPO = {
     "ventas": {"tendencia_baja", "venta_nocturna", "mes_pico", "ticket_gap"},
 }
 
+_ALIASES_TIPO = {
+    "todo": "todos", "general": "todos",
+    "cobros": "dinero", "gastos": "dinero", "dinero": "dinero",
+    "inventario": "stock", "productos": "stock", "stock": "stock",
+    "ventas": "ventas",
+}
+
 _CACHE_TTL_SEG = 300  # 5 minutos
 _cache: dict[str, tuple[float, dict]] = {}
 _lock = threading.Lock()
-
-
-def _rango_dias(tenant_id: str, periodo: str):
-    desde_d = None
-    if periodo in ("30dias", "90dias"):
-        dias = 30 if periodo == "30dias" else 90
-        desde_d = hoy_negocio(tenant_id) - timedelta(days=dias - 1)
-    return desde_d, None, False
 
 
 def _analisis_completo(tenant_id: str, periodo: str) -> dict:
     """generar() + evaluar() con caché TTL. Lanza ValueError si el plan no es Plus."""
     if _get_tenant_plan(tenant_id) != "plus":
         raise ValueError("El Análisis Inteligente es exclusivo del plan Plus.")
+
+    periodo = _normalizar_periodo(periodo)
+    if periodo not in PERIODOS:
+        raise ValueError(
+            f"Periodo inválido: '{periodo}'. Usa 'mes' (mes contable actual), "
+            "'30dias', '90dias' o 'todo'."
+        )
 
     cache_key = f"{tenant_id}:{periodo}"
     ahora = time.monotonic()
@@ -63,12 +94,7 @@ def _analisis_completo(tenant_id: str, periodo: str) -> dict:
         if cached and ahora - cached[0] < _CACHE_TTL_SEG:
             return cached[1]
 
-    if periodo == "todo":
-        desde_d, hasta_d = None, None
-    elif periodo == "mes":
-        desde_d, hasta_d = resolver_rango_q(tenant_id, None, None)
-    else:
-        desde_d, hasta_d = _rango_dias(tenant_id, periodo)
+    desde_d, hasta_d = _rango_periodo(tenant_id, periodo)
     desde_ts, hasta_ts = ventana_ts_de_rango(tenant_id, desde_d, hasta_d)
 
     paquete = generar(tenant_id, desde_ts, hasta_ts, desde_d, hasta_d)
@@ -97,6 +123,7 @@ def resumen_negocio(tenant_id: str, periodo: str = "mes") -> dict:
 def hallazgos_inteligentes(tenant_id: str, periodo: str = "mes", tipo: str = "todos") -> dict:
     """Hallazgos del motor de reglas (puntos ciegos + recomendaciones)."""
     tipo = (tipo or "todos").strip().lower()
+    tipo = _ALIASES_TIPO.get(tipo, tipo)
     if tipo not in _FILTROS_TIPO:
         raise ValueError(
             f"Tipo inválido: '{tipo}'. Usa 'todos', 'dinero', 'stock' o 'ventas'."
