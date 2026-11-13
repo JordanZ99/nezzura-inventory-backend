@@ -19,11 +19,11 @@
 
 import threading
 import time
-from datetime import timedelta
+from datetime import date, timedelta
 
 from analisis.reglas import evaluar
 from database.analitica import generar
-from database.helpers import resolver_rango_q, ventana_ts_de_rango, hoy_negocio
+from database.helpers import ventana_ts_de_rango, hoy_negocio
 from database.imagenes import _get_tenant_plan
 
 # Periodos que aceptan los tools (nombres pensados para un agente IA).
@@ -45,13 +45,23 @@ def _normalizar_periodo(periodo: str) -> str:
 
 
 def _rango_periodo(tenant_id: str, periodo: str) -> tuple:
-    """(desde_d, hasta_d) según el periodo ya normalizado."""
+    """
+    (desde_d, hasta_d) según el periodo ya normalizado. 'hasta' EXCLUSIVA.
+    Se calcula directo con hoy_negocio (mismo camino que 30dias/90dias, que
+    funciona en producción) — resolver_rango_q queda fuera por si acaso.
+    """
+    hoy = hoy_negocio(tenant_id)
     if periodo == "todo":
         return None, None
     if periodo == "mes":
-        return resolver_rango_q(tenant_id, None, None)  # mes contable actual
+        inicio = hoy.replace(day=1)
+        if hoy.month == 12:
+            siguiente = date(hoy.year + 1, 1, 1)
+        else:
+            siguiente = date(hoy.year, hoy.month + 1, 1)
+        return inicio, siguiente
     dias = 30 if periodo == "30dias" else 90
-    return hoy_negocio(tenant_id) - timedelta(days=dias - 1), None
+    return hoy - timedelta(days=dias - 1), None
 
 
 # Filtros de hallazgos: cada categoría agrupa los tipos del motor de reglas.
@@ -100,6 +110,17 @@ def _analisis_completo(tenant_id: str, periodo: str) -> dict:
     paquete = generar(tenant_id, desde_ts, hasta_ts, desde_d, hasta_d)
     hechos = paquete.pop("hechos", {})
     paquete["hallazgos"] = evaluar(hechos)
+    # Ventana PEDIDA (distinta de rango_analizado, que muestra los días con
+    # ventas reales: si el mes no tiene ventas, rango_analizado se ve de 1 día
+    # aunque la ventana sea de 30). El agente lo usa para explicar al dueño.
+    paquete["rango_solicitado"] = {
+        "desde": desde_d.isoformat() if desde_d else None,
+        "hasta": (hasta_d - timedelta(days=1)).isoformat() if hasta_d else None,
+        "nota": (
+            "'desde'/'hasta' son la ventana pedida; 'rango_analizado' son los días "
+            "con ventas registradas dentro de esa ventana."
+        ),
+    }
 
     with _lock:
         # Un tenant puede pedir dos periodos en la misma ráfaga; el caché
@@ -114,6 +135,7 @@ def resumen_negocio(tenant_id: str, periodo: str = "mes") -> dict:
     """KPIs agregados del periodo. Sin costos unitarios ni lotes."""
     paquete = _analisis_completo(tenant_id, periodo)
     return {
+        "rango_solicitado": paquete.get("rango_solicitado"),
         "rango_analizado": paquete.get("rango_analizado"),
         "mensaje": paquete.get("mensaje") or "",
         "metricas": paquete.get("metricas") or {},
@@ -134,6 +156,7 @@ def hallazgos_inteligentes(tenant_id: str, periodo: str = "mes", tipo: str = "to
     if tipos_permitidos is not None:
         hallazgos = [h for h in hallazgos if h.get("tipo") in tipos_permitidos]
     return {
+        "rango_solicitado": paquete.get("rango_solicitado"),
         "rango_analizado": paquete.get("rango_analizado"),
         "mensaje": paquete.get("mensaje") or "",
         "tipo_filtro": tipo,

@@ -244,8 +244,10 @@ def resumen_negocio(periodo: str = "mes") -> dict:
     ganancia bruta, margen, gastos, utilidad neta, ticket promedio, mejor día
     y mejor mes, proyección del mes y valor del inventario. NUNCA incluye
     costos unitarios por producto. Periodo: 'mes' (contable actual, por
-    defecto), '30dias', '90dias' o 'todo'. Úsalo cuando el dueño pregunte
-    cómo va el negocio."""
+    defecto), '30dias', '90dias' o 'todo'. Ojo: 'rango_analizado' son los días
+    que TIENEN ventas dentro de la ventana; 'rango_solicitado' es la ventana
+    completa. Si la ventana no tiene ventas, las métricas van en 0 y eso es
+    la respuesta correcta — infórmale al dueño que no hay registros del periodo."""
     nivel = _requiere_nivel(2)
     if nivel:
         return nivel
@@ -255,7 +257,8 @@ def resumen_negocio(periodo: str = "mes") -> dict:
     except ValueError as e:
         return {"error": str(e)}
     except Exception as e:
-        return {"error": f"No se pudo calcular el resumen: {e}"}
+        print(f"[MCP] resumen_negocio fallo: {type(e).__name__}: {e}")
+        return {"error": f"{type(e).__name__}: {e}"}
 
 
 @servidor.tool(annotations=SOLO_LECTURA)
@@ -266,8 +269,8 @@ def hallazgos_inteligentes(tipo: str = "todos", periodo: str = "mes") -> dict:
     tendencias a la baja, márgenes bajos, gastos pendientes de confirmar,
     días de concentración de ventas, etc. Cada hallazgo es un cálculo sobre
     datos reales, no una opinión. 'tipo' filtra: 'todos', 'dinero' (márgenes
-    y gastos), 'stock' (inventario) o 'ventas' (tendencias). Úsalo para dar
-    consejos concretos al dueño."""
+    y gastos), 'stock' (inventario) o 'ventas' (tendencias). 'periodo' igual
+    que resumen_negocio. Úsalo para dar consejos concretos al dueño."""
     nivel = _requiere_nivel(2)
     if nivel:
         return nivel
@@ -277,7 +280,8 @@ def hallazgos_inteligentes(tipo: str = "todos", periodo: str = "mes") -> dict:
     except ValueError as e:
         return {"error": str(e)}
     except Exception as e:
-        return {"error": f"No se pudo calcular los hallazgos: {e}"}
+        print(f"[MCP] hallazgos_inteligentes fallo: {type(e).__name__}: {e}")
+        return {"error": f"{type(e).__name__}: {e}"}
 
 
 # ── Nivel 3: escritura básica (borrador → confirmar) ─────────────────────────

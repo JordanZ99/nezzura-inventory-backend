@@ -291,8 +291,11 @@ def generar(tenant_id: str, desde_ts, hasta_ts, desde_d: date | None, hasta_d: d
                 "ingresos": round(_f(mejor_dow["ingresos"]), 2) if mejor_dow else 0,
             },
             "mejor_mes": {
-                "mes": pico["mes"] or "",
-                "ingresos": round(_f(pico["ingresos"]), 2),
+                # Con una ventana sin ventas, la subquery de mes_pico no
+                # devuelve filas → row_to_json = NULL → el dict viene vacío.
+                # .get() en vez de indexar: mejor_mes vacío, no crash.
+                "mes": pico.get("mes") or "",
+                "ingresos": round(_f(pico.get("ingresos")), 2),
             },
             "proyeccion_mes_actual": round(proyeccion, 2),
             "valor_inventario_costo": round(valor_inventario, 2),
@@ -308,7 +311,7 @@ def generar(tenant_id: str, desde_ts, hasta_ts, desde_d: date | None, hasta_d: d
             "ticket_promedio": (ingresos / num) if num else 0,
             "ticket_mediano": _f(v["mediana"]),
             "valor_inventario_costo": valor_inventario,
-            "mejor_mes": {"mes": pico["mes"] or "", "ingresos": _f(pico["ingresos"])},
+            "mejor_mes": {"mes": pico.get("mes") or "", "ingresos": _f(pico.get("ingresos"))},
             "proyeccion_mes_actual": proyeccion,
             "productos_90": foto,
             "semanas_8": semanas_8,
