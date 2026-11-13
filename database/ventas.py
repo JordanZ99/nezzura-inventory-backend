@@ -541,7 +541,60 @@ def _revertir_consumo(cur, consumo: list[dict] | None, tenant_id: str, origen: s
         )
 
 
-def actualizar_venta(venta_id: int, fecha: str, cantidad: float, precio_real: float, costo_unitario: float, total_venta: float, ganancia_bruta: float, tenant_id: str) -> dict:
+def _registrar_edicion_venta(
+    tenant_id: str, venta_id: int, v: dict,
+    fecha_nueva: str, cantidad_nueva: float, precio_nuevo: float,
+    conn=None, origen: str = "",
+) -> None:
+    """
+    Historial (068): TODA edición de venta queda registrada — la haga el
+    dueño o el agente IA ('agente_ia' en origen la atribuye). Nunca lanza:
+    el historial se salta y la edición sigue (misma regla que
+    registrar_actividad).
+    """
+    try:
+        from database.actividad import registrar_actividad
+        from database.helpers import fecha_negocio_de
+
+        diff: dict = {}
+        try:
+            vieja_cant = float(v.get("cantidad"))
+            if vieja_cant != float(cantidad_nueva):
+                diff["cantidad"] = [vieja_cant, float(cantidad_nueva)]
+        except (TypeError, ValueError):
+            pass
+        try:
+            viejo_precio = round(float(v.get("precio_real") or 0), 2)
+            if viejo_precio != round(float(precio_nuevo), 2):
+                diff["precio_real"] = [viejo_precio, round(float(precio_nuevo), 2)]
+        except (TypeError, ValueError):
+            pass
+        try:
+            viejo_dia = fecha_negocio_de(v.get("fecha_ts") or v.get("fecha"), tenant_id)
+            nuevo_dia = fecha_negocio_de(fecha_nueva, tenant_id)
+            if viejo_dia != nuevo_dia:
+                diff["fecha"] = [str(v.get("fecha")), str(fecha_nueva)]
+        except Exception:
+            pass
+
+        if diff:
+            if origen:
+                resumen = f"El agente IA editó la venta #{venta_id} ({v.get('producto')})"
+                diff["origen"] = origen
+            else:
+                resumen = f"Editó la venta #{venta_id} ({v.get('producto')})"
+            registrar_actividad(
+                tenant_id, "venta", "venta", "editar",
+                resumen=resumen,
+                entidad_id=venta_id,
+                detalle=diff,
+                conn=conn,
+            )
+    except Exception:
+        pass
+
+
+def actualizar_venta(venta_id: int, fecha: str, cantidad: float, precio_real: float, costo_unitario: float, total_venta: float, ganancia_bruta: float, tenant_id: str, origen: str = "") -> dict:
     """Modifica una venta asegurando pertenencia del tenant y re-calculando stocks."""
     conn = get_conn()
     try:
@@ -633,6 +686,7 @@ def actualizar_venta(venta_id: int, fecha: str, cantidad: float, precio_real: fl
                 )
                 # La orden debe reflejar el renglón editado
                 _recalcular_orden(cur, v.get("orden_id"), tenant_id)
+                _registrar_edicion_venta(tenant_id, venta_id, v, fecha, cantidad, precio_real, conn=conn, origen=origen)
                 conn.commit()
                 return {"ok": True, "id": venta_id}
             elif dif > 0:
@@ -690,6 +744,7 @@ def actualizar_venta(venta_id: int, fecha: str, cantidad: float, precio_real: fl
 
             # 4. La orden debe reflejar el renglón editado
             _recalcular_orden(cur, v.get("orden_id"), tenant_id)
+            _registrar_edicion_venta(tenant_id, venta_id, v, fecha, cantidad, precio_real, conn=conn, origen=origen)
             conn.commit()
             return {"ok": True, "id": venta_id}
     except Exception as e:

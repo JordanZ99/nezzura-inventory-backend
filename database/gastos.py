@@ -179,10 +179,47 @@ def descartar_gasto(gasto_id: int, tenant_id: str) -> dict:
     return {"ok": True, "id": gasto_id, "estado": "descartado"}
 
 
-def actualizar_gasto(gasto_id: int, monto: float, categoria: str, descripcion: str, tenant_id: str) -> dict:
-    """Actualiza monto, categoría y descripción de un gasto existente."""
+def actualizar_gasto(gasto_id: int, monto: float, categoria: str, descripcion: str, tenant_id: str, origen: str = "") -> dict:
+    """Actualiza monto, categoría y descripción de un gasto existente.
+    El Historial (068) registra TODA edición — la haga el dueño o el agente
+    IA ('agente_ia' en origen la atribuye) — con el diff de lo que cambió."""
+    viejo = query(
+        "SELECT Monto, Categoria, Descripcion FROM gastos WHERE id = %s AND Tenant_ID = %s",
+        (gasto_id, tenant_id),
+    )
     execute(
         "UPDATE gastos SET Monto = %s, Categoria = %s, Descripcion = %s WHERE id = %s AND Tenant_ID = %s",
         (monto, categoria.strip(), descripcion.strip(), gasto_id, tenant_id)
     )
+
+    try:
+        from database.actividad import registrar_actividad
+
+        diff: dict = {}
+        if viejo:
+            v = viejo[0]
+            try:
+                if round(float(v.get("monto") or 0), 2) != round(float(monto), 2):
+                    diff["monto"] = [round(float(v.get("monto") or 0), 2), round(float(monto), 2)]
+            except (TypeError, ValueError):
+                pass
+            if (v.get("categoria") or "") != categoria.strip():
+                diff["categoria"] = [v.get("categoria"), categoria.strip()]
+            if (v.get("descripcion") or "") != descripcion.strip():
+                diff["descripcion"] = [v.get("descripcion"), descripcion.strip()]
+        if diff:
+            if origen:
+                resumen = f"El agente IA editó el gasto #{gasto_id} ({categoria.strip()})"
+                diff["origen"] = origen
+            else:
+                resumen = f"Editó el gasto #{gasto_id} ({categoria.strip()})"
+            registrar_actividad(
+                tenant_id, "gasto", "gasto", "editar",
+                resumen=resumen,
+                entidad_id=gasto_id,
+                detalle=diff,
+            )
+    except Exception:
+        pass
+
     return {"ok": True, "id": gasto_id, "monto": monto, "categoria": categoria.strip(), "descripcion": descripcion.strip()}

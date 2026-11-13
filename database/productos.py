@@ -520,7 +520,8 @@ def actualizar_producto(
     tamano_cm: float | None = None,
     tipo_producto: str | None = None,
     costo_servicio: float | None = None,
-    precio_servicio: float | None = None
+    precio_servicio: float | None = None,
+    origen: str = "",   # 'agente_ia' si la edición viene del conector MCP (nivel 3)
 ) -> dict:
     producto = producto.strip()
     descripcion = descripcion.strip()
@@ -668,10 +669,15 @@ def actualizar_producto(
 
         diff: dict = {}
         if a is not None:
+            # OJO: SELECT * devuelve los nombres del catálogo, que en la DB
+            # real son MINÚSCULA (producto, descripcion, imagen — sin comillas
+            # al crearlas). Acceder con capital inicial rompía el diff en
+            # silencio (KeyError atrapado) y las ediciones NUNCA llegaban al
+            # Historial. Todas las claves van en minúscula.
             for key, actual_v, nuevo_v in [
-                ("descripcion", a["Descripcion"], descripcion),
-                ("imagen", a["Imagen"], imagen),
-                ("estado", a["Estado"], estado),
+                ("descripcion", a["descripcion"], descripcion),
+                ("imagen", a["imagen"], imagen),
+                ("estado", a["estado"], estado),
                 ("codigo_interno", a["codigo_interno"], codigo_interno),
                 ("codigo_barras", a["codigo_barras"], codigo_barras),
                 ("ubicacion", a["ubicacion"], ubicacion),
@@ -687,22 +693,29 @@ def actualizar_producto(
                 if par:
                     diff[key] = par
             if costo is not None and lote_ref:
-                par = _par(lote_ref[0]["Costo"], float(costo))
+                par = _par(lote_ref[0]["costo"], float(costo))
                 if par:
                     diff["costo_lote"] = par
             if precio_venta is not None and lote_ref:
-                par = _par(lote_ref[0]["Precio_Venta"], float(precio_venta))
+                par = _par(lote_ref[0]["precio_venta"], float(precio_venta))
                 if par:
                     diff["precio_venta"] = par
-        if a is not None and nombre_final != str(a["Producto"]):
-            diff["nombre"] = [a["Producto"], nombre_final]
+        if a is not None and nombre_final != str(a["producto"]):
+            diff["nombre"] = [a["producto"], nombre_final]
         if categoria:
             diff["categorias"] = list(categoria)
 
         if diff:
+            # 'agente_ia' = la edición la hizo el conector MCP (nivel 3):
+            # el Historial lo atribuye igual que las altas del agente.
+            if origen:
+                resumen = f"El agente IA editó el producto {producto}"
+                diff["origen"] = origen
+            else:
+                resumen = f"Editó el producto {producto}"
             registrar_actividad(
                 tenant_id, "producto", "producto", "editar",
-                resumen=f"Editó el producto {producto}",
+                resumen=resumen,
                 entidad_id=(prod[0]["id"] if prod else None),
                 detalle=diff,
             )

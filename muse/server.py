@@ -55,20 +55,26 @@ from database import mcp_analisis
 from database import mcp_borradores
 from database import mcp_catalogo as cat
 from database import mcp_escritura
+from database import mcp_ventas
 from database.mcp_claves import contar_escritura
 from muse.auth import (
     AutenticacionAPIKey,
     clave_de_request,
     nivel_de_request,
     tenant_de_request,
+    ver_costos_de_request,
 )
 
-# Nivel mínimo por tool (los 6 de catálogo son nivel 1: los ve cualquier clave).
+# Nivel mínimo por tool (los 6 de catálogo + listar_productos son nivel 1).
 _NIVEL_MINIMO = {
+    "ventas_recientes": 2,
+    "top_vendidos": 2,
     "resumen_negocio": 2,
     "hallazgos_inteligentes": 2,
     "proponer_producto": 3,
     "confirmar_producto": 3,
+    "proponer_edicion": 3,
+    "confirmar_edicion": 3,
 }
 
 
@@ -89,13 +95,21 @@ servidor = ServidorMuse(
         "Conector del gestor de inventario de este negocio. Las herramientas "
         "disponibles dependen del nivel de permiso de la clave: TODAS las "
         "claves pueden leer el catálogo (productos físicos con precio de "
-        "venta al público, descripción, tamaño, stock y fotos). Las claves "
-        "nivel 2 pueden además leer el análisis del negocio: métricas y "
-        "hallazgos calculados sobre datos reales — úsalos cuando el dueño "
-        "pregunte cómo va el negocio, nunca inventes cifras. Las claves "
-        "nivel 3 pueden además crear productos nuevos, SIEMPRE con "
-        "proponer_producto primero y confirmar_producto después. Ninguna "
-        "clave ve costos unitarios por producto. Cuando el dueño pida "
+        "venta al público, descripción, tamaño, stock y fotos) y listar el "
+        "inventario completo con filtros (listar_productos: por categoría, "
+        "stock bajo, agotados, sin foto/descripción/tamaño, paginado). Las "
+        "claves nivel 2 pueden además leer el análisis del negocio: métricas "
+        "y hallazgos calculados sobre datos reales, ventas recientes una por "
+        "una y top vendidos — úsalos cuando el dueño pregunte cómo va el "
+        "negocio, nunca inventes cifras; requieren plan Plus. Las claves "
+        "nivel 3 pueden además crear productos nuevos y EDITAR productos, "
+        "ventas y gastos, SIEMPRE con proponer_* primero y confirmar_* "
+        "después (borrador que el dueño revisa; cada cambio queda en el "
+        "Historial del gestor como hecho por el agente IA). Algunas claves "
+        "tienen el permiso 'ver costos': si una respuesta incluye campos de "
+        "costo o margen, son datos internos del dueño — NUNCA los menciones "
+        "en publicaciones, frente a compradores ni en el catálogo público; "
+        "datos_para_publicar nunca los incluye. Cuando el dueño pida "
         "publicar un producto en Marketplace o redes sociales, obtén los "
         "datos con estos tools en lugar de pedírselos: busca el producto, "
         "luego usa datos_para_publicar con su id."
@@ -133,25 +147,73 @@ def buscar_productos(consulta: str, solo_con_stock: bool = False, limite: int = 
     divide la consulta en palabras y busca cada una en el nombre, la
     descripción, la categoría y los códigos ("Sanrio" trae todo lo de esa
     categoría). Devuelve id, nombre, precio de venta al público, stock
-    disponible y categoría. NUNCA incluye costos internos. Úsalo para
-    encontrar el id de un producto antes de obtener sus detalles o fotos."""
+    disponible y categoría. Si la clave tiene el permiso 'ver costos',
+    incluye costo_unitario y margen (datos internos: nunca los muestres a
+    compradores). Úsalo para encontrar el id de un producto antes de obtener
+    sus detalles o fotos."""
     tenant = tenant_de_request()
     try:
-        productos = cat.buscar_productos(tenant, consulta, solo_con_stock, limite)
+        productos = cat.buscar_productos(
+            tenant, consulta, solo_con_stock, limite, con_costos=ver_costos_de_request()
+        )
         return {"productos": productos, "total": len(productos)}
     except Exception as e:
         return {"error": f"No se pudo buscar: {e}"}
 
 
 @servidor.tool(annotations=SOLO_LECTURA)
+def listar_productos(
+    categoria: str = "",
+    estado_stock: str = "",
+    umbral_stock_bajo: int = 3,
+    sin_datos: str = "",
+    orden: str = "",
+    pagina: int = 1,
+    limite: int = 20,
+) -> dict:
+    """Lista el inventario completo paginado (máximo 50 por página), con
+    filtros combinables — cubre lo que la búsqueda por términos no puede:
+    - categoria: todo lo de una categoría ("Sanrio", "Pokémon"...).
+    - estado_stock: 'stock_bajo' (para saber qué reponer), 'sin_stock' (lo
+      que NO conviene publicar) o 'disponible'.
+    - sin_datos: 'sin_foto', 'sin_descripcion', 'sin_tamanio' o
+      'incompletos' (cualquiera de las tres) — para limpiar el catálogo y
+      mejorar las publicaciones.
+    - orden: 'nombre' (default), 'stock_asc' (lo que falta primero) o
+      'recientes'.
+    Cada producto trae tiene_foto / sin_descripcion / sin_tamano para que
+    puedas reportar al dueño qué le falta a cada publicación. Itera con
+    'pagina' para recorrer todo. Nunca incluye costos (salvo permiso
+    'ver costos' de la clave)."""
+    tenant = tenant_de_request()
+    try:
+        return cat.listar_productos(
+            tenant,
+            categoria=categoria or None,
+            estado_stock=estado_stock or None,
+            umbral_stock_bajo=umbral_stock_bajo,
+            sin_datos=sin_datos or None,
+            orden=orden or None,
+            pagina=pagina,
+            limite=limite,
+            con_costos=ver_costos_de_request(),
+        )
+    except Exception as e:
+        return {"error": f"No se pudo listar el inventario: {e}"}
+
+
+@servidor.tool(annotations=SOLO_LECTURA)
 def obtener_producto(producto_id: int) -> dict:
     """Devuelve la ficha completa de un producto para publicarlo: nombre,
     descripción, precio de venta al público, stock disponible, tamaño en cm,
-    categoría y variaciones (cada una con su precio y stock). No incluye
-    costos ni datos internos del negocio."""
+    categoría y variaciones (cada una con su precio y stock). Si la clave
+    tiene el permiso 'ver costos', incluye costo_unitario y margen (datos
+    internos: nunca los muestres a compradores ni en publicaciones)."""
     tenant = tenant_de_request()
     try:
-        ficha = cat.obtener_producto(tenant, producto_id)
+        ficha = cat.obtener_producto(
+            tenant, producto_id, con_costos=ver_costos_de_request()
+        )
     except Exception as e:
         return {"error": f"No se pudo obtener el producto: {e}"}
     if ficha is None:
@@ -236,7 +298,57 @@ def datos_para_publicar(producto_id: int) -> dict:
 # ── Nivel 2: análisis del negocio con datos reales ───────────────────────────
 # Los números salen del MISMO motor que el Análisis Inteligente del gestor
 # (database/analitica.py + analisis/reglas.py): el agente no calcula nada,
-# solo narra. Agregados sí, costos unitarios por producto nunca.
+# solo narra. Agregados sí; costos por producto/venta solo con el permiso
+# 'ver costos' de la clave (068).
+
+@servidor.tool(annotations=SOLO_LECTURA)
+def ventas_recientes(periodo: str = "30dias", pagina: int = 1, limite: int = 20) -> dict:
+    """Lista las VENTAS del negocio una por una, la más nueva primero, en la
+    ventana pedida ('mes', '30dias' —default—, '90dias' o 'todo'). Cada venta
+    trae fecha, producto, cantidad, precio unitario y total. Paginado
+    (máximo 50 por página): itera con 'pagina' para recorrer el periodo.
+    Úsalo para responder 'qué se vendió ayer', 'qué se llevó el último
+    cliente' o revisar ventas registradas. Requiere clave nivel 2 y plan
+    Plus. Si la clave tiene permiso 'ver costos', incluye costo_unitario y
+    ganancia por venta (datos internos)."""
+    nivel = _requiere_nivel(2)
+    if nivel:
+        return nivel
+    tenant = tenant_de_request()
+    try:
+        return mcp_ventas.ventas_recientes(
+            tenant, periodo, pagina, limite, con_costos=ver_costos_de_request()
+        )
+    except ValueError as e:
+        return {"error": str(e)}
+    except Exception as e:
+        print(f"[MCP] ventas_recientes fallo: {type(e).__name__}: {e}")
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+@servidor.tool(annotations=SOLO_LECTURA)
+def top_vendidos(periodo: str = "30dias", limite: int = 10) -> dict:
+    """Ranking de los productos MÁS VENDIDOS del periodo ('mes', '30dias' —
+    default—, '90dias' o 'todo'), ordenado por ingresos, con unidades
+    vendidas y el stock ACTUAL de cada uno ('agotado' y 'por_agotarse'
+    marcados). Úsalo para decirle al dueño qué repetir, qué reponer antes
+    de volver a publicar y por qué un mes fue mejor que otro. Requiere
+    clave nivel 2 y plan Plus. Si la clave tiene permiso 'ver costos',
+    incluye costo_unitario y margen del ranking (datos internos)."""
+    nivel = _requiere_nivel(2)
+    if nivel:
+        return nivel
+    tenant = tenant_de_request()
+    try:
+        return mcp_ventas.top_vendidos(
+            tenant, periodo, limite, con_costos=ver_costos_de_request()
+        )
+    except ValueError as e:
+        return {"error": str(e)}
+    except Exception as e:
+        print(f"[MCP] top_vendidos fallo: {type(e).__name__}: {e}")
+        return {"error": f"{type(e).__name__}: {e}"}
+
 
 @servidor.tool(annotations=SOLO_LECTURA)
 def resumen_negocio(periodo: str = "mes") -> dict:
@@ -376,6 +488,76 @@ def confirmar_producto(borrador_id: str) -> dict:
             )
         }
     return mcp_escritura.confirmar(tenant, datos)
+
+
+# ── Nivel 3: EDICIONES (mismo patrón borrador → confirmar) ───────────────────
+# proponer_edicion lee los valores VIEJOS de la base y guarda el diff
+# antes→después en el borrador; confirmar_edicion aplica SOLO lo guardado y
+# cada edición queda en el Historial como hecha por el agente IA (068).
+
+@servidor.tool(annotations=SOLO_LECTURA)
+def proponer_edicion(
+    tipo: str, entidad_id: int, cambios: dict
+) -> dict:
+    """PRIMER paso para EDITAR algo del inventario (requiere clave nivel 3):
+    valida los cambios y guarda un borrador con el diff antes→después — NO
+    edita nada todavía. tipos y campos:
+    - tipo 'producto' (entidad_id = id del producto): descripcion, nombre,
+      precio_venta, estado ('Activo'/'Inactivo'), visible_en_catalogo,
+      tamano_cm, codigo_interno, codigo_barras, ubicacion, categoria (lista
+      de hasta 5). El campo 'costo' solo si la clave tiene permiso 'ver
+      costos'. NO se puede editar la imagen.
+    - tipo 'venta' (id de la venta): fecha ('2026-11-12 15:30'), cantidad
+      (>0) y precio_real. Los totales y el stock se recalculan solos.
+    - tipo 'gasto' (id del gasto): monto, categoria, descripcion.
+    Devuelve el diff legible y un borrador_id que DEBE confirmarse con
+    confirmar_edicion. Si un campo no aplica, devuelve el error exacto."""
+    nivel = _requiere_nivel(3)
+    if nivel:
+        return nivel
+    tenant = tenant_de_request()
+    try:
+        return mcp_escritura.proponer_edicion(
+            tenant, clave_de_request(), tipo, entidad_id, cambios or {},
+            con_costos=ver_costos_de_request(),
+        )
+    except Exception as e:
+        return {"error": f"No se pudo proponer la edición: {e}"}
+
+
+@servidor.tool(annotations=CONFIRMACION)
+def confirmar_edicion(borrador_id: str) -> dict:
+    """SEGUNDO y último paso para EDITAR (requiere clave nivel 3): aplica los
+    cambios que el dueño ya revisó. Usa SIEMPRE el borrador_id que devolvió
+    proponer_edicion — no reenvíes los cambios. El borrador se consume (una
+    sola vez, expira a los 15 minutos). La edición queda registrada en el
+    Historial del gestor como hecha por el agente IA ('El agente IA editó
+    el producto/la venta/el gasto...')."""
+    nivel = _requiere_nivel(3)
+    if nivel:
+        return nivel
+    tenant = tenant_de_request()
+    try:
+        datos = mcp_borradores.consumir_borrador(
+            tenant, clave_de_request(), (borrador_id or "").strip()
+        )
+    except Exception as e:
+        return {"error": f"No se pudo recuperar el borrador: {e}"}
+    if datos is None:
+        return {
+            "error": (
+                "El borrador no existe, ya se confirmó antes o expiró (15 min). "
+                "Vuelve a proponer los cambios con proponer_edicion."
+            )
+        }
+    if not contar_escritura(clave_de_request()):
+        return {
+            "error": (
+                "Límite diario de escrituras alcanzado para esta clave. "
+                "El dueño puede ajustarla en Ajustes → Negocio → Conectar mi IA."
+            )
+        }
+    return mcp_escritura.confirmar_edicion(tenant, datos)
 
 
 # ── App ASGI: streamable HTTP + middleware de API key ────────────────────────

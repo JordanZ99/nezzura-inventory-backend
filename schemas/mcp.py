@@ -45,3 +45,10 @@ class EditarClaveMcp(BaseModel):
         le=1000000,
         description="Override de escrituras por día. Omitir = no cambiar. 0 = volver al default del nivel.",
     )
+    ver_costos: Optional[bool] = Field(
+        default=None,
+        description=(
+            "Permiso de ESTA clave para que el agente lea costos internos y "
+            "márgenes (migrations/068). Independiente del nivel. Omitir = no cambiar."
+        ),
+    )

@@ -70,8 +70,14 @@ def editar_clave(clave_id: int, data: EditarClaveMcp, tenant_id: str = Depends(g
                 detail="Límites inválidos: deben ser enteros positivos (o null para el default)",
             )
         cambios.append("limites")
+    if data.ver_costos is not None:
+        if not mcp_claves.cambiar_ver_costos(clave_id, tenant_id, data.ver_costos):
+            raise HTTPException(status_code=404, detail="Clave no encontrada")
+        cambios.append("ver_costos")
     if not cambios:
-        raise HTTPException(status_code=422, detail="Nada que editar: envía nivel y/o límites")
+        raise HTTPException(
+            status_code=422, detail="Nada que editar: envía nivel, límites y/o ver_costos"
+        )
     return {"ok": True, "cambiado": cambios}
 
 

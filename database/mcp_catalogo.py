@@ -43,6 +43,15 @@ _FILTRO_ALCANCE = (
     "p.Estado = 'Activo' AND p.tenant_id = %s AND p.tipo_producto = 'stock'"
 )
 
+# Costo promedio ponderado de los lotes ACTIVOS con stock (espejo del
+# inventario del gestor). SOLO se agrega al SELECT cuando la clave tiene el
+# permiso ver_costos (migrations/068): apagado, el costo ni siquiera viaja.
+_COSTO_PROMEDIO = (
+    "CASE WHEN COALESCE(SUM(CASE WHEN l.Stock_Lote > 0 THEN l.Stock_Lote END), 0) > 0 "
+    "THEN SUM(CASE WHEN l.Stock_Lote > 0 THEN l.Costo * l.Stock_Lote END) "
+    "/ SUM(CASE WHEN l.Stock_Lote > 0 THEN l.Stock_Lote END) ELSE 0 END"
+)
+
 # Categorías del producto (todas, no solo las visibles en catálogo).
 _CATEGORIAS = _obtener_categorias_subquery("p", visible_only=False)
 
@@ -135,19 +144,26 @@ def _condicion_busqueda(consulta: str) -> tuple[str, list[str], str, list[str]]:
 # ── Tool: buscar_productos ────────────────────────────────────────────────────
 
 def buscar_productos(
-    tenant_id: str, consulta: str, solo_con_stock: bool = False, limite: int = 15
+    tenant_id: str, consulta: str, solo_con_stock: bool = False, limite: int = 15,
+    con_costos: bool = False,
 ) -> list[dict]:
     """
     Búsqueda tolerante: por palabras (no frase completa), en nombre,
     descripción, códigos y categoría, ignorando acentos, mayúsculas y
     espacios. Ordenada por relevancia.
+
+    con_costos (migrations/068): SOLO claves con el permiso ver_costos ven
+    el costo promedio ponderado y el margen. Default False: el costo no se
+    selecciona en la query.
     """
     filtro_tokens, params_tokens, orden, params_orden = _condicion_busqueda(consulta)
     filtro_stock = "HAVING COALESCE(SUM(l.Stock_Lote), 0) > 0" if solo_con_stock else ""
+    campo_costo = f"{_COSTO_PROMEDIO} AS costo_unitario," if con_costos else ""
     filas = query(
         f"""
         SELECT p.id, p.producto AS nombre, p.sufijo_precio,
                {_PRECIO_VENTA} AS precio_venta,
+               {campo_costo}
                COALESCE(SUM(l.Stock_Lote), 0) AS stock_disponible,
                {_CATEGORIAS}
         FROM productos p
@@ -161,8 +177,9 @@ def buscar_productos(
         """,
         tuple([tenant_id] + params_tokens + params_orden + [limite]),
     )
-    return [
-        {
+    resultado = []
+    for f in filas:
+        item = {
             "id": f["id"],
             "nombre": f["nombre"],
             "precio_venta": _num(f["precio_venta"]),
@@ -170,19 +187,30 @@ def buscar_productos(
             "stock_disponible": _stock(f["stock_disponible"]),
             "categoria": f.get("categoria") or ["General"],
         }
-        for f in filas
-    ]
+        if con_costos:
+            costo = _num(f.get("costo_unitario"))
+            item["costo_unitario"] = costo
+            item["margen"] = round(item["precio_venta"] - costo, 2)
+        resultado.append(item)
+    return resultado
 
 
 # ── Tool: obtener_producto ────────────────────────────────────────────────────
 
-def obtener_producto(tenant_id: str, producto_id: int) -> dict | None:
-    """Ficha completa para publicar. None si no existe / no es del tenant."""
+def obtener_producto(
+    tenant_id: str, producto_id: int, con_costos: bool = False
+) -> dict | None:
+    """Ficha completa para publicar. None si no existe / no es del tenant.
+    con_costos: solo claves con permiso ver_costos (068). datos_para_publicar
+    llama a esta función SIN el flag: el paquete de publicación es público
+    y jamás lleva costos."""
+    campo_costo = f"{_COSTO_PROMEDIO} AS costo_unitario," if con_costos else ""
     filas = query(
         f"""
         SELECT p.id, p.producto AS nombre, p.descripcion AS descripcion,
                p.sufijo_precio, p.tamano_cm,
                {_PRECIO_VENTA} AS precio_venta,
+               {campo_costo}
                COALESCE(SUM(l.Stock_Lote), 0) AS stock_disponible,
                {_CATEGORIAS}
         FROM productos p
@@ -214,7 +242,7 @@ def obtener_producto(tenant_id: str, producto_id: int) -> dict | None:
     )
 
     tamano = fila.get("tamano_cm")
-    return {
+    ficha = {
         "id": fila["id"],
         "nombre": fila["nombre"],
         "descripcion": fila.get("descripcion") or "",
@@ -233,6 +261,11 @@ def obtener_producto(tenant_id: str, producto_id: int) -> dict | None:
             for v in variaciones
         ],
     }
+    if con_costos:
+        costo = _num(fila.get("costo_unitario"))
+        ficha["costo_unitario"] = costo
+        ficha["margen"] = round(ficha["precio_venta"] - costo, 2)
+    return ficha
 
 
 # ── Tool: obtener_fotos_producto ──────────────────────────────────────────────
@@ -356,3 +389,142 @@ def datos_para_publicar(tenant_id: str, producto_id: int) -> dict | None:
     }
     ficha["fotos"] = fotos
     return ficha
+
+
+# ── Tool: listar_productos (nivel 1) ─────────────────────────────────────────
+
+TOPE_PAGINA = 50  # protege la ventana de contexto del agente, no la base
+
+
+def listar_productos(
+    tenant_id: str,
+    categoria: str | None = None,
+    estado_stock: str | None = None,
+    umbral_stock_bajo: int = 3,
+    sin_datos: str | None = None,
+    orden: str | None = None,
+    pagina: int = 1,
+    limite: int = 20,
+    con_costos: bool = False,
+) -> dict:
+    """
+    Listado paginado del catálogo físico activo con filtros. Cubre lo que la
+    búsqueda por términos no puede: "todo el stock bajo", "lo de Sanrio",
+    "productos sin foto o sin descripción".
+
+    estado_stock: 'disponible' (>0) · 'stock_bajo' (0 < stock <= umbral) ·
+                  'sin_stock' (<= 0). 'disponible' incluye a los bajos.
+    sin_datos:    'sin_foto' · 'sin_descripcion' · 'sin_tamanio' ·
+                  'incompletos' (cualquiera de las tres).
+    orden:        'nombre' (default) · 'stock_asc' (lo que falta primero) ·
+                  'recientes' (altas nuevas primero).
+    """
+    limite = max(1, min(int(limite or 20), TOPE_PAGINA))
+    pagina = max(1, int(pagina or 1))
+    try:
+        umbral = max(1, int(umbral_stock_bajo))
+    except (TypeError, ValueError):
+        umbral = 3
+
+    filtros: list[str] = []
+    params: list = [tenant_id]
+    havings: list[str] = []
+
+    categoria = (categoria or "").strip()
+    if categoria:
+        patron = f"%{_normalizar(categoria)}%"
+        filtros.append(
+            "EXISTS (SELECT 1 FROM producto_categorias pcx"
+            "         JOIN categorias cx ON cx.id = pcx.categoria_id"
+            "         WHERE pcx.producto_id = p.id"
+            f"          AND {_norm('cx.nombre')} LIKE %s)"
+        )
+        params.append(patron)
+
+    estado = (estado_stock or "").strip().lower()
+    if estado in ("disponible", "stock_bajo", "sin_stock"):
+        # Agregados → van en HAVING, no en WHERE.
+        stock = "COALESCE(SUM(l.Stock_Lote), 0)"
+        if estado == "sin_stock":
+            havings.append(f"{stock} <= 0")
+        elif estado == "disponible":
+            havings.append(f"{stock} > 0")
+        else:  # stock_bajo
+            havings.append(f"{stock} > 0 AND {stock} <= {int(umbral)}")
+
+    calidad = (sin_datos or "").strip().lower()
+    if calidad:
+        sin_foto = "(p.imagen IS NULL OR p.imagen = 'No hay foto')"
+        sin_desc = "COALESCE(p.descripcion, '') = ''"
+        sin_tam = "p.tamano_cm IS NULL"
+        if calidad == "sin_foto":
+            filtros.append(sin_foto)
+        elif calidad == "sin_descripcion":
+            filtros.append(sin_desc)
+        elif calidad == "sin_tamanio":
+            filtros.append(sin_tam)
+        elif calidad in ("incompletos", "incompleto"):
+            filtros.append(f"({sin_foto} OR {sin_desc} OR {sin_tam})")
+
+    orden_sql = "p.producto ASC"
+    if estado in ("stock_bajo", "sin_stock") and not orden:
+        orden_sql = "COALESCE(SUM(l.Stock_Lote), 0) ASC, p.producto ASC"
+    elif orden == "stock_asc":
+        orden_sql = "COALESCE(SUM(l.Stock_Lote), 0) ASC, p.producto ASC"
+    elif orden == "recientes":
+        orden_sql = "p.id DESC"
+
+    campo_costo = f"{_COSTO_PROMEDIO} AS costo_unitario," if con_costos else ""
+    where = f"WHERE {_FILTRO_ALCANCE}" + (" AND " + " AND ".join(filtros) if filtros else "")
+    having = f" HAVING {' AND '.join(havings)}" if havings else ""
+    base = f"FROM productos p {_JOIN_LOTES} {where} GROUP BY p.id{having}"
+
+    total = query(
+        f"SELECT COUNT(*) AS c FROM (SELECT p.id {base}) sub",
+        tuple(params),
+    )[0]["c"]
+
+    filas = query(
+        f"""
+        SELECT p.id, p.producto AS nombre, p.sufijo_precio, p.descripcion,
+               p.imagen, p.tamano_cm,
+               {_PRECIO_VENTA} AS precio_venta,
+               {campo_costo}
+               COALESCE(SUM(l.Stock_Lote), 0) AS stock_disponible,
+               {_CATEGORIAS}
+        {base}
+        ORDER BY {orden_sql}
+        LIMIT %s OFFSET %s
+        """,
+        tuple(params + [limite, (pagina - 1) * limite]),
+    )
+
+    def _tiene_foto(imagen) -> bool:
+        return bool(imagen) and imagen != "No hay foto"
+
+    productos = []
+    for f in filas:
+        item = {
+            "id": f["id"],
+            "nombre": f["nombre"],
+            "precio_venta": _num(f["precio_venta"]),
+            "sufijo_precio": f.get("sufijo_precio") or "",
+            "stock_disponible": _stock(f["stock_disponible"]),
+            "categoria": f.get("categoria") or ["General"],
+            "tiene_foto": _tiene_foto(f.get("imagen")),
+            "sin_descripcion": not (f.get("descripcion") or "").strip(),
+            "sin_tamano": f.get("tamano_cm") is None,
+        }
+        if con_costos:
+            costo = _num(f.get("costo_unitario"))
+            item["costo_unitario"] = costo
+            item["margen"] = round(item["precio_venta"] - costo, 2)
+        productos.append(item)
+
+    return {
+        "total": int(total),
+        "pagina": pagina,
+        "paginas": max(1, -(-int(total) // limite)),
+        "limite": limite,
+        "productos": productos,
+    }

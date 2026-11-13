@@ -30,11 +30,13 @@ MAX_CLAVES_POR_TENANT = 5
 #   3 Escritura básica  → + crear productos (borrador → confirmar).
 NIVELES_VALIDOS = (1, 2, 3)
 
-# Rate limit diario POR CLAVE, según su nivel. Los tools de análisis corren
-# queries más pesadas que el catálogo, así que una clave nivel 2 gasta más
-# por llamada y su cuota es menor.
-LIMITE_LLAMADAS_DIARIO = 300
-_LIMITE_POR_NIVEL = {1: 300, 2: 100, 3: 50}
+# Rate limit diario POR CLAVE, según su nivel. La escalera: más permisos,
+# menos margen. El nivel 1 es generoso a propósito (1000): el catálogo es
+# barato de leer y el caso de uso principal (auditar el catálogo, iterar
+# listados paginados de a 50) no debe topar. El dueño puede apretar cada
+# clave con el override por clave (migrations/067).
+LIMITE_LLAMADAS_DIARIO = 1000
+_LIMITE_POR_NIVEL = {1: 1000, 2: 300, 3: 100}
 
 # Escrituras por día (solo nivel 3, contadas desde el día 1). Valor inicial
 # generoso para probar el agente sin topar; bajarlo después es cambiar ESTA
@@ -99,7 +101,7 @@ def listar_claves(tenant_id: str) -> list[dict]:
     return query(
         """SELECT id, nombre, key_prefix, nivel, creada_en, ultimo_uso_en,
                   llamadas_hoy, dia_uso, escrituras_hoy, dia_escrituras,
-                  limite_llamadas_diarias, limite_escrituras_diarias
+                  limite_llamadas_diarias, limite_escrituras_diarias, ver_costos
            FROM mcp_api_keys
            WHERE tenant_id = %s
            ORDER BY creada_en DESC""",
@@ -185,26 +187,45 @@ def actualizar_limites(clave_id: int, tenant_id: str,
     return True
 
 
+def cambiar_ver_costos(clave_id: int, tenant_id: str, ver_costos: bool) -> bool:
+    """
+    Permite o prohíbe que el agente de esta clave vea costos internos
+    (costo promedio de los lotes y margen en fichas/listados/análisis).
+    Independiente del nivel: el nivel controla QUÉ ACCIONES puede hacer el
+    agente; este switch controla QUÉ DATOS sensibles puede leer.
+    La red de seguridad no cambia con esto: datos_para_publicar JAMÁS
+    devuelve costos (es el canal público, Marketplace).
+    """
+    filas = query(
+        "SELECT id FROM mcp_api_keys WHERE id = %s AND tenant_id = %s",
+        (clave_id, tenant_id),
+    )
+    if not filas:
+        return False
+    execute("UPDATE mcp_api_keys SET ver_costos = %s WHERE id = %s", (bool(ver_costos), clave_id))
+    return True
+
+
 def validar_clave(clave: str, contar_uso: bool = True):
     """
     Valida una clave para el middleware del servidor MCP.
-    Devuelve (tenant_id, nivel, clave_id, None) si es válida, o
-    (None, None, None, status_http) si no:
+    Devuelve (tenant_id, nivel, clave_id, None, ver_costos) si es válida, o
+    (None, None, None, status_http, False) si no:
       401 = no existe o está revocada · 429 = límite diario agotado.
 
     contar_uso: solo los POST (llamadas reales) gastan cuota; GET (SSE) y
     DELETE (cerrar sesión) se validan sin contar.
     """
     if not clave:
-        return None, None, None, 401
+        return None, None, None, 401, False
 
     filas = query(
         "SELECT id, tenant_id, nivel, revocada_en, llamadas_hoy, dia_uso, "
-        "limite_llamadas_diarias FROM mcp_api_keys WHERE key_hash = %s",
+        "limite_llamadas_diarias, ver_costos FROM mcp_api_keys WHERE key_hash = %s",
         (_hashear(clave),),
     )
     if not filas or filas[0]["revocada_en"]:
-        return None, None, None, 401
+        return None, None, None, 401, False
 
     fila = filas[0]
     nivel = int(fila["nivel"] or 1)
@@ -213,7 +234,7 @@ def validar_clave(clave: str, contar_uso: bool = True):
     # Override por clave (NULL = default del nivel, migrations/067)
     limite = fila["limite_llamadas_diarias"] or _LIMITE_POR_NIVEL.get(nivel, LIMITE_LLAMADAS_DIARIO)
     if contar_uso and usadas >= limite:
-        return None, None, None, 429
+        return None, None, None, 429, False
 
     if contar_uso:
         execute(
@@ -221,7 +242,8 @@ def validar_clave(clave: str, contar_uso: bool = True):
             "ultimo_uso_en = now() WHERE id = %s",
             (usadas + 1, hoy, fila["id"]),
         )
-    return str(fila["tenant_id"]), nivel, int(fila["id"]), None
+    # 5ª posición: el agente de esta clave puede ver costos internos (068).
+    return str(fila["tenant_id"]), nivel, int(fila["id"]), None, bool(fila["ver_costos"])
 
 
 def contar_escritura(clave_id: int) -> bool:

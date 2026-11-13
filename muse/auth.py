@@ -24,6 +24,7 @@ from database.mcp_claves import validar_clave
 tenant_actual: ContextVar[str] = ContextVar("muse_tenant", default="")
 nivel_actual: ContextVar[int] = ContextVar("muse_nivel", default=0)
 clave_actual: ContextVar[int] = ContextVar("muse_clave", default=0)
+ver_costos_actual: ContextVar[bool] = ContextVar("muse_ver_costos", default=False)
 
 
 def tenant_de_request() -> str:
@@ -39,6 +40,13 @@ def nivel_de_request() -> int:
 def clave_de_request() -> int:
     """Id de la clave usada (para borradores y auditoría). 0 = sin clave."""
     return clave_actual.get()
+
+
+def ver_costos_de_request() -> bool:
+    """True si la clave tiene el permiso de ver costos internos (068).
+    False = el costo ni siquiera se selecciona en las queries (defensa a
+    nivel SQL, no un filtro de presentación)."""
+    return ver_costos_actual.get()
 
 
 class AutenticacionAPIKey:
@@ -61,7 +69,7 @@ class AutenticacionAPIKey:
         # Solo los POST (llamadas reales) gastan cuota del rate limit;
         # GET (stream SSE) y DELETE (cerrar sesión) se validan sin contar.
         contar = scope.get("method") == "POST"
-        tenant_id, nivel, clave_id, error = await run_in_threadpool(
+        tenant_id, nivel, clave_id, error, ver_costos = await run_in_threadpool(
             validar_clave, clave_api, contar
         )
 
@@ -80,4 +88,5 @@ class AutenticacionAPIKey:
         tenant_actual.set(tenant_id)
         nivel_actual.set(int(nivel or 1))
         clave_actual.set(int(clave_id or 0))
+        ver_costos_actual.set(bool(ver_costos))
         await self.app(scope, receive, send)
