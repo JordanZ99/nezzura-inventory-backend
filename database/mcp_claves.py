@@ -94,28 +94,94 @@ def crear_clave(tenant_id: str, nombre: str | None, nivel: int = 1) -> dict:
 
 
 def listar_claves(tenant_id: str) -> list[dict]:
-    """Claves del tenant SIN el hash (la UI muestra solo el prefijo)."""
+    """Claves del tenant SIN el hash (la UI muestra solo el prefijo).
+    Solo activas: eliminar es ahora un hard delete, ya no hay revocadas."""
     return query(
         """SELECT id, nombre, key_prefix, nivel, creada_en, ultimo_uso_en,
                   llamadas_hoy, dia_uso, escrituras_hoy, dia_escrituras,
-                  revocada_en
+                  limite_llamadas_diarias, limite_escrituras_diarias
            FROM mcp_api_keys
            WHERE tenant_id = %s
-           ORDER BY revocada_en IS NOT NULL, creada_en DESC""",
+           ORDER BY creada_en DESC""",
         (tenant_id,),
     )
 
 
 def revocar_clave(clave_id: int, tenant_id: str) -> bool:
-    """Soft-delete: la clave deja de validar en el próximo request."""
+    """Elimina la clave DEFINITIVAMENTE (hard delete).
+    - La clave deja de validar al instante: la validación busca el hash y la
+      fila ya no existe → 401.
+    - Libera el slot de las MAX_CLAVES_POR_TENANT.
+    - El Historial (registro_actividad) NO se toca: las altas que hizo el
+      agente siguen ahí con su atribución.
+    - Borradores huérfanos de la clave: no confirmables (pertenecen a una
+      clave muerta) y expiran solos en minutos."""
     filas = query(
-        "SELECT id FROM mcp_api_keys "
-        "WHERE id = %s AND tenant_id = %s AND revocada_en IS NULL",
+        "SELECT id FROM mcp_api_keys WHERE id = %s AND tenant_id = %s",
         (clave_id, tenant_id),
     )
     if not filas:
         return False
-    execute("UPDATE mcp_api_keys SET revocada_en = now() WHERE id = %s", (clave_id,))
+    execute("DELETE FROM mcp_api_keys WHERE id = %s AND tenant_id = %s", (clave_id, tenant_id))
+    return True
+
+
+def cambiar_nivel(clave_id: int, tenant_id: str, nivel: int) -> bool:
+    """
+    Cambia el nivel de permisos de una clave ACTIVA sin tocar su hash: el
+    agente no se reconecta y tools/list se ajusta en el próximo request.
+    """
+    try:
+        nivel = int(nivel)
+    except (TypeError, ValueError):
+        return False
+    if nivel not in NIVELES_VALIDOS:
+        return False
+    filas = query(
+        "SELECT id FROM mcp_api_keys WHERE id = %s AND tenant_id = %s",
+        (clave_id, tenant_id),
+    )
+    if not filas:
+        return False
+    execute("UPDATE mcp_api_keys SET nivel = %s WHERE id = %s", (nivel, clave_id))
+    return True
+
+
+def actualizar_limites(clave_id: int, tenant_id: str,
+                       limite_llamadas: int | None = None,
+                       limite_escrituras: int | None = None) -> bool:
+    """
+    Override de límites por clave. 0 = vuelve al default del nivel (limpia la
+    columna); >0 = fija el override. Los cambios no son retroactivos: los
+    contadores diarios ya gastados siguen contando.
+    """
+    def _limpiar(valor):
+        if valor is None:
+            return None
+        try:
+            n = int(valor)
+        except (TypeError, ValueError):
+            return False
+        if n == 0:
+            return None  # 0 = volver al default del nivel
+        return n if n > 0 else False
+
+    llamadas = _limpiar(limite_llamadas)
+    escrituras = _limpiar(limite_escrituras)
+    if llamadas is False or escrituras is False:
+        return False
+
+    filas = query(
+        "SELECT id FROM mcp_api_keys WHERE id = %s AND tenant_id = %s",
+        (clave_id, tenant_id),
+    )
+    if not filas:
+        return False
+    execute(
+        "UPDATE mcp_api_keys SET limite_llamadas_diarias = %s, "
+        "limite_escrituras_diarias = %s WHERE id = %s",
+        (llamadas, escrituras, clave_id),
+    )
     return True
 
 
@@ -133,8 +199,8 @@ def validar_clave(clave: str, contar_uso: bool = True):
         return None, None, None, 401
 
     filas = query(
-        "SELECT id, tenant_id, nivel, revocada_en, llamadas_hoy, dia_uso "
-        "FROM mcp_api_keys WHERE key_hash = %s",
+        "SELECT id, tenant_id, nivel, revocada_en, llamadas_hoy, dia_uso, "
+        "limite_llamadas_diarias FROM mcp_api_keys WHERE key_hash = %s",
         (_hashear(clave),),
     )
     if not filas or filas[0]["revocada_en"]:
@@ -144,7 +210,8 @@ def validar_clave(clave: str, contar_uso: bool = True):
     nivel = int(fila["nivel"] or 1)
     hoy = date.today()
     usadas = fila["llamadas_hoy"] if fila["dia_uso"] == hoy else 0
-    limite = _LIMITE_POR_NIVEL.get(nivel, LIMITE_LLAMADAS_DIARIO)
+    # Override por clave (NULL = default del nivel, migrations/067)
+    limite = fila["limite_llamadas_diarias"] or _LIMITE_POR_NIVEL.get(nivel, LIMITE_LLAMADAS_DIARIO)
     if contar_uso and usadas >= limite:
         return None, None, None, 429
 
@@ -164,7 +231,8 @@ def contar_escritura(clave_id: int) -> bool:
     aunque luego falle la creación: el costo de intentarlo ya se pagó.
     """
     filas = query(
-        "SELECT escrituras_hoy, dia_escrituras FROM mcp_api_keys WHERE id = %s",
+        "SELECT escrituras_hoy, dia_escrituras, limite_escrituras_diarias "
+        "FROM mcp_api_keys WHERE id = %s",
         (clave_id,),
     )
     if not filas:
@@ -172,7 +240,9 @@ def contar_escritura(clave_id: int) -> bool:
     fila = filas[0]
     hoy = date.today()
     usadas = fila["escrituras_hoy"] if fila["dia_escrituras"] == hoy else 0
-    if usadas >= LIMITE_ESCRITURAS_DIARIO:
+    # Override por clave (NULL = default global, migrations/067)
+    limite = fila["limite_escrituras_diarias"] or LIMITE_ESCRITURAS_DIARIO
+    if usadas >= limite:
         return False
     execute(
         "UPDATE mcp_api_keys SET escrituras_hoy = %s, dia_escrituras = %s "

@@ -23,3 +23,25 @@ class CrearClaveMcp(BaseModel):
             "(+ crear productos con borrador y confirmación)."
         ),
     )
+
+
+class EditarClaveMcp(BaseModel):
+    """Edición de una clave ACTIVA (sin tocar su hash: el agente no se reconecta)."""
+    nivel: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=3,
+        description="Nuevo nivel de permiso. Omitir = no cambiar.",
+    )
+    limite_llamadas: Optional[int] = Field(
+        default=None,
+        ge=0,
+        le=1000000,
+        description="Override de llamadas por día. Omitir = no cambiar. 0 = volver al default del nivel.",
+    )
+    limite_escrituras: Optional[int] = Field(
+        default=None,
+        ge=0,
+        le=1000000,
+        description="Override de escrituras por día. Omitir = no cambiar. 0 = volver al default del nivel.",
+    )
