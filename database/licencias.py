@@ -227,6 +227,56 @@ def revalidar_licencia(token: str) -> dict:
     }
 
 
+class ErrorLicencia(Exception):
+    """Guard de licencia para endpoints del Modo Local: trae el status HTTP
+    y el código listos para mapear a HTTPException en el router."""
+
+    def __init__(self, status: int, mensaje: str, codigo: str = "LICENCIA_INVALIDA"):
+        self.status = status
+        self.mensaje = mensaje
+        self.codigo = codigo
+        super().__init__(mensaje)
+
+
+def tenant_de_licencia(token: str) -> str:
+    """Valida un JWT de LICENCIA (HS256 del dispositivo) y devuelve tenant_id.
+
+    Es el guard de los endpoints que el Modo Local llama con su licencia
+    (publish de catálogo): mismos checks que `revalidar_licencia` (firma +
+    plan + dispositivo activo) pero SIN renovar el token. Lanza
+    ErrorLicencia con el status HTTP listo.
+    """
+    try:
+        payload = verificar_licencia(token)
+    except ValueError as e:
+        raise ErrorLicencia(401, str(e))
+
+    tenant_id = payload.get("tenant_id")
+    device_id = payload.get("sub")
+    if not tenant_id or not device_id:
+        raise ErrorLicencia(401, "Licencia incompleta.")
+
+    plan_actual = _plan_tenant(tenant_id)
+    if plan_actual not in PLANES_CON_LOCAL:
+        raise ErrorLicencia(403, "Tu plan ya no incluye el Modo Local.", "PLAN_SIN_LOCAL")
+
+    filas = query(
+        "SELECT activo FROM dispositivos_licencia WHERE tenant_id = %s AND device_id = %s",
+        (tenant_id, device_id),
+    )
+    if not filas or not filas[0].get("activo"):
+        raise ErrorLicencia(
+            403, "Este dispositivo fue revocado desde la configuración.", "DISPOSITIVO_REVOCADO"
+        )
+
+    execute(
+        "UPDATE dispositivos_licencia SET ultimo_uso = now() "
+        "WHERE tenant_id = %s AND device_id = %s",
+        (tenant_id, device_id),
+    )
+    return tenant_id
+
+
 def listar_dispositivos(tenant_id: str) -> dict:
     """Lista del dueño: qué aparatos tienen licencia (para revocar uno)."""
     filas = _activos_tenant(tenant_id)

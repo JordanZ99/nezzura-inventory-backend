@@ -13,7 +13,7 @@ from fastapi.responses import JSONResponse
 from psycopg2.errors import UndefinedTable
 
 from database.conexion import inicializar_db
-from routers import inventario, ventas, gastos, gastos_programados, catalogo_gestion, publico, exportacion, terminales, turnos, stats, mesas, clientes, analitica, licencias, cobros, actividad, mcp_conexion
+from routers import inventario, ventas, gastos, gastos_programados, catalogo_gestion, publico, exportacion, terminales, turnos, stats, mesas, clientes, analitica, licencias, cobros, actividad, mcp_conexion, catalogo_publicado
 from muse.server import app_mcp, servidor
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
@@ -114,6 +114,7 @@ app.include_router(cobros.router)
 app.include_router(actividad.router)
 app.include_router(analitica.router)
 app.include_router(licencias.router)
+app.include_router(catalogo_publicado.router)
 app.include_router(mcp_conexion.router)
 
 @app.get("/")

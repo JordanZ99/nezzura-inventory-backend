@@ -331,6 +331,17 @@ def obtener_catalogo_publico(slug: str) -> dict:
     # tenant_id se usa INTERNAMENTE — nunca se devuelve al cliente
     tenant_id = cfg["tenant_id"]
 
+    # 2-bis. Snapshot del MODO LOCAL (migración 069): si el tenant publicó su
+    # catálogo desde el dispositivo, los productos viven en catalogo_publicado
+    # y se sirven de ahí (dibujando desde datos, NO un HTML estático). Los
+    # tenants de nube nunca tienen filas aquí y siguen el path vivo de abajo.
+    # Import diferido: catalogo_publicado importa _asegurar_config de este
+    # módulo — un import top-level aquí crearía un ciclo.
+    from database.catalogo_publicado import obtener_snapshot_publico
+    snapshot = obtener_snapshot_publico(tenant_id)
+    if snapshot:
+        return _catalogo_desde_snapshot(cfg, snapshot)
+
     # 2. Productos activos: solo campos públicos.
     #    Se incluye stock_total para que el cliente sepa si hay disponibilidad,
     #    pero NO se incluye costo, ganancia_bruta, codigo_interno ni tenant_id.
@@ -518,5 +529,83 @@ def obtener_catalogo_publico(slug: str) -> dict:
         },
         "productos": productos,
         "orden_categorias": mapa_orden,
+        "contacto": contacto,
+    }
+
+
+def _catalogo_desde_snapshot(cfg: dict, snapshot: list) -> dict:
+    """
+    Arma la respuesta pública desde el snapshot del Modo Local (mismas formas
+    que el path vivo de arriba). La fila '__config__' trae SOLO los overrides
+    del tenant local (titulo, logo ya en Cloudinary, subtitulo, contacto,
+    orden_categorias…); el resto sale de catalogo_config (valores default) —
+    los productos llegan ya en el orden guardado (columna `orden`).
+    """
+    fila_config = next((f for f in snapshot if f["clave"] == "__config__"), None)
+    extra = (fila_config or {}).get("data") or {}
+
+    productos = []
+    for fila in snapshot:
+        if fila["clave"] == "__config__":
+            continue
+        p = dict(fila["data"])
+        p.setdefault("variaciones", [])
+        p.setdefault("precios", [])
+        p.setdefault("imagenes", [])
+        productos.append(p)
+
+    # Config: defaults del path vivo + overrides publicados por el tenant.
+    config = {
+        "tema": cfg["tema"],
+        "template": cfg["template"],
+        "titulo": cfg["titulo"],
+        "subtitulo": cfg.get("subtitulo", ""),
+        "fuente": cfg.get("fuente") or "serif",
+        "mostrar_precios": cfg["mostrar_precios"],
+        "mostrar_stock": cfg["mostrar_stock"] is not False,
+        "mostrar_categorias": cfg["mostrar_categorias"],
+        "agrupar_por_categoria": cfg.get("agrupar_por_categoria"),
+        "columnas_movil": cfg.get("columnas_movil") or 2,
+        "permitir_descarga": bool(cfg.get("permitir_descarga")),
+        "ocultar_agotados": bool(cfg.get("ocultar_agotados")),
+        "banner_url": cfg.get("banner_url") or "",
+        "banner_url_movil": cfg.get("banner_url_movil") or "",
+        "hero_estilo": cfg.get("hero_estilo") or "gradiente",
+        "banner_texto_color": cfg.get("banner_texto_color") or "#ffffff",
+        "banner_mostrar_texto": cfg.get("banner_mostrar_texto") is not False,
+        "banner_mostrar_logo": cfg.get("banner_mostrar_logo") is not False,
+        "banner_mostrar_redes": cfg.get("banner_mostrar_redes") is not False,
+        "anuncio_texto": cfg.get("anuncio_texto") or "",
+        "relacion_imagen": cfg.get("relacion_imagen") or "1:1",
+        "logo": cfg.get("logo") or "",
+        "fondo_url": cfg.get("fondo_url") or "",
+        "fondo_modo": cfg.get("fondo_modo") if cfg.get("fondo_modo") in ("cover", "repeat") else "cover",
+        "fondo_opacidad": int(cfg["fondo_opacidad"]) if cfg.get("fondo_opacidad") is not None else 100,
+        "fondo_color": cfg.get("fondo_color") or "",
+        "hero_url": cfg.get("hero_url") or "",
+        "hero_url_movil": cfg.get("hero_url_movil") or "",
+        "hero_color": cfg.get("hero_color") or "",
+        "hero_opacidad": int(cfg["hero_opacidad"]) if cfg.get("hero_opacidad") is not None else 40,
+        "hero_layout": cfg.get("hero_layout") or {},
+    }
+    for k, v in extra.items():
+        if k not in ("contacto", "orden_categorias", "publicado_en", "slug"):
+            config[k] = v
+
+    contacto_cfg = {
+        "telefono": (cfg.get("telefono") or "").strip(),
+        "correo": (cfg.get("correo") or "").strip(),
+        "instagram": (cfg.get("instagram") or "").strip(),
+        "facebook": (cfg.get("facebook") or "").strip(),
+        "tiktok": (cfg.get("tiktok") or "").strip(),
+        "sitio_web": (cfg.get("sitio_web") or "").strip(),
+        "maps": (cfg.get("maps") or "").strip(),
+    }
+    contacto = {**contacto_cfg, **(extra.get("contacto") or {})}
+
+    return {
+        "config": config,
+        "productos": productos,
+        "orden_categorias": extra.get("orden_categorias") or {},
         "contacto": contacto,
     }
