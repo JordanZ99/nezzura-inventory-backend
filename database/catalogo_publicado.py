@@ -123,12 +123,25 @@ def subir_foto_catalogo(tenant_id: str, contents: bytes, nombre: str = "") -> di
         )
 
     from database.imagenes import _es_imagen_valida
+    from database.almacenamiento import reservar, liberar_reserva, confirmar
 
     if not _es_imagen_valida(contents):
         raise ErrorLicencia(
             400,
             "El archivo no es una imagen válida (solo JPG, PNG, GIF, WebP, BMP, AVIF o HEIC).",
             "FOTO_INVALIDA",
+        )
+
+    # Cuota de almacenamiento (migración 071): el Modo Local es un MODO dentro
+    # de básico/plus, y las fotos que publica pesan igual en el plan. Sin
+    # crédito de reemplazo: el cliente reutiliza la URL cuando el hash no
+    # cambió, así que cada subida aquí es peso nuevo.
+    reserva = reservar(tenant_id, len(contents))
+    if not reserva.get("ok"):
+        raise ErrorLicencia(
+            reserva.get("status", 422),
+            reserva.get("mensaje", "Tu espacio está lleno. Libera espacio o mejora a Plus."),
+            "CUOTA_LLENA",
         )
 
     # public_id legible a partir del nombre (producto/variación), saneado.
@@ -144,6 +157,15 @@ def subir_foto_catalogo(tenant_id: str, contents: bytes, nombre: str = "") -> di
             fetch_format="auto",
         )
     except Exception as e:
+        liberar_reserva(tenant_id, len(contents))
         raise ErrorLicencia(500, f"Error subiendo a Cloudinary: {str(e)}", "FOTO_CLOUDINARY")
+
+    confirmar(
+        tenant_id,
+        resultado.get("secure_url"),
+        len(contents),
+        resultado.get("bytes"),
+        "Catálogo publicado (Modo Local)",
+    )
 
     return {"ok": True, "ruta": resultado.get("secure_url")}

@@ -218,12 +218,19 @@ def restockear(data: Restock, tenant_id: str = Depends(get_tenant_id)):
 
 @router.post("/foto/{producto}")
 async def subir_foto(producto: str, foto: UploadFile = File(...), tenant_id: str = Depends(get_tenant_id)):
-    """Sube la foto de un producto a Cloudinary y devuelve la URL segura."""
+    """Sube la foto de un producto a Cloudinary y devuelve la URL segura.
+
+    Con cuota de almacenamiento (migración 071): si el tenant cruzó el límite
+    de su plan devuelve 422 con el mensaje para el usuario. `aviso` (cuando
+    viene) indica que la subida cruzó el 80/95% del espacio del plan."""
     contents = await foto.read()
     resultado = subir_foto_negocio(producto, contents, tenant_id)
     if not resultado.get("ok"):
         raise HTTPException(status_code=resultado["status"], detail=resultado["mensaje"])
-    return {"ruta": resultado["ruta"]}
+    respuesta = {"ruta": resultado["ruta"]}
+    if resultado.get("aviso"):
+        respuesta["aviso"] = resultado["aviso"]
+    return respuesta
 
 
 @router.post("/borrar_imagen")

@@ -15,6 +15,7 @@ from urllib.parse import unquote
 from psycopg2.extras import RealDictCursor
 
 from database.conexion import query, execute, get_conn, release_conn
+from database.almacenamiento import reservar, confirmar, liberar_url, liberar_reserva
 
 
 class _ErrorGaleria(Exception):
@@ -150,8 +151,124 @@ def borrar_imagen_cloudinary(url: str | None) -> None:
         # extraídos o fotos ya borradas (refs duplicadas). Nunca bloquea el flujo.
         if estado and estado != "ok":
             print(f"Cloudinary: destroy devolvió '{estado}' para {public_id} (url: {url})")
+        # Liberar cuota (migración 071): PUNTO ÚNICO de destrucción de assets.
+        # 'ok' = borrada; 'not_found' = ya no existe (deja de costar). Con
+        # cualquier otro estado el asset persiste y el medidor lo conserva:
+        # la reconciliación nocturna detecta esos huérfanos. El ledger conoce
+        # al dueño de la URL, por eso liberar_url va sin tenant_id. Best-effort:
+        # imágenes legadas sin seguimiento no-restan (liberar_url es no-op).
+        if estado in ("ok", "not_found"):
+            liberar_url(url)
     except Exception as e:
         print(f"Error borrando imagen de Cloudinary ({public_id}): {e}")
+
+
+def _url_en_galeria(url: str, tenant_id: str) -> bool:
+    """
+    True si la URL vive también en la galería (producto_imagenes) del tenant.
+    Usado por el crédito de reemplazo: si la foto principal vieja sigue en la
+    galería, el reemplazo la CONSERVA (swap) y el uso real crece con la nueva
+    — no hay crédito.
+    """
+    if not url or "res.cloudinary.com" not in url:
+        return False
+    try:
+        filas = query(
+            "SELECT 1 FROM producto_imagenes WHERE url = %s AND tenant_id = %s LIMIT 1",
+            (url, tenant_id),
+        )
+        return bool(filas)
+    except Exception as e:
+        print(f"Error comprobando URL en galería: {e}")
+        return True  # ante la duda, NO dar crédito
+
+
+def _url_reemplazo_para_subida(producto: str, tenant_id: str) -> str | None:
+    """
+    Crédito de reemplazo (migración 071) para subidas por POST /inventario/foto:
+    solo aplica cuando la foto vieja se destruirá GARANTIZADAMENTE tras la
+    subida (el peso neto no crece):
+      - '_logo_*'    → el logo viejo (tenants.logo); el frontend lo borra vía
+                       /borrar_imagen justo después de subir el nuevo.
+      - '_banner_*'  → el banner/hero viejo correspondiente (catalogo_config).
+      - foto principal de producto → SOLO si la foto actual NO vive también en
+        la galería (si vive ahí, el reemplazo la conserva — swap — y el uso
+        real crecería con la nueva: sin crédito).
+    Devuelve None cuando la subida es nueva (no hay crédito).
+    Best-effort: ante cualquier error devuelve None (se cobra subida nueva).
+    """
+    try:
+        if producto.startswith("_logo_"):
+            filas = query("SELECT logo FROM tenants WHERE id = %s", (tenant_id,))
+            vieja = ((filas[0].get("logo") or "") if filas else "").strip()
+        elif producto.startswith("_banner"):
+            # El orden importa: prefijos más específicos primero
+            filas = query(
+                "SELECT banner_url, banner_url_movil, hero_url, hero_url_movil "
+                "FROM catalogo_config WHERE tenant_id = %s",
+                (tenant_id,),
+            )
+            if not filas:
+                return None
+            cfg = filas[0]
+            if producto.startswith("_banner_hero_movil"):
+                vieja = (cfg.get("hero_url_movil") or "").strip()
+            elif producto.startswith("_banner_hero"):
+                vieja = (cfg.get("hero_url") or "").strip()
+            elif producto.startswith("_banner_movil"):
+                vieja = (cfg.get("banner_url_movil") or "").strip()
+            else:
+                vieja = (cfg.get("banner_url") or "").strip()
+        else:
+            vieja = (leer_imagen_actual_producto(producto, tenant_id) or "").strip()
+            if vieja and vieja != "No hay foto" and _url_en_galeria(vieja, tenant_id):
+                return None  # la foto vive en la galería: el reemplazo la conserva
+        if vieja and vieja != "No hay foto" and "res.cloudinary.com" in vieja:
+            return vieja
+        return None
+    except Exception as e:
+        print(f"Error determinando crédito de reemplazo para '{producto}': {e}")
+        return None
+
+
+def _subir_con_cupo(tenant_id: str, contents: bytes, *, carpeta: str,
+                    public_id: str, url_a_reemplazar: str | None = None,
+                    detalle: str | None = None) -> dict:
+    """
+    ÚNICO punto de subida con cuota (migración 071). Envuelve a
+    cloudinary.uploader.upload con el guardián de almacenamiento:
+
+      1. reservar()  — bloquea con 422 si no cabe (el dict de error de dominio
+         ya trae el mensaje para el usuario; los routers lo mapean igual que
+         cualquier error).
+      2. upload al proveedor.
+      3. Si el proveedor falla: liberar_reserva() compensa el contador.
+      4. confirmar() — registra la subida en el ledger (bytes reales incluidos,
+         Cloudinary los devuelve en su respuesta).
+
+    En éxito devuelve {"ok": True, "url": ..., "resultado": ..., "aviso": ...}.
+    En fallo {"ok": False, "status": ..., "mensaje": ...}. Nunca lanza.
+    """
+    reserva = reservar(tenant_id, len(contents), url_a_reemplazar)
+    if not reserva.get("ok"):
+        return reserva
+    try:
+        resultado = cloudinary.uploader.upload(
+            contents,
+            folder=carpeta,
+            public_id=public_id,
+            quality="auto:best",
+            fetch_format="auto"
+        )
+    except Exception as e:
+        liberar_reserva(tenant_id, len(contents))
+        return {"ok": False, "status": 500, "mensaje": f"Error subiendo a Cloudinary: {str(e)}"}
+    url = resultado.get("secure_url")
+    confirmar(tenant_id, url, len(contents), resultado.get("bytes"), detalle)
+    respuesta = {"ok": True, "url": url, "resultado": resultado}
+    if reserva.get("aviso"):
+        respuesta["aviso"] = reserva["aviso"]
+    return respuesta
 
 
 def _url_sigue_referenciada(url: str, tenant_id: str) -> bool:
@@ -365,23 +482,25 @@ def subir_foto(producto: str, contents: bytes, tenant_id: str) -> dict:
         if producto.startswith("_logo_") or producto.startswith("_banner"):
             carpeta = "branding"
 
-        # Subimos a Cloudinary con optimización automática de calidad.
-        # folder="productos" agrupa todas las fotos en una carpeta en Cloudinary.
-        # public_id usa el nombre del producto + un hex aleatorio para unicidad.
-        # quality="auto:best" permite que Cloudinary optimice el peso del
-        # archivo automáticamente sin pérdida de calidad visible.
-        # fetch_format="auto" convierte automáticamente al formato más
-        # eficiente (WebP en navegadores modernos, JPEG en el resto).
-        resultado = cloudinary.uploader.upload(
-            contents,
-            folder=carpeta,
+        # Subida con cuota (migración 071): bloquea con 422 si el tenant cruzó
+        # su límite; otorga crédito de reemplazo cuando la foto vieja se
+        # destruirá garantizadamente (logo/banner, o foto principal que NO
+        # vive en la galería). Ver _url_reemplazo_para_subida().
+        subida = _subir_con_cupo(
+            tenant_id, contents,
+            carpeta=carpeta,
             public_id=f"{producto}_{uuid.uuid4().hex[:8]}",
-            quality="auto:best",
-            fetch_format="auto"
+            url_a_reemplazar=_url_reemplazo_para_subida(producto, tenant_id),
+            detalle=f"Foto: {producto}",
         )
+        if not subida.get("ok"):
+            return subida
         # Cloudinary devuelve una URL HTTPS persistente que se guarda en la DB.
         # Esta URL sobrevive a deploys de Render porque vive en el CDN de Cloudinary.
-        return {"ok": True, "ruta": resultado.get("secure_url")}
+        respuesta = {"ok": True, "ruta": subida["url"]}
+        if subida.get("aviso"):
+            respuesta["aviso"] = subida["aviso"]
+        return respuesta
 
     except Exception as e:
         return {"ok": False, "status": 500, "mensaje": f"Error subiendo a Cloudinary: {str(e)}"}
@@ -415,24 +534,33 @@ def subir_foto_variacion(variacion_id: int, contents: bytes, tenant_id: str) -> 
             "mensaje": f"La imagen es demasiado grande ({tamano_kb:.0f} KB). Máximo 1024 KB."
         }
 
-    resultado = cloudinary.uploader.upload(
-        contents,
-        folder="variaciones",
+    # Reemplazo garantizado (migración 071): la foto vieja se destruye aquí
+    # mismo tras subir la nueva, así que su peso cuenta como disponible —
+    # un tenant al límite puede cambiar la foto de una variación (por otra
+    # igual o más ligera), pero no puede crecer con el reemplazo.
+    old = (fila[0].get("foto") or "").strip()
+    subida = _subir_con_cupo(
+        tenant_id, contents,
+        carpeta="variaciones",
         public_id=f"var_{variacion_id}_{uuid.uuid4().hex[:8]}",
-        quality="auto:best",
-        fetch_format="auto"
+        url_a_reemplazar=old if old and "res.cloudinary.com" in old else None,
+        detalle=f"Foto variación {variacion_id}",
     )
-    url = resultado.get("secure_url")
+    if not subida.get("ok"):
+        return subida
+    url = subida["url"]
     execute(
         "UPDATE producto_variaciones SET foto=%s WHERE id=%s AND tenant_id=%s",
         (url, variacion_id, tenant_id)
     )
 
-    old = fila[0].get("foto") or ""
     if old and old != url:
-        borrar_imagen_cloudinary(old)
+        borrar_imagen_cloudinary(old)  # libera cuota vía ledger si el destroy sale bien
 
-    return {"ok": True, "url": url}
+    respuesta = {"ok": True, "url": url}
+    if subida.get("aviso"):
+        respuesta["aviso"] = subida["aviso"]
+    return respuesta
 
 
 def borrar_imagen_url(url: str, tenant_id: str) -> dict:
@@ -628,14 +756,23 @@ def subir_imagen_extra(producto: str, contents: bytes, orden_target, tenant_id: 
         reemplazo_id = None
         reemplazo_url_anterior = None
 
-    # 5. Subir a Cloudinary en la carpeta "productos/galeria"
-    resultado = cloudinary.uploader.upload(
-        contents,
-        folder="productos/galeria",
+    # 5. Subir a Cloudinary en la carpeta "productos/galeria" con cuota
+    #    (migración 071). Reemplazo de slot: la imagen que ocupa el orden se
+    #    destruye en el paso 7, así que su peso cuenta como disponible.
+    subida = _subir_con_cupo(
+        tenant_id, contents,
+        carpeta="productos/galeria",
         public_id=f"{producto}_{uuid.uuid4().hex[:8]}_img{nueva_orden}",
-        quality="auto:best",
-        fetch_format="auto"
+        url_a_reemplazar=(
+            reemplazo_url_anterior
+            if reemplazo_url_anterior and "res.cloudinary.com" in reemplazo_url_anterior
+            else None
+        ),
+        detalle=f"Galería: {producto}",
     )
+    if not subida.get("ok"):
+        return subida
+    resultado = subida["resultado"]
     url = resultado.get("secure_url")
 
     # 6. Guardar en la BD en UNA transacción con bloqueo de la fila del producto
@@ -723,9 +860,12 @@ def subir_imagen_extra(producto: str, contents: bytes, orden_target, tenant_id: 
 
     # 7. Borrar la imagen anterior de Cloudinary SOLO tras subir la nueva
     if reemplazo_url_anterior and reemplazo_url_anterior != url:
-        borrar_imagen_cloudinary(reemplazo_url_anterior)
+        borrar_imagen_cloudinary(reemplazo_url_anterior)  # libera cuota vía ledger
 
-    return {"ok": True, "url": url, "orden": nueva_orden}
+    respuesta = {"ok": True, "url": url, "orden": nueva_orden}
+    if subida.get("aviso"):
+        respuesta["aviso"] = subida["aviso"]
+    return respuesta
 
 
 def eliminar_imagen_extra(imagen_id: int, tenant_id: str) -> dict:
@@ -864,6 +1004,129 @@ def reordenar_imagenes(producto: str, ids: list, tenant_id: str) -> dict:
         )
 
     return {"ok": True, "mensaje": "Imágenes reordenadas correctamente"}
+
+
+def _compactar_orden_galeria(producto_id: int, tenant_id: str) -> None:
+    """Renumera la galería de un producto secuencialmente (1..N) tras borrar
+    una fila, para que el editor no vea huecos. Best-effort."""
+    try:
+        filas = query(
+            "SELECT id, orden FROM producto_imagenes "
+            "WHERE producto_id = %s AND tenant_id = %s ORDER BY orden ASC",
+            (producto_id, tenant_id),
+        )
+        for indice, fila in enumerate(filas, start=1):
+            if fila["orden"] != indice:
+                execute(
+                    "UPDATE producto_imagenes SET orden = %s WHERE id = %s",
+                    (indice, fila["id"]),
+                )
+    except Exception as e:
+        print(f"Error compactando galería del producto {producto_id}: {e}")
+
+
+def liberar_urls(urls: list, tenant_id: str) -> dict:
+    """
+    Gestor de espacio (migración 071, Fase B): libera imágenes elegidas por el
+    tenant. Por cada URL:
+      1. Guardia de propiedad: debe estar referenciada en las tablas del
+         tenant O rastreada en su ledger (permite liberar huérfanos que el
+         tenant subió y nunca guardó).
+      2. Limpia TODAS las referencias del tenant (producto principal, galería,
+         variación, logo, banners/hero).
+      3. Destruye el asset en Cloudinary vía borrar_imagen_cloudinary → la
+         liberación de cuota ocurre sola en el ledger.
+      4. Compacta la galería de los productos afectados.
+    NO toca catalogo_publicado (esas fotos se gestionan republicando desde el
+    Modo Local): liberarlas aquí rompería el catálogo publicado.
+    """
+    resultados = []
+    liberadas = 0
+    bytes_liberados = 0
+    vistas = set()
+    for url_raw in urls or []:
+        url = (url_raw or "").strip()
+        if not url or "res.cloudinary.com" not in url or url in vistas:
+            continue
+        vistas.add(url)
+
+        # Guardia de propiedad
+        try:
+            ref = query(
+                "SELECT 1 FROM productos WHERE Imagen = %s AND tenant_id = %s "
+                "UNION SELECT 1 FROM producto_imagenes WHERE url = %s AND tenant_id = %s "
+                "UNION SELECT 1 FROM producto_variaciones WHERE foto = %s AND tenant_id = %s "
+                "UNION SELECT 1 FROM tenants WHERE id = %s AND logo = %s "
+                "UNION SELECT 1 FROM catalogo_config WHERE tenant_id = %s AND "
+                "(banner_url = %s OR banner_url_movil = %s OR hero_url = %s OR hero_url_movil = %s) "
+                "UNION SELECT 1 FROM storage_eventos WHERE url = %s AND tenant_id = %s "
+                "LIMIT 1",
+                (url, tenant_id, url, tenant_id, url, tenant_id,
+                 tenant_id, url, tenant_id, url, url, url, url, url, tenant_id),
+            )
+        except Exception as e:
+            resultados.append({"url": url, "ok": False, "mensaje": f"Error validando propiedad: {e}"})
+            continue
+        if not ref:
+            resultados.append({"url": url, "ok": False,
+                               "mensaje": "La imagen no pertenece a este tenant"})
+            continue
+
+        # Productos cuya galería perderá la fila (para compactar después)
+        try:
+            afectados = query(
+                "SELECT DISTINCT producto_id FROM producto_imagenes "
+                "WHERE url = %s AND tenant_id = %s",
+                (url, tenant_id),
+            )
+        except Exception:
+            afectados = []
+
+        # 2. Limpiar referencias (cada una best-effort; la app tolera '' igual
+        #    que 'No hay foto' en los pickers)
+        try:
+            execute("UPDATE productos SET Imagen = 'No hay foto' "
+                    "WHERE Imagen = %s AND tenant_id = %s", (url, tenant_id))
+        except Exception as e:
+            print(f"Error limpiando productos.Imagen: {e}")
+        try:
+            execute("DELETE FROM producto_imagenes WHERE url = %s AND tenant_id = %s",
+                    (url, tenant_id))
+        except Exception as e:
+            print(f"Error limpiando galería: {e}")
+        try:
+            execute("UPDATE producto_variaciones SET foto = '' "
+                    "WHERE foto = %s AND tenant_id = %s", (url, tenant_id))
+        except Exception as e:
+            print(f"Error limpiando foto de variación: {e}")
+        try:
+            execute("UPDATE tenants SET logo = '' WHERE id = %s AND logo = %s",
+                    (tenant_id, url))
+        except Exception as e:
+            print(f"Error limpiando logo: {e}")
+        try:
+            execute(
+                "UPDATE catalogo_config SET "
+                "banner_url       = CASE WHEN banner_url       = %s THEN '' ELSE banner_url END, "
+                "banner_url_movil = CASE WHEN banner_url_movil = %s THEN '' ELSE banner_url_movil END, "
+                "hero_url         = CASE WHEN hero_url         = %s THEN '' ELSE hero_url END, "
+                "hero_url_movil   = CASE WHEN hero_url_movil   = %s THEN '' ELSE hero_url_movil END "
+                "WHERE tenant_id = %s",
+                (url, url, url, url, tenant_id),
+            )
+        except Exception as e:
+            print(f"Error limpiando banners: {e}")
+
+        # 3. Destruir el asset (la cuota se libera sola en el ledger)
+        borrar_imagen_cloudinary(url)
+        liberadas += 1
+        resultados.append({"url": url, "ok": True})
+
+        # 4. Compactar la galería de los productos afectados
+        for fila in afectados:
+            _compactar_orden_galeria(fila["producto_id"], tenant_id)
+
+    return {"ok": True, "liberadas": liberadas, "resultados": resultados}
 
 
 def leer_imagen_actual_producto(producto: str, tenant_id: str) -> str | None:
