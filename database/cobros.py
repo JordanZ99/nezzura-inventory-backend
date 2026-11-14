@@ -20,6 +20,7 @@ import psycopg2.extras
 
 from database.conexion import execute, query
 from database.actividad import registrar_actividad
+from database.tenants import _cfg_moratorios
 
 _EPSILON = 0.005  # tolerancia de centavos para 'saldo 0' (floats + NUMERIC)
 _REGEX_PERIODO = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
@@ -29,6 +30,7 @@ _REGEX_PERIODO = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
 _SELECT = """
 SELECT b.id, b.tenant_id, b.cliente_id, b.cuota_id, b.origen, b.concepto,
        b.periodo, b.monto, b.vencimiento, b.programa, b.notas, b.pagos, b.creado_en,
+       b.interes_cargado,
        cl.nombre AS cliente_nombre,
        cl.telefono AS cliente_telefono,
        cl.email AS cliente_email,
@@ -41,7 +43,7 @@ JOIN clientes cl ON cl.id = b.cliente_id
 """
 
 
-def _derivar(fila: dict) -> dict:
+def _derivar(fila: dict, cfg_moratorios: dict | None = None) -> dict:
     """Estado y vencido derivados (nunca almacenados): la única verdad es
     monto↔pagos y las fechas comprometidas. Con campos SQL (pagado/saldo) usa
     los volidos de la BDD; sin ellos, los reconstruye del JSONB (fallback
@@ -82,12 +84,27 @@ def _derivar(fila: dict) -> dict:
     fila["saldo"] = round(max(saldo, 0), 2)
     fila["pagado"] = round(pagado, 2)
     fila["monto"] = round(monto, 2)
+
+    # ── Intereses moratorios (mig 079): SIEMPRE derivados, jamás almacenados ──
+    # saldo_vencido × (tasa/100) / 30 × días efectivos (más allá de la gracia),
+    # interés SIMPLE (sin capitalización), menos lo ya facturado
+    # (interes_cargado) para no cobrar dos veces el mismo moratorio.
+    moratorios = 0.0
+    if cfg_moratorios and cfg_moratorios.get("activo") and fila["vencido"] and fila["estado"] != "pagado":
+        dias_efectivos = int(fila["dias_vencido"]) - int(cfg_moratorios.get("dias_gracia") or 0)
+        if dias_efectivos > 0:
+            tasa = float(cfg_moratorios.get("tasa_mensual") or 0)
+            calculado = fila["saldo"] * (tasa / 100.0) / 30.0 * dias_efectivos
+            cargado = float(fila.get("interes_cargado") or 0)
+            moratorios = max(0.0, round(calculado, 2) - cargado)
+    fila["moratorios"] = round(moratorios, 2)
+    fila["total_con_moratorios"] = round(fila["saldo"] + moratorios, 2)
     return fila
 
 
 def _cobro_por_id(tenant_id: str, cobro_id: str) -> dict | None:
     filas = query(_SELECT + " WHERE b.tenant_id = %s AND b.id = %s", (tenant_id, cobro_id))
-    return _derivar(filas[0]) if filas else None
+    return _derivar(filas[0], _cfg_moratorios(tenant_id)) if filas else None
 
 
 # ── Listado ───────────────────────────────────────────────────────────────────
@@ -113,7 +130,8 @@ def listar_cobros(
                   "FROM jsonb_array_elements(b.pagos) AS p), 0)) > %s")
         params.append(_EPSILON)
     filas = query(_SELECT + where + " ORDER BY b.vencimiento ASC NULLS LAST, b.creado_en DESC", tuple(params))
-    return [_derivar(f) for f in filas]
+    cfg = _cfg_moratorios(tenant_id)
+    return [_derivar(f, cfg) for f in filas]
 
 
 # ── Resumen (dashboard financiero) ────────────────────────────────────────────
@@ -131,6 +149,7 @@ def resumen(tenant_id: str, periodo: str | None = None) -> dict:
 
     pendiente_total = 0.0
     num_pendientes = 0
+    moratorios_total = 0.0
     aging = {"actual": 0.0, "d30": 0.0, "d60": 0.0, "d90": 0.0, "mas90": 0.0}
     cobrado_periodo = 0.0
     deudores: dict[str, dict] = {}
@@ -148,12 +167,15 @@ def resumen(tenant_id: str, periodo: str | None = None) -> dict:
             continue
         pendiente_total += c["saldo"]
         num_pendientes += 1
+        moratorios_total += float(c.get("moratorios") or 0)
 
         d = deudores.setdefault(
             c["cliente_id"],
-            {"cliente_id": c["cliente_id"], "nombre": c["cliente_nombre"], "saldo": 0.0, "cobros_pendientes": 0},
+            {"cliente_id": c["cliente_id"], "nombre": c["cliente_nombre"], "saldo": 0.0,
+             "moratorios": 0.0, "cobros_pendientes": 0},
         )
         d["saldo"] += c["saldo"]
+        d["moratorios"] += float(c.get("moratorios") or 0)
         d["cobros_pendientes"] += 1
 
         ref = c.get("vencimiento") or (
@@ -184,6 +206,7 @@ def resumen(tenant_id: str, periodo: str | None = None) -> dict:
     deudores_list = sorted(deudores.values(), key=lambda d: -d["saldo"])
     for d in deudores_list:
         d["saldo"] = round(d["saldo"], 2)
+        d["moratorios"] = round(d.get("moratorios") or 0, 2)
 
     proximos_list = sorted(
         proximos,
@@ -194,6 +217,7 @@ def resumen(tenant_id: str, periodo: str | None = None) -> dict:
         "periodo": periodo,
         "pendiente_total": round(pendiente_total, 2),
         "num_pendientes": num_pendientes,
+        "moratorios_total": round(moratorios_total, 2),
         "cobrado_periodo": round(cobrado_periodo, 2),
         "aging": {k: round(v, 2) for k, v in aging.items()},
         "deudores": deudores_list,
@@ -726,6 +750,53 @@ def _pago_payload(cobro: dict, entrada: dict | None = None) -> dict:
         "dias_vencido": cobro["dias_vencido"],
         **({"abono": entrada} if entrada else {}),
     }
+
+
+# ── Moratorios (mig 079): materializar el interés derivado ────────────────────
+
+def cargar_moratorios(tenant_id: str, cobro_id: str) -> dict:
+    """Convierte el interés moratorio DERIVADO del cobro en una deuda concreta
+    (cobro extra "Intereses moratorios — {concepto}", vence hoy). El monto
+    queda registrado en interes_cargado del cobro original para que la próxima
+    lectura no lo vuelva a derivar (no doble cobro). El dueño decide CUÁNDO
+    cobrar la mora; los abonos pagan cobros normales, sin lógica especial."""
+    actual = _cobro_por_id(tenant_id, cobro_id)
+    if not actual:
+        return {"ok": False, "tipo": "no_encontrado", "mensaje": "Cobro no encontrado"}
+    mora = float(actual.get("moratorios") or 0)
+    if mora <= _EPSILON:
+        return {"ok": False, "tipo": "validacion",
+                "mensaje": "Este cobro no tiene moratorios por cargar (desactivados, dentro de la gracia o ya cargados)"}
+
+    concepto = f"Intereses moratorios — {actual['concepto']}"
+    creado = _crear_cobro(
+        tenant_id, actual["cliente_id"], "extra", concepto, round(mora, 2),
+        vencimiento=date.today(),
+        notas=(f"Moratorios del cobro del {str(actual['vencimiento'])[:10] or '—'} "
+               f"({actual['dias_vencido']} días vencido)"),
+    )
+    if not creado.get("ok"):
+        return creado
+    execute(
+        "UPDATE cobros SET interes_cargado = interes_cargado + %s "
+        "WHERE tenant_id = %s AND id = %s",
+        (round(mora, 2), tenant_id, cobro_id)
+    )
+    nuevo = creado["cobro"]
+    # Registro de actividad: materialización de la mora.
+    try:
+        registrar_actividad(
+            tenant_id, "cobro", "cobro", "crear",
+            resumen=(f"Cargó {mora:.2f} de intereses moratorios al cobro "
+                     f"{actual['concepto']} de {actual['cliente_nombre']}"),
+            entidad_id=nuevo["id"],
+            detalle={"moratorios": round(mora, 2),
+                     "dias_vencido": actual["dias_vencido"],
+                     "cobro_origen": cobro_id},
+        )
+    except Exception:
+        pass
+    return {"ok": True, "cargado": round(mora, 2), "cobro": nuevo}
 
 
 # ── Cuotas (las suscripciones mensuales) ─────────────────────────────────────

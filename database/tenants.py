@@ -29,7 +29,36 @@ CAMPOS_PERFIL = (
     "clientes_activos", "cliente_campos",
     "puntos_activos", "puntos_valor_punto", "puntos_modo",
     "puntos_gasto_monto", "puntos_gasto_pts", "puntos_fijos",
+    "moratorios",
 )
+
+
+def normalizar_moratorios(cfg) -> dict | None:
+    """Política de moratorios normalizada (mig 079). None = desactivada.
+    {activo, tasa_mensual (0<t<=100), dias_gracia (0..60)}."""
+    if not isinstance(cfg, dict):
+        return None
+    if not bool(cfg.get("activo")):
+        return None
+    try:
+        tasa = float(cfg.get("tasa_mensual") or 4)
+        gracia = int(cfg.get("dias_gracia") or 0)
+    except (TypeError, ValueError):
+        return None
+    if not (0 < tasa <= 100):
+        return None
+    return {"activo": True, "tasa_mensual": round(tasa, 2), "dias_gracia": max(0, min(gracia, 60))}
+
+
+def _cfg_moratorios(tenant_id: str) -> dict | None:
+    """Política de moratorios del tenant (para la derivación de cobros)."""
+    try:
+        filas = query("SELECT moratorios FROM tenants WHERE id = %s", (tenant_id,))
+        if not filas:
+            return None
+        return normalizar_moratorios(filas[0].get("moratorios"))
+    except Exception:
+        return None
 
 
 def leer_config_perfil(tenant_id: str) -> dict:
@@ -38,7 +67,7 @@ def leer_config_perfil(tenant_id: str) -> dict:
     fila = query(
         "SELECT modo_precio_sugerido, zona_horaria, metodo_pago_default, gasto_comision_automatico, dias_cerrados, "
         "clientes_activos, cliente_campos, puntos_activos, puntos_valor_punto, puntos_modo, "
-        "puntos_gasto_monto, puntos_gasto_pts, puntos_fijos "
+        "puntos_gasto_monto, puntos_gasto_pts, puntos_fijos, moratorios "
         "FROM tenants WHERE id = %s",
         (tenant_id,)
     )
@@ -60,6 +89,8 @@ def leer_config_perfil(tenant_id: str) -> dict:
         "puntos_gasto_monto": float(f.get("puntos_gasto_monto") or 10) if fila else 10.0,
         "puntos_gasto_pts": int(f.get("puntos_gasto_pts") or 1) if fila else 1,
         "puntos_fijos": (int(f["puntos_fijos"]) if f.get("puntos_fijos") is not None else None) if fila else None,
+        # ── Intereses moratorios (079, giro servicios) ──
+        "moratorios": normalizar_moratorios(f.get("moratorios")) if fila else None,
     }
 
 
@@ -191,6 +222,16 @@ def actualizar_config_perfil(campos: dict, tenant_id: str) -> dict:
             return {"ok": False, "status": 422, "mensaje": "puntos_fijos no puede ser negativo"}
         execute("UPDATE tenants SET puntos_fijos = %s WHERE id = %s", (fijos, tenant_id))
         respuesta["puntos_fijos"] = fijos
+
+    # ── Intereses moratorios (079, giro servicios) ──
+    if campos.get("moratorios") is not None:
+        cfg = normalizar_moratorios(campos["moratorios"])
+        if campos["moratorios"].get("activo") and cfg is None:
+            return {"ok": False, "status": 422,
+                    "mensaje": "moratorios: tasa_mensual debe ser mayor a 0 y menor a 100, dias_gracia entre 0 y 60"}
+        execute("UPDATE tenants SET moratorios = %s::jsonb WHERE id = %s",
+                (json.dumps(cfg), tenant_id))
+        respuesta["moratorios"] = cfg
 
     respuesta.update(leer_config_perfil(tenant_id))
     return respuesta

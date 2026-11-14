@@ -182,3 +182,13 @@ def quitar_abono(cobro_id: str, indice: int, tenant_id: str = Depends(get_tenant
     resultado = db_cobros.quitar_pago(tenant_id, cobro_id, indice)
     _revisar(resultado, "Error al quitar el abono")
     return resultado
+
+
+@router.post("/{cobro_id}/moratorios")
+def cargar_moratorios(cobro_id: str, tenant_id: str = Depends(get_tenant_id)):
+    """Mig 079: materializa el interés moratorio derivado del cobro en un cobro
+    extra "Intereses moratorios — ..." (vence hoy). El monto queda registrado
+    en interes_cargado del cobro original para no derivarlo dos veces."""
+    resultado = db_cobros.cargar_moratorios(tenant_id, cobro_id)
+    _revisar(resultado, "Error al cargar los moratorios")
+    return resultado

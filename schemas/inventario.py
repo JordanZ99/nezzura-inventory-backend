@@ -139,6 +139,9 @@ class ActualizarPerfil(BaseModel):
     puntos_gasto_monto: Optional[float] = None   # Y en "X pts por cada $Y"
     puntos_gasto_pts: Optional[int] = None       # X en "X pts por cada $Y"
     puntos_fijos: Optional[int] = None           # pts por venta cuando modo = 'fijo'
+    # ── Intereses moratorios (migración 079, giro 'servicios') ──
+    # {"activo": bool, "tasa_mensual": %, "dias_gracia": int} | None = sin cambio
+    moratorios: Optional[dict] = None
 
 
 class ActualizarPostOverride(BaseModel):
