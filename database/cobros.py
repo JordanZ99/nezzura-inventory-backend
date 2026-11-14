@@ -574,13 +574,16 @@ def _pago_payload(cobro: dict, entrada: dict | None = None) -> dict:
 
 _SELECT_CUOTAS = """
 SELECT q.id, q.tenant_id, q.cliente_id, q.concepto, q.monto, q.dia_cobro,
-       q.frecuencia, q.dia_semana, q.monto_meta,
+       q.frecuencia, q.dia_semana, q.monto_meta, q.tipo, q.costo,
        q.activo, q.notas, q.creado_en, cl.nombre AS cliente_nombre,
        -- Derivados para la UI (cuentas finitas, 064): SOLO lectura.
        (SELECT COALESCE(SUM(x.monto), 0) FROM cobros x WHERE x.cuota_id = q.id) AS programado_meta,
        (SELECT COALESCE(SUM((pg->>'monto')::numeric), 0)
           FROM cobros y, jsonb_array_elements(y.pagos) AS pg
-         WHERE y.cuota_id = q.id) AS abonado_meta
+         WHERE y.cuota_id = q.id) AS abonado_meta,
+       -- Venta a plazos (076): ganancia derivada del precio (meta) menos costo.
+       CASE WHEN q.tipo = 'venta' AND q.monto_meta IS NOT NULL AND q.costo IS NOT NULL
+            THEN q.monto_meta - q.costo END AS ganancia
 FROM cuotas_clientes q
 JOIN clientes cl ON cl.id = q.cliente_id
 """
@@ -615,7 +618,8 @@ def listar_cuotas(tenant_id: str, solo_activas: bool = False) -> list[dict]:
 def crear_cuota(tenant_id: str, cliente_id: str, concepto: str, monto: float,
                 dia_cobro: int = 1, notas: str | None = None,
                 frecuencia: str = "mensual", dia_semana: int | None = None,
-                monto_meta: float | None = None) -> dict:
+                monto_meta: float | None = None,
+                tipo: str = "cuota", costo: float | None = None) -> dict:
     concepto = (concepto or "").strip()
     if not concepto:
         return {"ok": False, "tipo": "validacion", "mensaje": "El concepto es obligatorio"}
@@ -624,6 +628,16 @@ def crear_cuota(tenant_id: str, cliente_id: str, concepto: str, monto: float,
     if frecuencia not in _FRECUENCIAS:
         return {"ok": False, "tipo": "validacion",
                 "mensaje": "La frecuencia debe ser mensual, semanal o quincenal"}
+    if tipo not in ("cuota", "venta"):
+        return {"ok": False, "tipo": "validacion", "mensaje": "El tipo debe ser cuota o venta"}
+    costo_n = round(float(costo), 2) if costo is not None else None
+    if costo_n is not None and costo_n < 0:
+        return {"ok": False, "tipo": "validacion", "mensaje": "El costo no puede ser negativo"}
+    # Venta a plazos (076): el precio total es la esencia — sin meta no hay
+    # venta que terminar (el CHECK de la migración lo garantiza también).
+    if tipo == "venta" and monto_meta is None:
+        return {"ok": False, "tipo": "validacion",
+                "mensaje": "Una venta a plazos necesita el precio total (meta)"}
     meta_n = round(float(monto_meta), 2) if monto_meta is not None else None
     if meta_n is not None and meta_n <= 0:
         return {"ok": False, "tipo": "validacion",
@@ -644,21 +658,24 @@ def crear_cuota(tenant_id: str, cliente_id: str, concepto: str, monto: float,
         return {"ok": False, "tipo": "no_encontrado", "mensaje": "Cliente no encontrado"}
     filas = query(
         "INSERT INTO cuotas_clientes (tenant_id, cliente_id, concepto, monto, dia_cobro, "
-        "frecuencia, dia_semana, monto_meta, notas) "
-        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+        "frecuencia, dia_semana, monto_meta, tipo, costo, notas) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
         (tenant_id, cliente_id, concepto, round(monto, 2), int(dia_cobro),
-         frecuencia, dia_semana_n, meta_n, (notas or "").strip() or None)
+         frecuencia, dia_semana_n, meta_n, tipo, costo_n, (notas or "").strip() or None)
     )
     cuota = query(_SELECT_CUOTAS + " WHERE q.tenant_id = %s AND q.id = %s", (tenant_id, filas[0]["id"]))[0]
-    # Registro de actividad (062): alta de cuota (suscripción recurrente).
+    # Registro de actividad (062): alta de cuota (suscripción o venta a plazos).
     try:
+        etiqueta = "venta a plazos" if tipo == "venta" else "cuota"
         registrar_actividad(
             tenant_id, "cobro", "cuota", "crear",
-            resumen=f"Creó la cuota {concepto} de {cuota['cliente_nombre']} "
+            resumen=f"Creó la {etiqueta} {concepto} de {cuota['cliente_nombre']} "
                     f"({round(monto, 2):.2f}, {_resumen_cuota(cuota)}{f', hasta {meta_n:.2f}' if meta_n is not None else ''})",
             entidad_id=filas[0]["id"],
             detalle={"monto": round(monto, 2), "frecuencia": frecuencia,
                      "dia_cobro": int(cuota["dia_cobro"]),
+                     **({"tipo": tipo} if tipo != "cuota" else {}),
+                     **({"costo": costo_n} if costo_n is not None else {}),
                      **({"dia_semana": dia_semana_n} if dia_semana_n is not None else {}),
                      **({"monto_meta": meta_n} if meta_n is not None else {})},
         )
@@ -674,10 +691,11 @@ def actualizar_cuota(
     activo: bool | None = None, notas: str | None = None,
     frecuencia: str | None = None, dia_semana: int | None = None,
     monto_meta: float | None = None,
+    tipo: str | None = None, costo: float | None = None,
 ) -> dict:
     actual = query(
         "SELECT id, cliente_id, concepto, monto, dia_cobro, frecuencia, dia_semana, "
-        "monto_meta, activo, notas "
+        "monto_meta, tipo, costo, activo, notas "
         "FROM cuotas_clientes WHERE tenant_id = %s AND id = %s",
         (tenant_id, cuota_id)
     )
@@ -730,6 +748,27 @@ def actualizar_cuota(
             return {"ok": False, "tipo": "validacion", "mensaje": "La meta no puede ser negativa"}
         sets.append("monto_meta = %s")
         params.append(meta_nueva if meta_nueva > 0 else None)
+    # ── Tipo venta/cuota (076): validar el PAR tipo+meta que quedará final ──
+    tipo_final = (tipo if tipo is not None else actual["tipo"]) or "cuota"
+    if tipo is not None:
+        if tipo not in ("cuota", "venta"):
+            return {"ok": False, "tipo": "validacion", "mensaje": "El tipo debe ser cuota o venta"}
+        sets.append("tipo = %s")
+        params.append(tipo)
+    meta_final = (
+        round(float(monto_meta), 2) if (monto_meta is not None and monto_meta > 0)
+        else actual["monto_meta"]
+    )
+    if tipo_final == "venta" and not meta_final:
+        return {"ok": False, "tipo": "validacion",
+                "mensaje": "Una venta a plazos necesita el precio total (meta)"}
+    if costo is not None:
+        costo_nuevo = round(float(costo), 2)
+        if costo_nuevo < 0:
+            return {"ok": False, "tipo": "validacion", "mensaje": "El costo no puede ser negativo"}
+        # Sentinel de la UI: 0 = quitar el costo (NULL); >0 = fijarlo.
+        sets.append("costo = %s")
+        params.append(costo_nuevo if costo_nuevo > 0 else None)
     if frec_final != "semanal" and (dia_semana is not None or actual["dia_semana"] is not None):
         # Al salir de semanal se limpia el día de semana (CHECK-friendly y
         # sin datos huérfanos aunque el cliente no mande dia_semana).
@@ -786,6 +825,13 @@ def actualizar_cuota(
                         f"{vieja_meta:.2f}" if vieja_meta is not None else "sin límite",
                         f"{nueva_meta:.2f}" if nueva_meta > 0 else "sin límite",
                     ]
+            if tipo is not None and tipo != (actual["tipo"] or "cuota"):
+                diff["tipo"] = [actual["tipo"] or "cuota", tipo]
+            if costo is not None:
+                viejo_costo = float(actual["costo"]) if actual["costo"] is not None else None
+                nuevo_costo = round(float(costo), 2) if float(costo) > 0 else None
+                if viejo_costo != nuevo_costo:
+                    diff["costo"] = [viejo_costo, nuevo_costo]
             if diff:
                 registrar_actividad(
                     tenant_id, "cobro", "cuota", "editar",

@@ -61,23 +61,29 @@ FrecuenciaCuota = Literal["mensual", "semanal", "quincenal"]
 
 
 class CuotaNueva(BaseModel):
-    """Suscripción recurrente: mensual (día 1..28 del mes), semanal (un día
+    """Suscripción recurrente (tipo 'cuota') o VENTA A PLAZOS (tipo 'venta',
+    mig 076: concepto = el artículo, monto_meta = precio total OBLIGATORIO,
+    costo opcional → ganancia derivada). Mensual (día 1..28), semanal (un día
     de la semana, se genera en cada aparición del mes) o quincenal (días 1
-    y 15). monto_meta (opcional, 064) la vuelve CUENTA FINITA: el generador
-    deja de emitir al cubrir el total y el último abono sale al residuo."""
+    y 15). monto_meta (opcional en cuota, 064) la vuelve CUENTA FINITA: el
+    generador deja de emitir al cubrir el total y el último abono sale al residuo."""
     cliente_id  : str = Field(..., min_length=1)
     concepto    : str = Field(..., min_length=1)
     monto       : float = Field(..., gt=0)
     frecuencia  : FrecuenciaCuota = "mensual"
     dia_cobro   : int = Field(1, ge=1, le=28, description="Solo mensual: día del mes")
     dia_semana  : Optional[int] = Field(None, ge=0, le=6, description="Solo semanal: 0=Lunes..6=Domingo")
-    monto_meta  : Optional[float] = Field(None, gt=0, description="Total a cubrir (NULL = infinita)")
+    monto_meta  : Optional[float] = Field(None, gt=0, description="Total a cubrir (NULL = infinita en cuota; OBLIGATORIA en venta)")
+    tipo        : Literal["cuota", "venta"] = "cuota"
+    costo       : Optional[float] = Field(None, ge=0, description="Solo venta: lo que te costó (ganancia = meta - costo)")
     notas       : Optional[str] = None
 
 
 class CuotaActualizar(BaseModel):
     """Todas las columnas son opcionales; el backend valida cada una que llegue.
-    monto_meta: None = sin cambio; 0 = quitar la meta (vuelve infinita); >0 = fijar."""
+    monto_meta: None = sin cambio; 0 = quitar la meta (vuelve infinita); >0 = fijar.
+    costo: None = sin cambio; 0 = quitarlo; >0 = fijar.
+    tipo: cambiar cuota↔venta (una venta exige meta)."""
     cliente_id   : Optional[str] = None
     concepto     : Optional[str] = None
     monto        : Optional[float] = Field(None, gt=0)
@@ -85,5 +91,7 @@ class CuotaActualizar(BaseModel):
     dia_cobro    : Optional[int] = Field(None, ge=1, le=28)
     dia_semana   : Optional[int] = Field(None, ge=0, le=6)
     monto_meta   : Optional[float] = Field(None, ge=0)
+    tipo         : Optional[Literal["cuota", "venta"]] = None
+    costo        : Optional[float] = Field(None, ge=0)
     activo       : Optional[bool] = None
     notas        : Optional[str] = None

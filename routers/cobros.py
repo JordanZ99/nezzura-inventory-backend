@@ -65,7 +65,7 @@ def crear_cuota(data: CuotaNueva, tenant_id: str = Depends(get_tenant_id)):
         tenant_id, data.cliente_id, data.concepto, data.monto,
         dia_cobro=data.dia_cobro, notas=data.notas,
         frecuencia=data.frecuencia, dia_semana=data.dia_semana,
-        monto_meta=data.monto_meta,
+        monto_meta=data.monto_meta, tipo=data.tipo, costo=data.costo,
     )
     _revisar(resultado, "Error al crear la cuota")
     return resultado
@@ -78,7 +78,7 @@ def actualizar_cuota(cuota_id: str, data: CuotaActualizar, tenant_id: str = Depe
         cliente_id=data.cliente_id, concepto=data.concepto, monto=data.monto,
         dia_cobro=data.dia_cobro, activo=data.activo, notas=data.notas,
         frecuencia=data.frecuencia, dia_semana=data.dia_semana,
-        monto_meta=data.monto_meta,
+        monto_meta=data.monto_meta, tipo=data.tipo, costo=data.costo,
     )
     _revisar(resultado, "Error al actualizar la cuota")
     return resultado
