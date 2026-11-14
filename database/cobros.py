@@ -226,14 +226,18 @@ def _fechas_de_cuota_en_mes(cuota: dict, anio: int, mes: int) -> list:
 def generar_cobros(tenant_id: str, periodo: str) -> dict:
     """Crea los cobros del periodo para cada cuota activa (mig 063: mensuales,
     semanales y quincenales). Idempotente: el par cuota+vencimiento que ya
-    existe no se duplica (índice parcial único)."""
+    existe no se duplica (índice parcial único).
+    Mig 079 (semántica): una cuota NO genera cobros con vencimiento ANTERIOR a
+    su fecha de creación — una venta a plazos creada a mitad de mes no cobra
+    retroactivo las semanas ya pasadas. Regenerar meses pasados de cuotas
+    viejas sigue igual (su creado_en ya es anterior a todo el periodo)."""
     if not _REGEX_PERIODO.match(periodo or ""):
         return {"ok": False, "tipo": "validacion", "mensaje": "El periodo debe ser 'YYYY-MM' (ej. 2026-11)"}
 
     anio, mes = int(periodo[:4]), int(periodo[5:7])
     cuotas = query(
         "SELECT id, cliente_id, concepto, monto, dia_cobro, frecuencia, dia_semana, "
-        "monto_meta, notas "
+        "monto_meta, notas, creado_en "
         "FROM cuotas_clientes WHERE tenant_id = %s AND activo",
         (tenant_id,)
     )
@@ -257,11 +261,18 @@ def generar_cobros(tenant_id: str, periodo: str) -> dict:
         (tenant_id,)
     )}
 
-    creados, omitidos = 0, 0
+    creados, omitidos, saltados = 0, 0, 0
     for cuota in cuotas:
         meta = cuota["monto_meta"]
         restante = round(float(meta), 2) if meta is not None else None
+        # Fecha de inicio (mig 079): la cuota no puede deber dinero de antes
+        # de existir. vencimiento < creado_en.date() → se omite siempre.
+        creado = cuota.get("creado_en")
+        fecha_inicio = creado.date() if creado is not None else None
         for vencimiento in _fechas_de_cuota_en_mes(cuota, anio, mes):
+            if fecha_inicio and vencimiento < fecha_inicio:
+                saltados += 1
+                continue
             if restante is not None and restante <= _EPSILON:
                 # Cuenta finita cubierta: no genera más (064).
                 break
@@ -289,10 +300,12 @@ def generar_cobros(tenant_id: str, periodo: str) -> dict:
     # Registro de actividad (062): generación del periodo (un solo renglón
     # resumido; cada cobro ya vive en la tabla cobros).
     try:
-        if creados or omitidos:
+        if creados or omitidos or saltados:
             detalle_gen: dict = {"cuotas": len(cuotas)}
             if omitidos:
                 detalle_gen["omitidos"] = omitidos
+            if saltados:
+                detalle_gen["anteriores_al_inicio"] = saltados
             registrar_actividad(
                 tenant_id, "cobro", "cobro", "generar",
                 resumen=f"Generó {creados} cobro(s) de cuota(s) del periodo {periodo}",
@@ -301,12 +314,17 @@ def generar_cobros(tenant_id: str, periodo: str) -> dict:
     except Exception:
         pass
 
+    mensaje = f"{creados} cobro(s) generado(s), {omitidos} ya existían."
+    if saltados:
+        mensaje += (f" {saltados} vencimiento(s) anterior(es) a la fecha de inicio "
+                    "de la cuota no se generaron (no se cobra retroactivo).")
     return {
         "ok": True,
         "creados": creados,
         "omitidos": omitidos,
+        "saltados": saltados,
         "periodo": periodo,
-        "mensaje": f"{creados} cobro(s) generado(s), {omitidos} ya existían.",
+        "mensaje": mensaje,
     }
 
 
