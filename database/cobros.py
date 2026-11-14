@@ -30,6 +30,8 @@ _SELECT = """
 SELECT b.id, b.tenant_id, b.cliente_id, b.cuota_id, b.origen, b.concepto,
        b.periodo, b.monto, b.vencimiento, b.programa, b.notas, b.pagos, b.creado_en,
        cl.nombre AS cliente_nombre,
+       cl.telefono AS cliente_telefono,
+       cl.email AS cliente_email,
        COALESCE((SELECT SUM((p->>'monto')::numeric)
                  FROM jsonb_array_elements(b.pagos) AS p), 0) AS pagado,
        b.monto - COALESCE((SELECT SUM((p->>'monto')::numeric)
@@ -507,10 +509,17 @@ def eliminar_cobro(tenant_id: str, cobro_id: str) -> dict:
 # ── Abonos (pagos parciales/totales) ─────────────────────────────────────────
 
 def agregar_pago(tenant_id: str, cobro_id: str, monto: float,
-                 metodo: str | None = None, fecha: date | None = None) -> dict:
+                 metodo: str | None = None, fecha: date | None = None,
+                 cascada: bool = False) -> dict:
     """Registra un abono (parcial o total). Append-only al JSONB `pagos`:
     el saldo y el estado se recalculan de inmediato. Sobre-pago permitido
-    (quedará 'pagado' con saldo 0; corregible quitando el abono)."""
+    (quedará 'pagado' con saldo 0; corregible quitando el abono).
+
+    cascada (mig 081): si el monto excede el saldo del cobro y pertenece a una
+    cuenta (cuota_id), el excedente se reparte a los SIGUIENTES cobros
+    pendientes de la misma cuota (orden por vencimiento). Un mismo pago = una
+    sola entrada {fecha, monto, metodo} por cobro cubierto. El sobrante final
+    (pagó más que toda la deuda) va completo al último cobro como sobrepago."""
     if monto is None or monto <= 0:
         return {"ok": False, "tipo": "validacion", "mensaje": "El abono debe ser mayor a 0"}
     actual = _cobro_por_id(tenant_id, cobro_id)
@@ -522,28 +531,159 @@ def agregar_pago(tenant_id: str, cobro_id: str, monto: float,
         "monto": round(monto, 2),
         "metodo": (metodo or "").strip() or None,
     }
-    pagos_nuevos = actual["pagos"] + [entrada]
+    resto = round(float(monto), 2)
+    reparto: list[dict] = []
+    cobro_tocado = actual["id"]
+
+    if cascada and actual.get("cuota_id"):
+        hermanos = query(
+            _SELECT + " WHERE b.tenant_id = %s AND b.cuota_id = %s "
+            "ORDER BY b.vencimiento ASC NULLS LAST, b.creado_en ASC",
+            (tenant_id, actual["cuota_id"])
+        )
+        pendientes = [h for h in (hermanos or []) if float(h["saldo"]) > _EPSILON]
+        for h in pendientes:
+            if resto <= _EPSILON:
+                break
+            aporte = round(min(resto, float(h["saldo"])), 2)
+            # Cada cobro recibe SU PORCIÓN del pago (no el monto completo):
+            # una entrada {fecha, aporte, metodo} por cobro cubierto.
+            porcion = {**entrada, "monto": aporte}
+            pagos_nuevos = h["pagos"] + [porcion]
+            execute(
+                "UPDATE cobros SET pagos = %s WHERE tenant_id = %s AND id = %s",
+                (psycopg2.extras.Json(pagos_nuevos), tenant_id, h["id"])
+            )
+            reparto.append({
+                "cobro_id": h["id"],
+                "vencimiento": str(h["vencimiento"])[:10] if h.get("vencimiento") else None,
+                "monto": aporte,
+            })
+            cobro_tocado = h["id"]
+            resto = round(resto - aporte, 2)
+        if resto > _EPSILON:
+            # Sobrante: pagó más que TODA la deuda pendiente → al último cobro
+            # pendiente (o al ancla si no había ninguno) como sobrepago. Se
+            # RE-LEE su pagos: el bucle pudo ya haberle escrito una porción.
+            objetivo = pendientes[-1] if pendientes else actual
+            filas_obj = query(
+                "SELECT pagos FROM cobros WHERE tenant_id = %s AND id = %s",
+                (tenant_id, objetivo["id"])
+            )
+            pagos_actuales = filas_obj[0]["pagos"] if filas_obj else objetivo["pagos"]
+            sobrante = {**entrada, "monto": resto}
+            execute(
+                "UPDATE cobros SET pagos = %s WHERE tenant_id = %s AND id = %s",
+                (psycopg2.extras.Json(pagos_actuales + [sobrante]), tenant_id, objetivo["id"])
+            )
+            reparto.append({
+                "cobro_id": objetivo["id"],
+                "vencimiento": str(objetivo["vencimiento"])[:10] if objetivo.get("vencimiento") else None,
+                "monto": resto,
+                "sobrepago": True,
+            })
+            cobro_tocado = objetivo["id"]
+            resto = 0.0
+
+    if not reparto:
+        # Sin cascada, o cascada sin cuenta (extra): comportamiento clásico.
+        pagos_nuevos = actual["pagos"] + [entrada]
+        execute(
+            "UPDATE cobros SET pagos = %s WHERE tenant_id = %s AND id = %s",
+            (psycopg2.extras.Json(pagos_nuevos), tenant_id, cobro_id)
+        )
+        reparto = [{"cobro_id": cobro_id, "vencimiento": str(actual["vencimiento"])[:10] if actual.get("vencimiento") else None,
+                    "monto": round(float(monto), 2)}]
+        cobro_tocado = cobro_id
+
+    cobro = _cobro_por_id(tenant_id, cobro_tocado)
+    # Saldo consolidado de la cuenta (para el recibo y la UI), si es de cuenta.
+    cuenta_saldo = None
+    if actual.get("cuota_id"):
+        filas2 = query(
+            _SELECT + " WHERE b.tenant_id = %s AND b.cuota_id = %s",
+            (tenant_id, actual["cuota_id"])
+        )
+        cuenta_saldo = round(sum(float(f["saldo"]) for f in filas2), 2)
+
+    # Registro de actividad (062): abono al cobro (el dinero vive en `pagos`).
+    try:
+        nombre_cuenta = actual["concepto"]
+        detalle: dict = {"monto": round(float(monto), 2),
+                         "fecha": entrada["fecha"],
+                         **({"metodo": entrada["metodo"]} if entrada["metodo"] else {}),
+                         "saldo_despues": cobro["saldo"] if cobro else None,
+                         "estado_despues": cobro["estado"] if cobro else None}
+        if len(reparto) > 1:
+            detalle["reparto"] = reparto
+        if cascada:
+            resumen = (f"Abonó {round(float(monto), 2):.2f} a la cuenta {nombre_cuenta} "
+                       f"de {actual['cliente_nombre']} (cubrió {len(reparto)} cobro(s))")
+        else:
+            resumen = (f"Abonó {round(float(monto), 2):.2f} al cobro {actual['concepto']} "
+                       f"de {actual['cliente_nombre']}")
+        registrar_actividad(
+            tenant_id, "cobro", "abono", "abonar",
+            resumen=resumen,
+            entidad_id=cobro_tocado,
+            detalle=detalle,
+        )
+    except Exception:
+        pass
+
+    respuesta = {"ok": True, **_pago_payload(cobro, entrada)}
+    respuesta["reparto"] = reparto
+    respuesta["abono"] = entrada
+    if cuenta_saldo is not None:
+        respuesta["cuenta_saldo"] = cuenta_saldo
+    return respuesta
+
+
+def editar_pago(tenant_id: str, cobro_id: str, indice: int,
+                monto: float, metodo: str | None = None,
+                fecha: date | None = None) -> dict:
+    """Corrección de un abono ya registrado: lo reescribe EN SU POSICIÓN del
+    ledger (JSONB pagos) — útil para arreglar la fecha sin quitar y volver a
+    poner. monto/metodo/fecha: None = conservar el valor actual del abono."""
+    if monto is None or monto <= 0:
+        return {"ok": False, "tipo": "validacion", "mensaje": "El abono debe ser mayor a 0"}
+    actual = _cobro_por_id(tenant_id, cobro_id)
+    if not actual:
+        return {"ok": False, "tipo": "no_encontrado", "mensaje": "Cobro no encontrado"}
+    if indice is None or indice < 0:
+        return {"ok": False, "tipo": "validacion", "mensaje": "Índice de abono inválido"}
+    if indice >= len(actual["pagos"]):
+        return {"ok": False, "tipo": "validacion", "mensaje": "Ese abono no existe"}
+
+    eliminado = actual["pagos"][indice]
+    entrada = {
+        "fecha": (fecha.isoformat() if isinstance(fecha, date)
+                  else (str(fecha)[:10] if fecha else (eliminado.get("fecha") or date.today().isoformat()))),
+        "monto": round(monto, 2),
+        "metodo": ((metodo or "").strip() or None) if metodo is not None else eliminado.get("metodo"),
+    }
+    pagos_nuevos = actual["pagos"][:indice] + [entrada] + actual["pagos"][indice + 1:]
     execute(
         "UPDATE cobros SET pagos = %s WHERE tenant_id = %s AND id = %s",
         (psycopg2.extras.Json(pagos_nuevos), tenant_id, cobro_id)
     )
     cobro = _cobro_por_id(tenant_id, cobro_id)
-    # Registro de actividad (062): abono al cobro (el dinero vive en `pagos`).
+    # Registro de actividad (062): corrección de abono.
     try:
         registrar_actividad(
-            tenant_id, "cobro", "abono", "abonar",
-            resumen=(f"Abonó {round(monto, 2):.2f} al cobro {actual['concepto']} "
+            tenant_id, "cobro", "abono", "editar",
+            resumen=(f"Editó el abono de {float(eliminado.get('monto') or 0):.2f} → "
+                     f"{entrada['monto']:.2f} del cobro {actual['concepto']} "
                      f"de {actual['cliente_nombre']}"),
             entidad_id=cobro_id,
-            detalle={"monto": round(monto, 2),
-                     "fecha": entrada["fecha"],
-                     **({"metodo": entrada["metodo"]} if entrada["metodo"] else {}),
-                     "saldo_despues": cobro["saldo"] if cobro else None,
-                     "estado_despues": cobro["estado"] if cobro else None},
+            detalle={"antes": eliminado, "despues": entrada,
+                     "saldo_despues": cobro["saldo"] if cobro else None},
         )
     except Exception:
         pass
-    return {"ok": True, **_pago_payload(cobro, entrada)}
+    respuesta = {"ok": True, **_pago_payload(cobro)}
+    respuesta["abono"] = entrada
+    return respuesta
 
 
 def quitar_pago(tenant_id: str, cobro_id: str, indice: int) -> dict:

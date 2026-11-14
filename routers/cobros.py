@@ -13,7 +13,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 from dependencies import get_tenant_id
 from schemas.cobros import (
-    AbonoNuevo, CobroActualizar, CobroExtraNuevo, CuotaActualizar, CuotaNueva,
+    AbonoEditar, AbonoNuevo, CobroActualizar, CobroExtraNuevo, CuotaActualizar, CuotaNueva,
     GenerarPeriodo,
 )
 from database import cobros as db_cobros
@@ -154,11 +154,25 @@ def eliminar(cobro_id: str, tenant_id: str = Depends(get_tenant_id)):
 
 @router.post("/{cobro_id}/pagos")
 def abonar(cobro_id: str, data: AbonoNuevo, tenant_id: str = Depends(get_tenant_id)):
-    """Registra un abono (parcial o total) y recalcula saldo/estado al vuelo."""
+    """Registra un abono (parcial o total) y recalcula saldo/estado al vuelo.
+    Con cascada=true y cobro de cuenta: el excedente se reparte a los
+    siguientes cobros pendientes de la misma cuota (mig 081)."""
     resultado = db_cobros.agregar_pago(
         tenant_id, cobro_id, data.monto, metodo=data.metodo, fecha=data.fecha,
+        cascada=data.cascada,
     )
     _revisar(resultado, "Error al registrar el abono")
+    return resultado
+
+
+@router.patch("/{cobro_id}/pagos/{indice}")
+def editar_abono(cobro_id: str, indice: int, data: AbonoEditar, tenant_id: str = Depends(get_tenant_id)):
+    """Corrige un abono EN SU POSICIÓN del ledger (monto/metodo/fecha);
+    None = conservar el valor actual del abono."""
+    resultado = db_cobros.editar_pago(
+        tenant_id, cobro_id, indice, data.monto, metodo=data.metodo, fecha=data.fecha,
+    )
+    _revisar(resultado, "Error al editar el abono")
     return resultado
 
 

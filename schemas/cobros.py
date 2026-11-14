@@ -49,7 +49,20 @@ class CobroActualizar(BaseModel):
 
 class AbonoNuevo(BaseModel):
     """Dinero entrante (parcial o total). Append-only: el saldo se recalcula
-    en el backend; nunca se persiste el 'estado'.""" 
+    en el backend; nunca se persiste el 'estado'.
+    cascada (mig 081): si el monto excede el saldo del cobro y este pertenece
+    a una cuenta (cuota_id), el excedente se reparte a los SIGUIENTES cobros
+    pendientes de la misma cuota (orden por vencimiento). Sobrante final
+    (pagó más que toda la deuda) va al último cobro como sobrepago."""
+    monto  : float = Field(..., gt=0)
+    metodo : Optional[MetodoPago] = None
+    fecha  : Optional[date] = None
+    cascada: bool = False
+
+
+class AbonoEditar(BaseModel):
+    """Corrección de un abono ya registrado: lo reescribe EN SU POSICIÓN del
+    ledger (JSONB pagos). Para editar la fecha sin quitar y volver a poner."""
     monto  : float = Field(..., gt=0)
     metodo : Optional[MetodoPago] = None
     fecha  : Optional[date] = None
