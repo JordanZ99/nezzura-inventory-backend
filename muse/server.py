@@ -65,7 +65,11 @@ from muse.auth import (
     ver_costos_de_request,
 )
 
-# Nivel mínimo por tool (los 6 de catálogo + listar_productos son nivel 1).
+# Nivel mínimo por tool (buscar_productos, listar_productos, stock_actual,
+# listar_categorias y datos_para_publicar son nivel 1). Las fichas de detalle
+# viven SOLO en datos_para_publicar: obtener_producto y obtener_fotos_producto
+# se retiraron por redundantes (Muse las señalaba) y para no dejar dos vías
+# con reglas de privacidad distintas.
 _NIVEL_MINIMO = {
     "ventas_recientes": 2,
     "top_vendidos": 2,
@@ -109,10 +113,13 @@ servidor = ServidorMuse(
         "tienen el permiso 'ver costos': si una respuesta incluye campos de "
         "costo o margen, son datos internos del dueño — NUNCA los menciones "
         "en publicaciones, frente a compradores ni en el catálogo público; "
-        "datos_para_publicar nunca los incluye. Cuando el dueño pida "
-        "publicar un producto en Marketplace o redes sociales, obtén los "
-        "datos con estos tools en lugar de pedírselos: busca el producto, "
-        "luego usa datos_para_publicar con su id."
+        "datos_para_publicar nunca los incluye. Para VER el detalle de un "
+        "producto o PUBLICARLO, la única vía es datos_para_publicar con el "
+        "id que te dio la búsqueda o el listado: incluye ficha completa y "
+        "fotos en una llamada. Cuando el dueño pida publicar un producto en "
+        "Marketplace o redes sociales, obtén los datos con estos tools en "
+        "lugar de pedírselos: busca el producto, luego usa "
+        "datos_para_publicar con su id."
     ),
 )
 
@@ -203,47 +210,6 @@ def listar_productos(
 
 
 @servidor.tool(annotations=SOLO_LECTURA)
-def obtener_producto(producto_id: int) -> dict:
-    """Devuelve la ficha completa de un producto para publicarlo: nombre,
-    descripción, precio de venta al público, stock disponible, tamaño en cm,
-    categoría y variaciones (cada una con su precio y stock). Si la clave
-    tiene el permiso 'ver costos', incluye costo_unitario y margen (datos
-    internos: nunca los muestres a compradores ni en publicaciones)."""
-    tenant = tenant_de_request()
-    try:
-        ficha = cat.obtener_producto(
-            tenant, producto_id, con_costos=ver_costos_de_request()
-        )
-    except Exception as e:
-        return {"error": f"No se pudo obtener el producto: {e}"}
-    if ficha is None:
-        return {"error": f"No existe un producto físico activo con id {producto_id}."}
-    return ficha
-
-
-@servidor.tool(annotations=SOLO_LECTURA)
-def obtener_fotos_producto(producto_id: int) -> dict:
-    """Devuelve las URLs públicas de las fotos de un producto (foto principal
-    y galería, ordenadas, sin duplicados). Las URLs son de Cloudinary y se
-    pueden descargar directamente para adjuntarlas a una publicación."""
-    tenant = tenant_de_request()
-    try:
-        fotos = cat.obtener_fotos(tenant, producto_id)
-    except Exception as e:
-        return {"error": f"No se pudo obtener las fotos: {e}"}
-    if fotos is None:
-        return {"error": f"No existe un producto físico activo con id {producto_id}."}
-    if fotos["total"] == 0:
-        return {
-            "error": (
-                f"El producto {producto_id} no tiene fotos cargadas. "
-                "Pídele al dueño que le tome una foto."
-            )
-        }
-    return fotos
-
-
-@servidor.tool(annotations=SOLO_LECTURA)
 def stock_actual(producto_id: int | None = None, consulta: str | None = None) -> dict:
     """Devuelve el stock disponible actual de uno o varios productos: por id
     exacto o buscando por nombre, descripción o categoría (búsqueda tolerante:
@@ -274,10 +240,12 @@ def listar_categorias() -> dict:
 
 @servidor.tool(annotations=SOLO_LECTURA)
 def datos_para_publicar(producto_id: int) -> dict:
-    """Recomendado para publicar: agrega en UNA llamada todo lo necesario
-    para anunciar un producto en Marketplace o redes sociales — ficha
-    completa (nombre, descripción, precio de venta, stock, tamaño, categoría,
-    variaciones) más sus fotos. Nunca incluye costos internos."""
+    """Única vía para VER el detalle completo de un producto o PUBLICARLO:
+    agrega en UNA llamada todo lo necesario — ficha completa (nombre,
+    descripción, precio de venta, stock, tamaño, categoría, variaciones) más
+    sus fotos con URLs descargables. Nunca incluye costos internos (es el
+    canal público); el costo individual con permiso 'ver costos' se lee con
+    buscar_productos o listar_productos."""
     tenant = tenant_de_request()
     try:
         paquete = cat.datos_para_publicar(tenant, producto_id)

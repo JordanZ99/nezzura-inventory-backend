@@ -195,22 +195,21 @@ def buscar_productos(
     return resultado
 
 
-# ── Tool: obtener_producto ────────────────────────────────────────────────────
+# ── Ficha interna de datos_para_publicar ─────────────────────────────────────
+# obtener_producto y obtener_fotos NO son tools del MCP (se retiraron por
+# redundantes): son las funciones que datos_para_publicar compone en un solo
+# paquete. Al ser la única vía, el paquete es SIEMPRE público: jamás lleva
+# costos (el costo individual con permiso ver_costos se lee en
+# buscar_productos / listar_productos).
 
-def obtener_producto(
-    tenant_id: str, producto_id: int, con_costos: bool = False
-) -> dict | None:
-    """Ficha completa para publicar. None si no existe / no es del tenant.
-    con_costos: solo claves con permiso ver_costos (068). datos_para_publicar
-    llama a esta función SIN el flag: el paquete de publicación es público
-    y jamás lleva costos."""
-    campo_costo = f"{_COSTO_PROMEDIO} AS costo_unitario," if con_costos else ""
+def obtener_producto(tenant_id: str, producto_id: int) -> dict | None:
+    """Ficha completa del producto. None si no existe / no es del tenant.
+    Nunca incluye costos: es la base del paquete de publicación."""
     filas = query(
         f"""
         SELECT p.id, p.producto AS nombre, p.descripcion AS descripcion,
                p.sufijo_precio, p.tamano_cm,
                {_PRECIO_VENTA} AS precio_venta,
-               {campo_costo}
                COALESCE(SUM(l.Stock_Lote), 0) AS stock_disponible,
                {_CATEGORIAS}
         FROM productos p
@@ -261,14 +260,10 @@ def obtener_producto(
             for v in variaciones
         ],
     }
-    if con_costos:
-        costo = _num(fila.get("costo_unitario"))
-        ficha["costo_unitario"] = costo
-        ficha["margen"] = round(ficha["precio_venta"] - costo, 2)
     return ficha
 
 
-# ── Tool: obtener_fotos_producto ──────────────────────────────────────────────
+# ── Galería interna de datos_para_publicar ───────────────────────────────────
 
 def obtener_fotos(tenant_id: str, producto_id: int) -> dict | None:
     """
