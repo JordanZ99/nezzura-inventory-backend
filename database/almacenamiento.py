@@ -30,6 +30,7 @@
 import json
 
 from psycopg2.extras import RealDictCursor
+from psycopg2.errors import UndefinedColumn, UndefinedTable
 
 from database.conexion import get_conn, release_conn, query, execute
 
@@ -69,65 +70,138 @@ def _mensaje_lleno(usados: int, limite: int, plan: str, faltan: int, es_reemplaz
 
 # ── Lectura (medidor) ────────────────────────────────────────────────────────
 
-def _desglose_por_fuente(tenant_id: str) -> dict:
+# ── Desglose en 3 categorías (Imágenes / Datos / Historial) ──────────────────
+# El tenant no distingue foto principal de galería ni logo de banner: la
+# categoría "imagenes" abarca TODO lo de Cloudinary (es lo único que cuenta
+# en el límite). Datos e historial son ESTIMACIONES nocturnas cacheadas
+# (migración 073): prorrateamos el pg_total_relation_size de cada tabla por
+# la proporción de filas del tenant. Cacheadas para que /uso (poll de 60 s)
+# sea una lectura barata, no un cálculo pesado por request.
+
+_TABLAS_INFRA = {"storage_eventos", "tenant_storage", "storage_avisos", "schema_migrations"}
+
+_TABLAS_DATOS = {
+    "productos", "lotes", "clientes", "categorias", "gastos_categorias",
+    "producto_variaciones", "producto_imagenes", "producto_recetas",
+    "catalogo_config", "catalogo_publicado", "mesas", "terminales",
+    "dispositivos_licencia", "mcp_api_keys", "cuotas_clientes", "etiquetas",
+    "cliente_etiqueta", "post_config", "gastos_programados",
+}
+
+_TABLAS_HISTORIAL = {
+    "ventas", "gastos", "inventario_movimientos", "registro_actividad",
+    "crm_interacciones", "conteos", "conteo_items", "ordenes", "mesa_items",
+    "turnos", "puntos_movimientos", "cobros", "sync_log",
+}
+
+
+def _estimar_datos_historial(tenant_id: str, tablas: set[str]) -> dict:
+    """Por tabla clasificada: pg_total_relation_size × (filas del tenant /
+    filas totales). Solo tablas que existen y tienen columna tenant_id
+    (existe-check contra information_schema: las listas pueden nombrar tablas
+    de migraciones futuras)."""
+    tablas_validas = (_TABLAS_DATOS | _TABLAS_HISTORIAL) & tablas - _TABLAS_INFRA
+    resultado = {"datos": 0, "historial": 0}
+    for tabla in sorted(tablas_validas):
+        categoria = "datos" if tabla in _TABLAS_DATOS else "historial"
+        try:
+            filas = query(
+                f"SELECT pg_total_relation_size('{tabla}'::regclass) AS size, "
+                f"count(*) FILTER (WHERE tenant_id = %s) AS filas_tenant, "
+                f"count(*) AS filas_total FROM {tabla}",
+                (tenant_id,),
+            )
+            f = filas[0]
+            size = int(f["size"] or 0)
+            total = int(f["filas_total"] or 0)
+            del_tenant = int(f["filas_tenant"] or 0)
+            if size <= 0 or total <= 0 or del_tenant <= 0:
+                continue
+            resultado[categoria] += int(size * del_tenant / total)
+        except Exception as e:
+            print(f"Estimación: tabla {tabla} omitida ({e})")
+    return resultado
+
+
+def actualizar_estimaciones(tenant_id: str | None = None) -> dict:
     """
-    Peso activo agrupado por categoría (TEXTO, sin fotos): es el resumen que
-    ve el tenant por defecto en el gestor de espacio — el listado de fotos
-    solo carga bajo demanda al decidir liberar.
-    Categorías: principal, galería, variaciones, branding, catálogo publicado
-    y sin referencia (huérfanos). Prioridad en ese orden (la foto principal
-    vive también en la galería: se cuenta una sola vez).
+    Cron (nocturno): refresca datos_bytes / historial_bytes / sin_uso_bytes
+    de cada tenant en tenant_storage (migración 073).
+
+    sin_uso = peso de subidas activas del ledger cuya URL ya no se referencia
+    en NINGUNA tabla de NINGÚN tenant (los refs globales se calculan UNA vez
+    y se comparten entre todos los tenants de la corrida).
     """
-    eventos = query(
-        "SELECT url, MAX(bytes) AS bytes FROM storage_eventos "
-        "WHERE tenant_id = %s AND evento = 'upload' AND NOT liberado GROUP BY url",
-        (tenant_id,),
-    )
-    pesos = {ev["url"]: int(ev["bytes"] or 0) for ev in eventos}
-    if not pesos:
-        return {}
-
-    marcas = "%res.cloudinary.com%"
-    desglose = {
-        "principal": 0, "galeria": 0, "variaciones": 0,
-        "branding": 0, "catalogo": 0, "sin_referencia": 0,
-    }
-    asignadas: set[str] = set()
-
-    def _sumar(sql: str, params: tuple, columnas: tuple[str, ...], categoria: str) -> None:
-        for f in query(sql, params):
-            for col in columnas:
-                url = (f.get(col) or "").strip()
-                if url and url in pesos and url not in asignadas:
-                    desglose[categoria] += pesos[url]
-                    asignadas.add(url)
-
-    _sumar("SELECT Imagen AS u1 FROM productos WHERE tenant_id = %s AND Imagen LIKE %s",
-           (tenant_id, marcas), ("u1",), "principal")
-    _sumar("SELECT url AS u1 FROM producto_imagenes WHERE tenant_id = %s AND url LIKE %s",
-           (tenant_id, marcas), ("u1",), "galeria")
-    _sumar("SELECT foto AS u1 FROM producto_variaciones WHERE tenant_id = %s AND foto LIKE %s",
-           (tenant_id, marcas), ("u1",), "variaciones")
-    _sumar("SELECT logo AS u1 FROM tenants WHERE id = %s AND logo LIKE %s",
-           (tenant_id, marcas), ("u1",), "branding")
-    _sumar("SELECT banner_url AS u1, banner_url_movil AS u2, hero_url AS u3, hero_url_movil AS u4 "
-           "FROM catalogo_config WHERE tenant_id = %s",
-           (tenant_id,), ("u1", "u2", "u3", "u4"), "branding")
-    for f in query("SELECT data FROM catalogo_publicado WHERE tenant_id = %s", (tenant_id,)):
-        data = f.get("data")
-        if isinstance(data, str):
+    targets = [{"id": tenant_id}] if tenant_id else query("SELECT id FROM tenants")
+    refs_globales: set[str] | None = None
+    tablas = _tablas_con_tenant_id()
+    actualizados = 0
+    for t in targets:
+        tid = str(t["id"])
+        try:
+            if refs_globales is None:
+                refs_globales = urls_referenciadas(None)
+            datos_hist = _estimar_datos_historial(tid, tablas)
+            eventos = query(
+                "SELECT url, MAX(bytes) AS bytes FROM storage_eventos "
+                "WHERE tenant_id = %s AND evento = 'upload' AND NOT liberado GROUP BY url",
+                (tid,),
+            )
+            sin_uso = sum(
+                int(ev["bytes"] or 0)
+                for ev in eventos
+                if ev["url"] not in refs_globales
+            )
+            conn = get_conn()
             try:
-                data = json.loads(data)
-            except (TypeError, ValueError):
-                data = None
-        for url in _urls_cloudinary_en_json(data):
-            if url in pesos and url not in asignadas:
-                desglose["catalogo"] += pesos[url]
-                asignadas.add(url)
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO tenant_storage "
+                        "(tenant_id, datos_bytes, historial_bytes, sin_uso_bytes) "
+                        "VALUES (%s, %s, %s, %s) "
+                        "ON CONFLICT (tenant_id) DO UPDATE SET "
+                        "datos_bytes = EXCLUDED.datos_bytes, "
+                        "historial_bytes = EXCLUDED.historial_bytes, "
+                        "sin_uso_bytes = EXCLUDED.sin_uso_bytes, "
+                        "actualizado_en = now()",
+                        (tid, datos_hist["datos"], datos_hist["historial"], sin_uso),
+                    )
+                conn.commit()
+            except (UndefinedColumn, UndefinedTable):
+                # Migración 073 aún no aplicada (conn cruda no dispara el
+                # auto-heal de conexion.py): migrar y reintentar UNA vez.
+                conn.rollback()
+                from database.conexion import inicializar_db
+                inicializar_db()
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO tenant_storage "
+                        "(tenant_id, datos_bytes, historial_bytes, sin_uso_bytes) "
+                        "VALUES (%s, %s, %s, %s) "
+                        "ON CONFLICT (tenant_id) DO UPDATE SET "
+                        "datos_bytes = EXCLUDED.datos_bytes, "
+                        "historial_bytes = EXCLUDED.historial_bytes, "
+                        "sin_uso_bytes = EXCLUDED.sin_uso_bytes, "
+                        "actualizado_en = now()",
+                        (tid, datos_hist["datos"], datos_hist["historial"], sin_uso),
+                    )
+                conn.commit()
+            finally:
+                release_conn(conn)
+            actualizados += 1
+        except Exception as e:
+            print(f"Error estimando datos/historial de {tid}: {e}")
+    return {"ok": True, "actualizados": actualizados}
 
-    desglose["sin_referencia"] = sum(
-        b for url, b in pesos.items() if url not in asignadas)
-    return {k: v for k, v in desglose.items() if v > 0}
+
+def _tablas_con_tenant_id() -> set[str]:
+    """Tablas del schema public que tienen columna tenant_id (existe-check:
+    las listas de arriba pueden nombrar tablas de migraciones futuras)."""
+    filas = query(
+        "SELECT table_name FROM information_schema.columns "
+        "WHERE table_schema = 'public' AND column_name = 'tenant_id'"
+    )
+    return {f["table_name"] for f in filas}
 
 
 def uso_actual(tenant_id: str) -> dict:
@@ -152,6 +226,25 @@ def uso_actual(tenant_id: str) -> dict:
     f = filas[0]
     usados = int(f["bytes_usados"])
     limite = int(f["limite_bytes"])
+
+    # Desglose en 3 categorías (migración 073): "imagenes" es la MISMA cifra
+    # del límite; datos/historial son estimaciones nocturnas cacheadas (no
+    # ocupan el espacio de imágenes — el frontend lo aclara). "sin_uso"
+    # (huérfanas) solo aparece cuando existe: es la pista accionable.
+    desglose: dict = {"imagenes": usados}
+    fila_ts = query(
+        "SELECT datos_bytes, historial_bytes, sin_uso_bytes "
+        "FROM tenant_storage WHERE tenant_id = %s",
+        (tenant_id,),
+    )
+    if fila_ts:
+        if int(fila_ts[0]["datos_bytes"] or 0) > 0:
+            desglose["datos"] = int(fila_ts[0]["datos_bytes"])
+        if int(fila_ts[0]["historial_bytes"] or 0) > 0:
+            desglose["historial"] = int(fila_ts[0]["historial_bytes"])
+        if int(fila_ts[0]["sin_uso_bytes"] or 0) > 0:
+            desglose["sin_uso"] = int(fila_ts[0]["sin_uso_bytes"])
+
     return {
         "ok": True,
         "plan": f["plan"],
@@ -162,9 +255,7 @@ def uso_actual(tenant_id: str) -> dict:
         "porcentaje": round(usados / limite * 100, 1) if limite > 0 else 0.0,
         "quedan_bytes": max(0, limite - usados),
         "excedido": usados > limite,
-        # Resumen por categoría (texto, sin fotos): lo que ve el tenant de
-        # un vistazo — "Fotos de producto: 15 MB · Galería: 4 MB …"
-        "desglose": _desglose_por_fuente(tenant_id),
+        "desglose": desglose,
     }
 
 

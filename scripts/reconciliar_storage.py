@@ -24,7 +24,7 @@ from pathlib import Path
 # Permitir importar database.* corriendo desde backend/
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from database.almacenamiento import procesar_avisos, reconciliar  # noqa: E402
+from database.almacenamiento import actualizar_estimaciones, procesar_avisos, reconciliar  # noqa: E402
 from database.notificaciones import enviar_email, smtp_configurado  # noqa: E402
 
 MB = 1024 * 1024
@@ -76,6 +76,11 @@ def main() -> None:
           f"{len(corregidos)} corregidos.")
     for c in corregidos:
         print(f"  - {c['tenant_id'][:8]}…: {c['antes']} → {c['despues']} bytes")
+
+    # Estimaciones nocturnas de datos/historial/sin_uso (migración 073):
+    # se cachean en tenant_storage para que /uso siga siendo una lectura barata
+    estimaciones = actualizar_estimaciones()
+    print(f"Estimaciones datos/historial refrescadas: {estimaciones.get('actualizados')} tenants.")
 
     avisos = procesar_avisos()
     print(f"Avisos nuevos: {len(avisos)}.")
