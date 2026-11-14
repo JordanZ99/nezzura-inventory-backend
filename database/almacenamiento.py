@@ -224,37 +224,43 @@ def uso_actual(tenant_id: str) -> dict:
         return {"ok": False, "status": 422,
                 "mensaje": "Tu plan no está reconocido. Contacta a soporte."}
     f = filas[0]
-    usados = int(f["bytes_usados"])
+    usados_imagenes = int(f["bytes_usados"])
     limite = int(f["limite_bytes"])
 
-    # Desglose en 3 categorías (migración 073): "imagenes" es la MISMA cifra
-    # del límite; datos/historial son estimaciones nocturnas cacheadas (no
-    # ocupan el espacio de imágenes — el frontend lo aclara). "sin_uso"
-    # (huérfanas) solo aparece cuando existe: es la pista accionable.
-    desglose: dict = {"imagenes": usados}
+    # El límite es TOTAL (migración 073): imágenes (exactas, ledger) + datos
+    # e historial (estimaciones nocturnas cacheadas). bytes_usados expone el
+    # TOTAL — es lo que muestran la barra, "te quedan" y el bloqueo.
     fila_ts = query(
         "SELECT datos_bytes, historial_bytes, sin_uso_bytes "
         "FROM tenant_storage WHERE tenant_id = %s",
         (tenant_id,),
     )
-    if fila_ts:
-        if int(fila_ts[0]["datos_bytes"] or 0) > 0:
-            desglose["datos"] = int(fila_ts[0]["datos_bytes"])
-        if int(fila_ts[0]["historial_bytes"] or 0) > 0:
-            desglose["historial"] = int(fila_ts[0]["historial_bytes"])
-        if int(fila_ts[0]["sin_uso_bytes"] or 0) > 0:
-            desglose["sin_uso"] = int(fila_ts[0]["sin_uso_bytes"])
+    datos = int(fila_ts[0]["datos_bytes"] or 0) if fila_ts else 0
+    historial = int(fila_ts[0]["historial_bytes"] or 0) if fila_ts else 0
+    sin_uso = int(fila_ts[0]["sin_uso_bytes"] or 0) if fila_ts else 0
+    total = usados_imagenes + datos + historial
+
+    # Desglose: "sin_uso" (huérfanas) solo aparece cuando existe — es la
+    # pista accionable dentro del chip de Imágenes.
+    desglose: dict = {"imagenes": usados_imagenes}
+    if datos > 0:
+        desglose["datos"] = datos
+    if historial > 0:
+        desglose["historial"] = historial
+    if sin_uso > 0:
+        desglose["sin_uso"] = sin_uso
 
     return {
         "ok": True,
         "plan": f["plan"],
         "nombre": f["nombre"],
         "limite_bytes": limite,
-        "bytes_usados": usados,
+        "bytes_usados": total,
+        "bytes_imagenes": usados_imagenes,
         "bytes_reales": int(f["bytes_reales"]),
-        "porcentaje": round(usados / limite * 100, 1) if limite > 0 else 0.0,
-        "quedan_bytes": max(0, limite - usados),
-        "excedido": usados > limite,
+        "porcentaje": round(total / limite * 100, 1) if limite > 0 else 0.0,
+        "quedan_bytes": max(0, limite - total),
+        "excedido": total > limite,
         "desglose": desglose,
     }
 
@@ -292,7 +298,8 @@ def reservar(tenant_id: str, bytes_nuevos: int, url_a_reemplazar: str | None = N
             )
             # Lock del contador + límite del plan ACTUAL (JOIN)
             cur.execute(
-                "SELECT s.bytes_usados, p.limite_bytes, p.nombre AS plan_nombre "
+                "SELECT s.bytes_usados, s.datos_bytes, s.historial_bytes, "
+                "p.limite_bytes, p.nombre AS plan_nombre "
                 "FROM tenant_storage s "
                 "JOIN tenants t ON t.id = s.tenant_id "
                 "JOIN planes_config p ON p.plan = t.plan "
@@ -308,6 +315,11 @@ def reservar(tenant_id: str, bytes_nuevos: int, url_a_reemplazar: str | None = N
             usados = int(fila["bytes_usados"])
             limite = int(fila["limite_bytes"])
             plan_nombre = fila["plan_nombre"]
+            # El límite es TOTAL (migración 073): imágenes + datos + historial.
+            # bytes_usados guarda solo la parte de imágenes (exacta, ledger);
+            # datos/historial son las estimaciones nocturnas cacheadas.
+            otros = int(fila["datos_bytes"] or 0) + int(fila["historial_bytes"] or 0)
+            total_antes = usados + otros
 
             # Crédito de reemplazo: el peso del asset que sale
             bytes_viejos = 0
@@ -327,8 +339,8 @@ def reservar(tenant_id: str, bytes_nuevos: int, url_a_reemplazar: str | None = N
                     bytes_viejos = int(ev["bytes"] or 0)
                     evento_viejo_id = ev["id"]
 
-            despues = usados + bytes_nuevos - bytes_viejos
-            if despues > limite:
+            total_despues = total_antes + bytes_nuevos - bytes_viejos
+            if total_despues > limite:
                 conn.rollback()
                 return {
                     "ok": False,
@@ -336,17 +348,18 @@ def reservar(tenant_id: str, bytes_nuevos: int, url_a_reemplazar: str | None = N
                     "codigo": "CUOTA_LLENA",
                     "plan": plan_nombre,
                     "limite_bytes": limite,
-                    "bytes_usados": usados,
-                    "quedan_bytes": max(0, limite - usados),
-                    "excedente_bytes": max(0, despues - limite),
+                    "bytes_usados": total_antes,
+                    "quedan_bytes": max(0, limite - total_antes),
+                    "excedente_bytes": max(0, total_despues - limite),
                     "mensaje": _mensaje_lleno(
-                        usados, limite, plan_nombre,
-                        max(0, bytes_nuevos - max(0, limite - usados)),
+                        total_antes, limite, plan_nombre,
+                        max(0, bytes_nuevos - max(0, limite - total_antes)),
                         es_reemplazo=bool(bytes_viejos),
                     ),
                 }
 
-            nuevo_uso = max(0, despues)
+            # El contador de imágenes guarda solo la parte de imágenes
+            nuevo_uso = max(0, usados + bytes_nuevos - bytes_viejos)
             cur.execute(
                 "UPDATE tenant_storage SET bytes_usados = %s, actualizado_en = now() "
                 "WHERE tenant_id = %s",
@@ -367,7 +380,7 @@ def reservar(tenant_id: str, bytes_nuevos: int, url_a_reemplazar: str | None = N
                     (tenant_id, url_vieja, bytes_viejos,
                      "Reemplazo: crédito ejercido en reservar()"),
                 )
-            aviso = _cruce_umbral(usados, nuevo_uso, limite)
+            aviso = _cruce_umbral(total_antes, total_despues, limite)
         conn.commit()
         return {"ok": True, "aviso": aviso}
     except Exception as e:
@@ -830,7 +843,8 @@ def procesar_avisos(tenant_id: str | None = None) -> list[dict]:
     """
     sql = (
         "SELECT t.id, t.empresa, t.correo, p.nombre AS plan, p.limite_bytes, "
-        "COALESCE(s.bytes_usados, 0) AS bytes_usados "
+        "COALESCE(s.bytes_usados, 0) + COALESCE(s.datos_bytes, 0) "
+        "+ COALESCE(s.historial_bytes, 0) AS bytes_usados "
         "FROM tenants t "
         "JOIN planes_config p ON p.plan = t.plan "
         "LEFT JOIN tenant_storage s ON s.tenant_id = t.id"
