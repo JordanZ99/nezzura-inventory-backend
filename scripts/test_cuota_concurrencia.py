@@ -29,8 +29,6 @@ from database.almacenamiento import (  # noqa: E402
 )
 
 MB = 1024 * 1024
-CHUNK = 600 * MB   # 600 MB × 2 > 1 GB del plan básico → solo cabe UNO
-LIMITE = 1073741824  # 1 GB (plan básico)
 
 fallos: list[str] = []
 
@@ -56,6 +54,19 @@ def main() -> None:
     except Exception as e:
         print(f"❌ No se pudo crear el tenant de prueba (¿columna NOT NULL sin default?): {e}")
         sys.exit(1)
+
+    # Límite leído EN VIVO de planes_config: el test funciona con el límite
+    # que sea (500 MB hoy, 1 GB mañana) sin mantenimiento.
+    fila_limite = query(
+        "SELECT p.limite_bytes FROM tenants t "
+        "JOIN planes_config p ON p.plan = t.plan WHERE t.id = %s",
+        (tid,),
+    )
+    LIMITE = int(fila_limite[0]["limite_bytes"])
+    CHUNK = int(LIMITE * 0.6)   # 0.6×LIMITE × 2 > LIMITE → solo cabe UNO
+    MITAD = LIMITE // 2
+    print(f"Límite del plan básico: {LIMITE / MB:.0f} MB "
+          f"(chunk de carrera: {CHUNK / MB:.0f} MB, mitad: {MITAD / MB:.0f} MB)")
 
     try:
         # ── Test 1: carrera de reservas simultáneas ─────────────────────────
@@ -104,12 +115,12 @@ def main() -> None:
 
         # ── Test 4: crédito de reemplazo ────────────────────────────────────
         print("\n[Test 4] Crédito de reemplazo 1:1:")
-        # Estado simulado: cupo a tope (1024 MB) + una foto de 500 MB activa
-        # en el ledger (la que se va a reemplazar)
-        confirmar(tid, url_falsa, 500 * MB, 500 * MB, "test")
-        # Reemplazar la foto de 500 MB por OTRA de 500 MB al tope: el crédito
+        # Estado simulado: cupo a tope + una foto de MITAD activa en el
+        # ledger (la que se va a reemplazar)
+        confirmar(tid, url_falsa, MITAD, MITAD, "test")
+        # Reemplazar la foto de MITAD por OTRA de MITAD al tope: el crédito
         # la neutraliza → pasa (el peso neto no crece)
-        r = reservar(tid, 500 * MB, url_a_reemplazar=url_falsa)
+        r = reservar(tid, MITAD, url_a_reemplazar=url_falsa)
         assert_ok(r.get("ok"), "reemplazo al tope pasa con el crédito (neto no crece)")
         ev = query(
             "SELECT liberado FROM storage_eventos WHERE tenant_id = %s AND url = %s "
@@ -121,7 +132,7 @@ def main() -> None:
         assert_ok(r2.get("ok") and r2.get("bytes_liberados", 0) == 0,
                   "liberar_url es idempotente (la foto ya estaba liberada)")
         # Sin crédito (la foto ya está liberada): la misma subida se BLOQUEA
-        r3 = reservar(tid, 500 * MB, url_a_reemplazar=url_falsa)
+        r3 = reservar(tid, MITAD, url_a_reemplazar=url_falsa)
         assert_ok(not r3.get("ok"), "la misma subida SIN crédito se bloquea (el crédito se consumió)")
 
         print("\n" + ("[OK] TEST COMPLETO: todas las aserciones pasaron"
