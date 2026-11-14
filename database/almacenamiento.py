@@ -69,6 +69,67 @@ def _mensaje_lleno(usados: int, limite: int, plan: str, faltan: int, es_reemplaz
 
 # ── Lectura (medidor) ────────────────────────────────────────────────────────
 
+def _desglose_por_fuente(tenant_id: str) -> dict:
+    """
+    Peso activo agrupado por categoría (TEXTO, sin fotos): es el resumen que
+    ve el tenant por defecto en el gestor de espacio — el listado de fotos
+    solo carga bajo demanda al decidir liberar.
+    Categorías: principal, galería, variaciones, branding, catálogo publicado
+    y sin referencia (huérfanos). Prioridad en ese orden (la foto principal
+    vive también en la galería: se cuenta una sola vez).
+    """
+    eventos = query(
+        "SELECT url, MAX(bytes) AS bytes FROM storage_eventos "
+        "WHERE tenant_id = %s AND evento = 'upload' AND NOT liberado GROUP BY url",
+        (tenant_id,),
+    )
+    pesos = {ev["url"]: int(ev["bytes"] or 0) for ev in eventos}
+    if not pesos:
+        return {}
+
+    marcas = "%res.cloudinary.com%"
+    desglose = {
+        "principal": 0, "galeria": 0, "variaciones": 0,
+        "branding": 0, "catalogo": 0, "sin_referencia": 0,
+    }
+    asignadas: set[str] = set()
+
+    def _sumar(sql: str, params: tuple, columnas: tuple[str, ...], categoria: str) -> None:
+        for f in query(sql, params):
+            for col in columnas:
+                url = (f.get(col) or "").strip()
+                if url and url in pesos and url not in asignadas:
+                    desglose[categoria] += pesos[url]
+                    asignadas.add(url)
+
+    _sumar("SELECT Imagen AS u1 FROM productos WHERE tenant_id = %s AND Imagen LIKE %s",
+           (tenant_id, marcas), ("u1",), "principal")
+    _sumar("SELECT url AS u1 FROM producto_imagenes WHERE tenant_id = %s AND url LIKE %s",
+           (tenant_id, marcas), ("u1",), "galeria")
+    _sumar("SELECT foto AS u1 FROM producto_variaciones WHERE tenant_id = %s AND foto LIKE %s",
+           (tenant_id, marcas), ("u1",), "variaciones")
+    _sumar("SELECT logo AS u1 FROM tenants WHERE id = %s AND logo LIKE %s",
+           (tenant_id, marcas), ("u1",), "branding")
+    _sumar("SELECT banner_url AS u1, banner_url_movil AS u2, hero_url AS u3, hero_url_movil AS u4 "
+           "FROM catalogo_config WHERE tenant_id = %s",
+           (tenant_id,), ("u1", "u2", "u3", "u4"), "branding")
+    for f in query("SELECT data FROM catalogo_publicado WHERE tenant_id = %s", (tenant_id,)):
+        data = f.get("data")
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except (TypeError, ValueError):
+                data = None
+        for url in _urls_cloudinary_en_json(data):
+            if url in pesos and url not in asignadas:
+                desglose["catalogo"] += pesos[url]
+                asignadas.add(url)
+
+    desglose["sin_referencia"] = sum(
+        b for url, b in pesos.items() if url not in asignadas)
+    return {k: v for k, v in desglose.items() if v > 0}
+
+
 def uso_actual(tenant_id: str) -> dict:
     """
     Estado del medidor para el frontend (StorageMeter / pre-check de subida).
@@ -101,6 +162,9 @@ def uso_actual(tenant_id: str) -> dict:
         "porcentaje": round(usados / limite * 100, 1) if limite > 0 else 0.0,
         "quedan_bytes": max(0, limite - usados),
         "excedido": usados > limite,
+        # Resumen por categoría (texto, sin fotos): lo que ve el tenant de
+        # un vistazo — "Fotos de producto: 15 MB · Galería: 4 MB …"
+        "desglose": _desglose_por_fuente(tenant_id),
     }
 
 

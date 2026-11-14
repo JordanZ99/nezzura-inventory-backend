@@ -49,7 +49,7 @@ def main() -> None:
 
     huerfanos = detectar_huerfanos(args.tenant)
     if not huerfanos:
-        print("Sin huérfanos: todas las subidas activas del ledger están referenciadas. ✓")
+        print("Sin huerfanos: todas las subidas activas del ledger estan referenciadas. [OK]")
         return
 
     ahora = datetime.now(timezone.utc)
@@ -85,7 +85,7 @@ def main() -> None:
         destruidos += 1
         liberados_bytes += int(h["bytes"] or 0)
 
-    print(f"\n✔ {destruidos} huérfanos destruidos, "
+    print(f"\n[OK] {destruidos} huerfanos destruidos, "
           f"{liberados_bytes / MB:.1f} MB liberados del medidor y del proveedor.")
 
 

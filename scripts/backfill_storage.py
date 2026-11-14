@@ -56,33 +56,39 @@ GB = 1073741824
 
 def cargar_urls_por_tenant(tenant_id: str | None = None) -> dict[str, set[str]]:
     """URLs de Cloudinary en uso por tenant (DISTINCT, dedupe dentro del tenant)."""
-    params_extra = "AND t.id = %s" if tenant_id else ""
-    params = (tenant_id,) if tenant_id else ()
+    marcas = "%res.cloudinary.com%"
+    # Cada rama del UNION trae su LIKE %s; con filtro de tenant, además su id
+    if tenant_id:
+        filtro = " AND t.id = %s"
+        params = (marcas, tenant_id) * 8
+    else:
+        filtro = ""
+        params = (marcas,) * 8
     filas = query(
         "SELECT t.id AS tenant_id, p.Imagen AS url "
         "FROM tenants t JOIN productos p ON p.tenant_id = t.id "
-        "WHERE p.Imagen LIKE %s " + params_extra +
+        "WHERE p.Imagen LIKE %s" + filtro +
         " UNION SELECT t.id, pi.url "
         "FROM tenants t JOIN producto_imagenes pi ON pi.tenant_id = t.id "
-        "WHERE pi.url LIKE %s " + params_extra +
+        "WHERE pi.url LIKE %s" + filtro +
         " UNION SELECT t.id, pv.foto "
         "FROM tenants t JOIN producto_variaciones pv ON pv.tenant_id = t.id "
-        "WHERE pv.foto LIKE %s " + params_extra +
+        "WHERE pv.foto LIKE %s" + filtro +
         " UNION SELECT t.id, t.logo "
-        "FROM tenants t WHERE t.logo LIKE %s " + params_extra +
+        "FROM tenants t WHERE t.logo LIKE %s" + filtro +
         " UNION SELECT t.id, cc.banner_url "
         "FROM tenants t JOIN catalogo_config cc ON cc.tenant_id = t.id "
-        "WHERE cc.banner_url LIKE %s " + params_extra +
+        "WHERE cc.banner_url LIKE %s" + filtro +
         " UNION SELECT t.id, cc.banner_url_movil "
         "FROM tenants t JOIN catalogo_config cc ON cc.tenant_id = t.id "
-        "WHERE cc.banner_url_movil LIKE %s " + params_extra +
+        "WHERE cc.banner_url_movil LIKE %s" + filtro +
         " UNION SELECT t.id, cc.hero_url "
         "FROM tenants t JOIN catalogo_config cc ON cc.tenant_id = t.id "
-        "WHERE cc.hero_url LIKE %s " + params_extra +
+        "WHERE cc.hero_url LIKE %s" + filtro +
         " UNION SELECT t.id, cc.hero_url_movil "
         "FROM tenants t JOIN catalogo_config cc ON cc.tenant_id = t.id "
-        "WHERE cc.hero_url_movil LIKE %s " + params_extra,
-        params + params + params + params + params + params + params + params,
+        "WHERE cc.hero_url_movil LIKE %s" + filtro,
+        params,
     )
     urls: dict[str, set[str]] = {}
     for fila in filas:
@@ -256,7 +262,7 @@ def main() -> None:
         if not args.apply:
             continue
         sembrar(tid, sembradas)
-        print("  ✔ Sembrado.")
+        print("  [OK] Sembrado.")
 
     if not args.apply:
         print("\n(Dry-run: no se escribió nada. Pasa --apply para sembrar.)")

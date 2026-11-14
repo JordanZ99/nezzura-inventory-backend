@@ -37,10 +37,10 @@ fallos: list[str] = []
 
 def assert_ok(condicion: bool, mensaje: str) -> None:
     if condicion:
-        print(f"  ✓ {mensaje}")
+        print(f"  [OK] {mensaje}")
     else:
         fallos.append(mensaje)
-        print(f"  ✗ FALLO: {mensaje}")
+        print(f"  [FALLO] {mensaje}")
 
 
 def main() -> None:
@@ -124,8 +124,8 @@ def main() -> None:
         r3 = reservar(tid, 500 * MB, url_a_reemplazar=url_falsa)
         assert_ok(not r3.get("ok"), "la misma subida SIN crédito se bloquea (el crédito se consumió)")
 
-        print("\n" + ("✅ TEST COMPLETO: todas las aserciones pasaron"
-                      if not fallos else f"❌ {len(fallos)} aserciones FALLARON"))
+        print("\n" + ("[OK] TEST COMPLETO: todas las aserciones pasaron"
+                      if not fallos else f"[ERROR] {len(fallos)} aserciones FALLARON"))
         if fallos:
             sys.exit(2)
     finally:
