@@ -15,9 +15,12 @@
 #                           (resumen_negocio, hallazgos_inteligentes). Agregados
 #                           sí, costos unitarios nunca. Requiere plan Plus.
 #   3 "Escritura básica"  → + crear productos con patrón borrador→confirmar
-#                           (proponer_producto, confirmar_producto). La
-#                           confirmación es destructiveHint: Muse debe pedir
-#                           aprobación humana en cada llamada, y cada alta
+#                           (proponer_producto, confirmar_producto), editar
+#                           productos/ventas/gastos (proponer_edicion,
+#                           confirmar_edicion) y adjuntar imágenes a productos
+#                           (adjuntar_imagen). Las confirmaciones y la subida
+#                           de imagen son destructiveHint: Muse debe pedir
+#                           aprobación humana en cada llamada, y cada acción
 #                           queda en el Historial como hecha por el agente.
 #
 # Modo del transporte:
@@ -55,6 +58,7 @@ from database import mcp_analisis
 from database import mcp_borradores
 from database import mcp_catalogo as cat
 from database import mcp_escritura
+from database import mcp_imagenes
 from database import mcp_ventas
 from database.mcp_claves import contar_escritura
 from muse.auth import (
@@ -79,6 +83,7 @@ _NIVEL_MINIMO = {
     "confirmar_producto": 3,
     "proponer_edicion": 3,
     "confirmar_edicion": 3,
+    "adjuntar_imagen": 3,
 }
 
 
@@ -109,7 +114,10 @@ servidor = ServidorMuse(
         "nivel 3 pueden además crear productos nuevos y EDITAR productos, "
         "ventas y gastos, SIEMPRE con proponer_* primero y confirmar_* "
         "después (borrador que el dueño revisa; cada cambio queda en el "
-        "Historial del gestor como hecho por el agente IA). Algunas claves "
+        "Historial del gestor como hecho por el agente IA), y adjuntar "
+        "IMÁGENES a productos con adjuntar_imagen: si tienes la foto de un "
+        "producto como archivo/base64, esa es la vía — el gestor la reduce de "
+        "peso y la hospeda (destino 'principal' o 'galeria'). Algunas claves "
         "tienen el permiso 'ver costos': si una respuesta incluye campos de "
         "costo o margen, son datos internos del dueño — NUNCA los menciones "
         "en publicaciones, frente a compradores ni en el catálogo público; "
@@ -395,7 +403,9 @@ def proponer_producto(
     Reglas: solo productos físicos; si defines variaciones [{nombre, precio,
     stock_inicial, costo}], el stock general debe ir en cada variación, no en
     'stock'. El costo es interno y solo se usa para el lote: nunca lo cites
-    al público."""
+    al público. El campo 'imagen' solo acepta una URL pública http(s); si
+    tienes la foto como archivo/base64, crea primero el producto y luego
+    adjúntala con adjuntar_imagen."""
     nivel = _requiere_nivel(3)
     if nivel:
         return nivel
@@ -474,7 +484,7 @@ def proponer_edicion(
       precio_venta, estado ('Activo'/'Inactivo'), visible_en_catalogo,
       tamano_cm, codigo_interno, codigo_barras, ubicacion, categoria (lista
       de hasta 5). El campo 'costo' solo si la clave tiene permiso 'ver
-      costos'. NO se puede editar la imagen.
+      costos'. Para agregar o cambiar la FOTO usa la herramienta adjuntar_imagen.
     - tipo 'venta' (id de la venta): fecha ('2026-11-12 15:30'), cantidad
       (>0) y precio_real. Los totales y el stock se recalculan solos.
     - tipo 'gasto' (id del gasto): monto, categoria, descripcion.
@@ -526,6 +536,49 @@ def confirmar_edicion(borrador_id: str) -> dict:
             )
         }
     return mcp_escritura.confirmar_edicion(tenant, datos)
+
+
+# ── Nivel 3: IMÁGENES (efecto directo, con cuota de escrituras) ───────────────
+# Adjuntar una foto no corrompe datos de negocio como crear/editar producto,
+# así que NO pasa por borrador→confirmar: se aplica directo, cuenta para la
+# cuota de escrituras del día y queda en el Historial como hecho por el agente.
+# El pipeline es el MISMO del gestor (reductor de peso + Cloudinary + cuota de
+# almacenamiento): la imagen entra como base64 y sale hospedada en el CDN.
+
+@servidor.tool(annotations=CONFIRMACION)
+def adjuntar_imagen(producto_id: int, imagen_base64: str, destino: str = "principal") -> dict:
+    """Adjunta una IMAGEN a un producto del inventario (requiere clave nivel 3).
+    Úsala SIEMPRE que tengas una foto de un producto como archivo/base64, sea
+    para un producto recién creado o para cambiar/agregar la foto de uno que
+    ya existe — es la única vía para fotos que no son una URL pública.
+    Parámetros:
+    - producto_id: id del producto (el que devuelven buscar/listar o
+      confirmar_producto).
+    - imagen_base64: el archivo de la imagen codificado en base64 (acepta
+      también la data URL 'data:image/...;base64,...'). El gestor la reduce de
+      peso automáticamente, no hace falta comprimirla antes.
+    - destino: 'principal' (default: reemplaza la foto principal) o 'galeria'
+      (agrega una foto extra al carrusel; requiere plan Plus y el producto no
+      puede superar las 5 fotos).
+    Efecto inmediato: la foto queda en el producto en esta misma llamada y en
+    el Historial del gestor como adjuntada por el agente IA. Cuenta para la
+    cuota diaria de escrituras de la clave."""
+    nivel = _requiere_nivel(3)
+    if nivel:
+        return nivel
+    tenant = tenant_de_request()
+    if not contar_escritura(clave_de_request()):
+        return {
+            "error": (
+                "Límite diario de escrituras alcanzado para esta clave. "
+                "El dueño puede ajustarla en Ajustes → Negocio → Conectar mi IA."
+            )
+        }
+    try:
+        return mcp_imagenes.adjuntar(tenant, producto_id, imagen_base64, destino)
+    except Exception as e:
+        print(f"[MCP] adjuntar_imagen fallo: {type(e).__name__}: {e}")
+        return {"error": f"No se pudo adjuntar la imagen: {e}"}
 
 
 # ── App ASGI: streamable HTTP + middleware de API key ────────────────────────
