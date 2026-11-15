@@ -39,12 +39,15 @@ class CobroExtraNuevo(BaseModel):
 
 class CobroActualizar(BaseModel):
     """Edición de deuda. pagos NO se edita aquí: es ledger (solo alta/baja de
-    abonos vía /pagos). vencimiento: None = sin cambio, '' = quitar la fecha."""
-    concepto    : Optional[str] = None
-    monto       : Optional[float] = Field(None, gt=0)
-    vencimiento : Optional[Union[date, Literal[""]]] = None
-    programa    : Optional[list[EntradaPrograma]] = None
-    notas       : Optional[str] = None
+    abonos vía /pagos). vencimiento: None = sin cambio, '' = quitar la fecha.
+    promesa_fecha (mig 080): None = sin cambio, '' = quitar la promesa,
+    date = fijar 'me dijo que paga ese día' (pausa recordatorios)."""
+    concepto     : Optional[str] = None
+    monto        : Optional[float] = Field(None, gt=0)
+    vencimiento  : Optional[Union[date, Literal[""]]] = None
+    promesa_fecha: Optional[Union[date, Literal[""]]] = None
+    programa     : Optional[list[EntradaPrograma]] = None
+    notas        : Optional[str] = None
 
 
 class AbonoNuevo(BaseModel):

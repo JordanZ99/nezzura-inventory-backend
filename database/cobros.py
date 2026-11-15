@@ -31,6 +31,7 @@ _SELECT = """
 SELECT b.id, b.tenant_id, b.cliente_id, b.cuota_id, b.origen, b.concepto,
        b.periodo, b.monto, b.vencimiento, b.programa, b.notas, b.pagos, b.creado_en,
        b.interes_cargado,
+       b.promesa_fecha, b.ultimo_recordatorio,
        cl.nombre AS cliente_nombre,
        cl.telefono AS cliente_telefono,
        cl.email AS cliente_email,
@@ -99,6 +100,10 @@ def _derivar(fila: dict, cfg_moratorios: dict | None = None) -> dict:
             moratorios = max(0.0, round(calculado, 2) - cargado)
     fila["moratorios"] = round(moratorios, 2)
     fila["total_con_moratorios"] = round(fila["saldo"] + moratorios, 2)
+
+    # Promesa de pago (mig 080): "me dijo que paga el viernes".
+    promesa = fila.get("promesa_fecha")
+    fila["promesa_fecha"] = promesa.isoformat() if hasattr(promesa, "isoformat") else promesa
     return fila
 
 
@@ -436,6 +441,7 @@ def actualizar_cobro(
     tenant_id: str, cobro_id: str,
     concepto: str | None = None, monto: float | None = None,
     vencimiento=None, programa=None, notas: str | None = None,
+    promesa_fecha=None,
 ) -> dict:
     """Edición de deuda: concepto, monto, vencimiento, plan y notas.
     `pagos` NO se toca aquí: el dinero entra SOLO por agregar_pago/quitar_pago."""
@@ -463,6 +469,12 @@ def actualizar_cobro(
         sets.append("vencimiento = %s")
         params.append(None if vencimiento == "" else vencimiento)
 
+    if promesa_fecha is not None:
+        # Promesa de pago (mig 080): '' = quitarla; fecha = fijarla. Los
+        # recordatorios automáticos se pausan mientras esté vigente.
+        sets.append("promesa_fecha = %s")
+        params.append(None if promesa_fecha == "" else promesa_fecha)
+
     if programa is not None:
         programa_n, error = _validar_programa(programa)
         if error:
@@ -489,6 +501,11 @@ def actualizar_cobro(
                 nueva_venc = None if vencimiento == "" else str(vencimiento)[:10]
                 if vieja_venc != nueva_venc:
                     diff["vencimiento"] = [vieja_venc, nueva_venc]
+            if promesa_fecha is not None:
+                vieja_prom = str(actual["promesa_fecha"])[:10] if actual.get("promesa_fecha") else None
+                nueva_prom = None if promesa_fecha == "" else str(promesa_fecha)[:10]
+                if vieja_prom != nueva_prom:
+                    diff["promesa"] = [vieja_prom, nueva_prom]
             if notas is not None:
                 viejas_notas = actual.get("notas") or None
                 nuevas_notas = (notas or "").strip() or None

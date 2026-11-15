@@ -139,7 +139,7 @@ def actualizar(cobro_id: str, data: CobroActualizar, tenant_id: str = Depends(ge
     resultado = db_cobros.actualizar_cobro(
         tenant_id, cobro_id,
         concepto=data.concepto, monto=data.monto, vencimiento=data.vencimiento,
-        programa=data.programa, notas=data.notas,
+        promesa_fecha=data.promesa_fecha, programa=data.programa, notas=data.notas,
     )
     _revisar(resultado, "Error al actualizar el cobro")
     return resultado
