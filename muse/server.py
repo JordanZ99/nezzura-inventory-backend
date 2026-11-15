@@ -546,7 +546,10 @@ def confirmar_edicion(borrador_id: str) -> dict:
 # almacenamiento): la imagen entra como base64 y sale hospedada en el CDN.
 
 @servidor.tool(annotations=CONFIRMACION)
-def adjuntar_imagen(producto_id: int, imagen_base64: str, destino: str = "principal") -> dict:
+def adjuntar_imagen(
+    producto_id: int, imagen_base64: str, destino: str = "principal",
+    encaje: str = "marco", fondo: str = "blanco",
+) -> dict:
     """Adjunta una IMAGEN a un producto del inventario (requiere clave nivel 3).
     Úsala SIEMPRE que tengas una foto de un producto como archivo/base64, sea
     para un producto recién creado o para cambiar/agregar la foto de uno que
@@ -560,6 +563,13 @@ def adjuntar_imagen(producto_id: int, imagen_base64: str, destino: str = "princi
     - destino: 'principal' (default: reemplaza la foto principal) o 'galeria'
       (agrega una foto extra al carrusel; requiere plan Plus y el producto no
       puede superar las 5 fotos).
+    - encaje: 'marco' (default: la imagen COMPLETA rellenando el lado corto
+      hasta la proporción del catálogo del negocio — RECOMENDADO para que la
+      foto llene la tarjeta del catálogo sin franjas), 'recorte' (llena el
+      marco recortando el centro; solo si el producto ocupa toda la escena) o
+      'libre' (sin marco, tal cual).
+    - fondo: color del relleno del marco: 'blanco' (default), 'negro' o
+      'rojo'. Solo aplica con encaje 'marco'.
     Efecto inmediato: la foto queda en el producto en esta misma llamada y en
     el Historial del gestor como adjuntada por el agente IA. Cuenta para la
     cuota diaria de escrituras de la clave."""
@@ -575,7 +585,9 @@ def adjuntar_imagen(producto_id: int, imagen_base64: str, destino: str = "princi
             )
         }
     try:
-        return mcp_imagenes.adjuntar(tenant, producto_id, imagen_base64, destino)
+        return mcp_imagenes.adjuntar(
+            tenant, producto_id, imagen_base64, destino, encaje, fondo
+        )
     except Exception as e:
         print(f"[MCP] adjuntar_imagen fallo: {type(e).__name__}: {e}")
         return {"error": f"No se pudo adjuntar la imagen: {e}"}
