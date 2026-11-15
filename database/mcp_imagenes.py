@@ -28,7 +28,11 @@ import re
 
 from database.actividad import registrar_actividad
 from database.conexion import query
-from database.imagenes import subir_foto, subir_imagen_extra
+from database.imagenes import (
+    asignar_foto_principal,
+    subir_foto,
+    subir_imagen_extra,
+)
 
 # Límite de ENTRADA (bytes decodificados): las fotos de agentes suelen pesar
 # 1-2 MB; 10 MB ya es abuso y protege la memoria del server (Render).
@@ -132,6 +136,13 @@ def adjuntar(tenant_id: str, producto_id: int, imagen_b64, destino: str) -> dict
       - 'principal' → reemplaza/asigna la foto principal (productos.imagen).
       - 'galeria'   → agrega una imagen extra (plan Plus, máx. 5 fotos).
     Devuelve dicts tipo MCP: {...} en éxito o {"error": ...}.
+
+    'principal' replica el flujo humano COMPLETO (upload + PATCH): subir_foto
+    solo manda la imagen a Cloudinary y devuelve la ruta — quien guarda la URL
+    en productos.imagen y sincroniza la galería es asignar_foto_principal.
+    Sin ese paso la foto quedaba huérfana en Cloudinary y la primera imagen
+    de galería terminaba tomando el slot 1 y pisando la principal (bug de la
+    Kuromi: 'la de frente se volvió la principal y la de estudio se perdió').
     """
     try:
         producto_id = int(producto_id)
@@ -162,6 +173,15 @@ def adjuntar(tenant_id: str, producto_id: int, imagen_b64, destino: str) -> dict
         return {"error": mensaje or "No se pudo adjuntar la imagen."}
 
     url = resultado.get("url") or resultado.get("ruta") or ""
+
+    if destino == "principal":
+        # Segundo paso del flujo humano: GUARDAR la URL en la BD. Sin esto la
+        # foto solo existe en Cloudinary y el producto sigue "sin foto" —
+        # la primera galería que llegue después pisaría la principal.
+        asignacion = asignar_foto_principal(producto_id, url, tenant_id)
+        if not isinstance(asignacion, dict) or not asignacion.get("ok"):
+            mensaje = asignacion.get("mensaje") if isinstance(asignacion, dict) else None
+            return {"error": mensaje or "No se pudo asignar la foto principal."}
     respuesta = {
         "ok": True,
         "producto_id": producto_id,

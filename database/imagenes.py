@@ -1181,3 +1181,57 @@ def sincronizar_imagenes_tras_editar_producto(
 
     if old_url and old_url != nueva_img and not _url_sigue_referenciada(old_url, tenant_id):
         borrar_imagen_cloudinary(old_url)
+
+
+def asignar_foto_principal(producto_id: int, url: str, tenant_id: str) -> dict:
+    """
+    Segundo paso del flujo humano de foto principal: el que históricamente
+    hacía el FRONTEND con PATCH /inventario/{producto} tras subir la foto al
+    endpoint de upload (que SOLO sube a Cloudinary y devuelve la ruta, nunca
+    escribe la BD). Este paso:
+      1. Guarda la URL en productos.imagen (el resultado real: {"ok": True/False}).
+      2. Best-effort: la refleja en la galería (plan Plus, orden 1).
+      3. Best-effort: borra la foto anterior de Cloudinary SOLO si quedó
+         huérfana (ya no referenciada en ninguna tabla del tenant).
+
+    Nace para el conector MCP (adjuntar_imagen): el agente llama a la subida
+    directo, y sin este paso la foto principal quedaba huérfana en Cloudinary
+    — el producto seguía "sin foto", así que la PRIMERA imagen de galería
+    tomaba el slot 1 y terminaba pisando la principal (bug "la de frente se
+    volvió la principal y la de estudio se perdió").
+    """
+    url = (url or "").strip()
+    if not url:
+        return {"ok": False, "mensaje": "La URL de la imagen viene vacía."}
+
+    try:
+        filas = query(
+            "SELECT Imagen AS imagen FROM productos WHERE id = %s AND tenant_id = %s",
+            (producto_id, tenant_id),
+        )
+        if not filas:
+            return {"ok": False, "mensaje": f"No existe el producto id {producto_id}."}
+        old_url = (filas[0].get("imagen") or "").strip()
+        execute(
+            "UPDATE productos SET Imagen = %s WHERE id = %s AND tenant_id = %s",
+            (url, producto_id, tenant_id),
+        )
+    except Exception as e:
+        return {"ok": False, "mensaje": f"No se pudo guardar la foto principal: {e}"}
+
+    # Best-effort (mismo espíritu que sincronizar_imagenes_tras_editar_producto):
+    # un fallo aquí no deshace el guardado, solo deja trabajo pendiente de sync.
+    try:
+        if _get_tenant_plan(tenant_id) == "plus":
+            _sincronizar_principal_galeria(producto_id, url, tenant_id)
+    except Exception as e:
+        print(f"Error sincronizando la foto principal con la galería: {e}")
+
+    try:
+        if (old_url and old_url != url and old_url != "No hay foto"
+                and not _url_sigue_referenciada(old_url, tenant_id)):
+            borrar_imagen_cloudinary(old_url)
+    except Exception as e:
+        print(f"Error limpiando la foto principal anterior: {e}")
+
+    return {"ok": True}
