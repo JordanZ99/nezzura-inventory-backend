@@ -947,6 +947,7 @@ def actualizar_cuota(
     )
     if not actual:
         return {"ok": False, "tipo": "no_encontrado", "mensaje": "Cuota no encontrada"}
+    actual = actual[0]
 
     sets, params = [], []
     if cliente_id is not None:
