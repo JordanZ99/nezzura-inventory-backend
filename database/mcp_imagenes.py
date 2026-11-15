@@ -117,13 +117,13 @@ def _producto_del_tenant(tenant_id: str, producto_id: int) -> tuple[int | None, 
     quedan fuera). Devuelve (producto_nombre, error).
     """
     filas = query(
-        "SELECT Producto FROM productos WHERE id = %s AND tenant_id = %s "
+        "SELECT Producto AS producto FROM productos WHERE id = %s AND tenant_id = %s "
         "AND Estado = 'Activo' AND tipo_producto = 'stock'",
         (producto_id, tenant_id),
     )
     if not filas:
         return None, f"No existe un producto físico activo con id {producto_id}."
-    return filas[0]["Producto"], ""
+    return filas[0]["producto"], ""
 
 
 def adjuntar(tenant_id: str, producto_id: int, imagen_b64, destino: str) -> dict:
