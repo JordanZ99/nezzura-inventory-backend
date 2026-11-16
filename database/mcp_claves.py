@@ -9,9 +9,11 @@
 #      middleware muse/auth.py la valida aquí: resuelve el tenant_id,
 #      chequea revocación y aplica el rate limit diario.
 #
-# El daño máximo de una clave filtrada es LECTURA del catálogo propio
-# (productos, precios de venta, fotos): no hay tools de escritura y los
-# costos internos jamás se seleccionan (database/mcp_catalogo.py).
+# El daño de una clave filtrada depende de sus ROLES (081): una clave
+# publicadora solo expone LECTURA del catálogo propio (productos, precios de
+# venta, fotos) y los costos internos jamás se seleccionan; una clave con
+# roles de escritura además queda limitada por la cuota diaria de escrituras
+# y el patrón borrador→confirmar con aprobación humana.
 # ==============================================================================
 
 import hashlib
@@ -19,16 +21,17 @@ import secrets
 from datetime import date
 
 from database.conexion import query, execute
+from muse.roles import normalizar_roles, nivel_de_roles, ROLES
 
 # Un negocio no necesita más agentes simultáneos que esto; el tope evita
 # crear claves en bucle para evadir el rate limit individual.
 MAX_CLAVES_POR_TENANT = 5
 
-# Niveles de permiso de una clave (migrations/066):
-#   1 Lectura básica    → catálogo para publicar.
-#   2 Lectura avanzada  → + análisis del negocio (requiere plan Plus).
-#   3 Escritura básica  → + crear productos (borrador → confirmar).
-NIVELES_VALIDOS = (1, 2, 3)
+# Roles funcionales de una clave (migrations/081 + muse/roles.py): el dueño
+# elige QUÉ TRABAJO hace el agente y la clave ve solo las tools de esos roles.
+# El NIVEL se deriva de los roles (máximo) y sigue alimentando los rate
+# limits y el permiso 'ver costos'.
+ROLES_VALIDOS = tuple(ROLES)
 
 # Rate limit diario POR CLAVE, según su nivel. La escalera: más permisos,
 # menos margen. El nivel 1 es generoso a propósito (1000): el catálogo es
@@ -54,22 +57,22 @@ def _generar_clave() -> str:
     return f"nezzura_mcp_{secrets.token_hex(24)}"
 
 
-def crear_clave(tenant_id: str, nombre: str | None, nivel: int = 1) -> dict:
+def crear_clave(tenant_id: str, nombre: str | None, roles=None) -> dict:
     """
-    Genera una clave nueva para el tenant.
+    Genera una clave nueva para el tenant con sus ROLES funcionales (081).
     Devuelve {ok: True, clave} — la clave en claro viaja UNA sola vez al
     frontend; de aquí en adelante solo existe su hash.
     """
-    try:
-        nivel = int(nivel)
-    except (TypeError, ValueError):
-        nivel = 1
-    if nivel not in NIVELES_VALIDOS:
+    roles_norm = normalizar_roles(roles)
+    if roles_norm is None:
         return {
             "ok": False,
             "status": 422,
-            "mensaje": "Nivel inválido: usa 1 (lectura básica), 2 (lectura avanzada) o 3 (escritura básica).",
+            "mensaje": (
+                "Roles inválidos. Usa: " + ", ".join(ROLES_VALIDOS) + "."
+            ),
         }
+    nivel = nivel_de_roles(roles_norm)
 
     activas = query(
         "SELECT COUNT(*) AS c FROM mcp_api_keys "
@@ -88,18 +91,22 @@ def crear_clave(tenant_id: str, nombre: str | None, nivel: int = 1) -> dict:
 
     clave = _generar_clave()
     execute(
-        "INSERT INTO mcp_api_keys (tenant_id, nombre, key_hash, key_prefix, nivel) "
-        "VALUES (%s, %s, %s, %s, %s)",
-        (tenant_id, (nombre or "").strip() or "Mi IA", _hashear(clave), clave[:12] + "…", nivel),
+        "INSERT INTO mcp_api_keys (tenant_id, nombre, key_hash, key_prefix, nivel, roles) "
+        "VALUES (%s, %s, %s, %s, %s, %s)",
+        (
+            tenant_id, (nombre or "").strip() or "Mi IA", _hashear(clave),
+            clave[:12] + "…", nivel, ",".join(roles_norm),
+        ),
     )
     return {"ok": True, "clave": clave}
 
 
 def listar_claves(tenant_id: str) -> list[dict]:
     """Claves del tenant SIN el hash (la UI muestra solo el prefijo).
-    Solo activas: eliminar es ahora un hard delete, ya no hay revocadas."""
-    return query(
-        """SELECT id, nombre, key_prefix, nivel, creada_en, ultimo_uso_en,
+    Solo activas: eliminar es ahora un hard delete, ya no hay revocadas.
+    `roles` llega ya como lista (el frontend pinta los toggles con ella)."""
+    filas = query(
+        """SELECT id, nombre, key_prefix, nivel, roles, creada_en, ultimo_uso_en,
                   llamadas_hoy, dia_uso, escrituras_hoy, dia_escrituras,
                   limite_llamadas_diarias, limite_escrituras_diarias, ver_costos
            FROM mcp_api_keys
@@ -107,6 +114,10 @@ def listar_claves(tenant_id: str) -> list[dict]:
            ORDER BY creada_en DESC""",
         (tenant_id,),
     )
+    for fila in filas:
+        crudos = (fila.get("roles") or "").strip()
+        fila["roles"] = [r for r in crudos.split(",") if r.strip()] or None
+    return filas
 
 
 def revocar_clave(clave_id: int, tenant_id: str) -> bool:
@@ -128,16 +139,14 @@ def revocar_clave(clave_id: int, tenant_id: str) -> bool:
     return True
 
 
-def cambiar_nivel(clave_id: int, tenant_id: str, nivel: int) -> bool:
+def cambiar_roles(clave_id: int, tenant_id: str, roles) -> bool:
     """
-    Cambia el nivel de permisos de una clave ACTIVA sin tocar su hash: el
-    agente no se reconecta y tools/list se ajusta en el próximo request.
+    Cambia los ROLES de una clave ACTIVA sin tocar su hash: el agente no se
+    reconecta y tools/list se ajusta en el próximo request. El nivel se
+    recalcula de los roles (máximo) porque alimenta los rate limits.
     """
-    try:
-        nivel = int(nivel)
-    except (TypeError, ValueError):
-        return False
-    if nivel not in NIVELES_VALIDOS:
+    roles_norm = normalizar_roles(roles)
+    if roles_norm is None:
         return False
     filas = query(
         "SELECT id FROM mcp_api_keys WHERE id = %s AND tenant_id = %s",
@@ -145,7 +154,10 @@ def cambiar_nivel(clave_id: int, tenant_id: str, nivel: int) -> bool:
     )
     if not filas:
         return False
-    execute("UPDATE mcp_api_keys SET nivel = %s WHERE id = %s", (nivel, clave_id))
+    execute(
+        "UPDATE mcp_api_keys SET roles = %s, nivel = %s WHERE id = %s",
+        (",".join(roles_norm), nivel_de_roles(roles_norm), clave_id),
+    )
     return True
 
 
@@ -209,23 +221,25 @@ def cambiar_ver_costos(clave_id: int, tenant_id: str, ver_costos: bool) -> bool:
 def validar_clave(clave: str, contar_uso: bool = True):
     """
     Valida una clave para el middleware del servidor MCP.
-    Devuelve (tenant_id, nivel, clave_id, None, ver_costos) si es válida, o
-    (None, None, None, status_http, False) si no:
+    Devuelve (tenant_id, nivel, clave_id, None, ver_costos, roles) si es
+    válida, o (None, None, None, status_http, False, None) si no:
       401 = no existe o está revocada · 429 = límite diario agotado.
+    roles: tupla de roles activos de la clave (081). None/'' = todas las
+    tools (defensa para claves pre-081 sin migrar).
 
     contar_uso: solo los POST (llamadas reales) gastan cuota; GET (SSE) y
     DELETE (cerrar sesión) se validan sin contar.
     """
     if not clave:
-        return None, None, None, 401, False
+        return None, None, None, 401, False, None
 
     filas = query(
-        "SELECT id, tenant_id, nivel, revocada_en, llamadas_hoy, dia_uso, "
+        "SELECT id, tenant_id, nivel, roles, revocada_en, llamadas_hoy, dia_uso, "
         "limite_llamadas_diarias, ver_costos FROM mcp_api_keys WHERE key_hash = %s",
         (_hashear(clave),),
     )
     if not filas or filas[0]["revocada_en"]:
-        return None, None, None, 401, False
+        return None, None, None, 401, False, None
 
     fila = filas[0]
     nivel = int(fila["nivel"] or 1)
@@ -234,7 +248,7 @@ def validar_clave(clave: str, contar_uso: bool = True):
     # Override por clave (NULL = default del nivel, migrations/067)
     limite = fila["limite_llamadas_diarias"] or _LIMITE_POR_NIVEL.get(nivel, LIMITE_LLAMADAS_DIARIO)
     if contar_uso and usadas >= limite:
-        return None, None, None, 429, False
+        return None, None, None, 429, False, None
 
     if contar_uso:
         execute(
@@ -243,7 +257,10 @@ def validar_clave(clave: str, contar_uso: bool = True):
             (usadas + 1, hoy, fila["id"]),
         )
     # 5ª posición: el agente de esta clave puede ver costos internos (068).
-    return str(fila["tenant_id"]), nivel, int(fila["id"]), None, bool(fila["ver_costos"])
+    # 6ª: roles activos (081); vacío = todas (compatibilidad pre-migración).
+    crudos_roles = (fila.get("roles") or "").strip()
+    roles = tuple(r.strip() for r in crudos_roles.split(",") if r.strip()) or None
+    return str(fila["tenant_id"]), nivel, int(fila["id"]), None, bool(fila["ver_costos"]), roles
 
 
 def contar_escritura(clave_id: int) -> bool:

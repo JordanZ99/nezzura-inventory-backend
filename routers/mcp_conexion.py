@@ -16,6 +16,7 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from database import mcp_claves
 from dependencies import get_tenant_id
+from muse.roles import ROLES
 from schemas.mcp import CrearClaveMcp, EditarClaveMcp
 
 router = APIRouter(prefix="/mcp-conexion", tags=["Conector IA (MCP)"])
@@ -27,6 +28,18 @@ def listar_claves(tenant_id: str = Depends(get_tenant_id)):
     return {"claves": mcp_claves.listar_claves(tenant_id)}
 
 
+@router.get("/roles")
+def listar_roles():
+    """Catálogo de roles activables por clave (muse/roles.py es la fuente
+    única de verdad): el frontend pinta los toggles con esto."""
+    return {
+        "roles": [
+            {"id": rol_id, "nombre": definicion["nombre"], "tools": list(definicion["tools"])}
+            for rol_id, definicion in ROLES.items()
+        ]
+    }
+
+
 @router.post("/claves")
 def crear_clave(data: CrearClaveMcp, tenant_id: str = Depends(get_tenant_id)):
     """
@@ -34,7 +47,7 @@ def crear_clave(data: CrearClaveMcp, tenant_id: str = Depends(get_tenant_id)):
     vez: el backend solo guardó su hash. Si el dueño la pierde, revoca y
     genera otra.
     """
-    resultado = mcp_claves.crear_clave(tenant_id, data.nombre, data.nivel)
+    resultado = mcp_claves.crear_clave(tenant_id, data.nombre, data.roles)
     if resultado.get("ok") is False:
         raise HTTPException(
             status_code=resultado.get("status", 422),
@@ -47,20 +60,23 @@ def crear_clave(data: CrearClaveMcp, tenant_id: str = Depends(get_tenant_id)):
 def editar_clave(clave_id: int, data: EditarClaveMcp, tenant_id: str = Depends(get_tenant_id)):
     """
     Edita una clave ACTIVA sin tocar su hash: el agente no se reconecta.
-    - nivel: cambia los permisos; tools/list se ajusta en el próximo request
-      (de 6 a 8 a 10 herramientas).
+    - roles: cambia QUÉ TRABAJO hace el agente; tools/list se ajusta en el
+      próximo request (la UNIÓN de las tools de los roles activos).
     - limite_llamadas / limite_escrituras: override por clave; null = vuelve
-      al default del nivel.
+      al default del nivel (el nivel se deriva de los roles: máximo).
     """
     filas = mcp_claves.listar_claves(tenant_id)
     if not any(c["id"] == clave_id for c in filas):
         raise HTTPException(status_code=404, detail="Clave no encontrada")
 
     cambios = []
-    if data.nivel is not None:
-        if not mcp_claves.cambiar_nivel(clave_id, tenant_id, data.nivel):
-            raise HTTPException(status_code=422, detail="Nivel inválido: usa 1, 2 o 3")
-        cambios.append("nivel")
+    if data.roles is not None:
+        if not mcp_claves.cambiar_roles(clave_id, tenant_id, data.roles):
+            raise HTTPException(
+                status_code=422,
+                detail="Roles inválidos. Usa: " + ", ".join(mcp_claves.ROLES_VALIDOS),
+            )
+        cambios.append("roles")
     if data.limite_llamadas is not None or data.limite_escrituras is not None:
         if not mcp_claves.actualizar_limites(
             clave_id, tenant_id, data.limite_llamadas, data.limite_escrituras
@@ -76,7 +92,7 @@ def editar_clave(clave_id: int, data: EditarClaveMcp, tenant_id: str = Depends(g
         cambios.append("ver_costos")
     if not cambios:
         raise HTTPException(
-            status_code=422, detail="Nada que editar: envía nivel, límites y/o ver_costos"
+            status_code=422, detail="Nada que editar: envía roles, límites y/o ver_costos"
         )
     return {"ok": True, "cambiado": cambios}
 

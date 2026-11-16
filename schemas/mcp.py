@@ -2,7 +2,7 @@
 # backend/schemas/mcp.py — Bodies de routers/mcp_conexion.py
 # ==============================================================================
 
-from typing import Optional
+from typing import List, Optional
 from pydantic import BaseModel, Field
 
 
@@ -13,25 +13,24 @@ class CrearClaveMcp(BaseModel):
         max_length=40,
         description="Etiqueta para reconocer la clave en la lista (ej. 'Muse del celular')",
     )
-    nivel: int = Field(
-        default=1,
-        ge=1,
-        le=3,
+    roles: Optional[List[str]] = Field(
+        default=None,
         description=(
-            "Nivel de permiso: 1 lectura básica (catálogo), 2 lectura avanzada "
-            "(+ análisis del negocio, plan Plus), 3 escritura básica "
-            "(+ crear productos con borrador y confirmación)."
+            "ROLES funcionales de la clave (081): la UNIÓN de sus tools es lo "
+            "que el agente ve. Valores: publicador, analista, disenador, "
+            "inventario. Lista vacía u omitida = publicador."
         ),
     )
 
 
 class EditarClaveMcp(BaseModel):
     """Edición de una clave ACTIVA (sin tocar su hash: el agente no se reconecta)."""
-    nivel: Optional[int] = Field(
+    roles: Optional[List[str]] = Field(
         default=None,
-        ge=1,
-        le=3,
-        description="Nuevo nivel de permiso. Omitir = no cambiar.",
+        description=(
+            "Nuevos roles de la clave (mínimo 1: una clave sin roles no ve "
+            "ninguna tool). Omitir = no cambiar."
+        ),
     )
     limite_llamadas: Optional[int] = Field(
         default=None,
@@ -49,6 +48,6 @@ class EditarClaveMcp(BaseModel):
         default=None,
         description=(
             "Permiso de ESTA clave para que el agente lea costos internos y "
-            "márgenes (migrations/068). Independiente del nivel. Omitir = no cambiar."
+            "márgenes (migrations/068). Independiente de los roles. Omitir = no cambiar."
         ),
     )

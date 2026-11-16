@@ -25,6 +25,8 @@ tenant_actual: ContextVar[str] = ContextVar("muse_tenant", default="")
 nivel_actual: ContextVar[int] = ContextVar("muse_nivel", default=0)
 clave_actual: ContextVar[int] = ContextVar("muse_clave", default=0)
 ver_costos_actual: ContextVar[bool] = ContextVar("muse_ver_costos", default=False)
+# Roles activos de la clave (081). None = todas las tools (pre-migración).
+roles_actual: ContextVar[tuple | None] = ContextVar("muse_roles", default=None)
 
 
 def tenant_de_request() -> str:
@@ -35,6 +37,12 @@ def tenant_de_request() -> str:
 def nivel_de_request() -> int:
     """Nivel de permiso de la clave (1, 2 o 3). 0 = request sin autenticar."""
     return nivel_actual.get()
+
+
+def roles_de_request() -> tuple | None:
+    """Roles activos de la clave (081): la UNIÓN de sus tools es lo único
+    que el agente ve y puede llamar. None = todas (compatibilidad)."""
+    return roles_actual.get()
 
 
 def clave_de_request() -> int:
@@ -69,7 +77,7 @@ class AutenticacionAPIKey:
         # Solo los POST (llamadas reales) gastan cuota del rate limit;
         # GET (stream SSE) y DELETE (cerrar sesión) se validan sin contar.
         contar = scope.get("method") == "POST"
-        tenant_id, nivel, clave_id, error, ver_costos = await run_in_threadpool(
+        tenant_id, nivel, clave_id, error, ver_costos, roles = await run_in_threadpool(
             validar_clave, clave_api, contar
         )
 
@@ -89,4 +97,5 @@ class AutenticacionAPIKey:
         nivel_actual.set(int(nivel or 1))
         clave_actual.set(int(clave_id or 0))
         ver_costos_actual.set(bool(ver_costos))
+        roles_actual.set(roles)
         await self.app(scope, receive, send)

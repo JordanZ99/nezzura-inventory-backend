@@ -22,6 +22,13 @@
 #      límite de 5 fotos y sincronizan productos.imagen con la galería.
 #   5. Cada adjunto queda en el Historial con origen 'agente_ia'.
 #
+# Rol Diseñador (081): además de adjuntar, gestiona las fotos existentes:
+#   - config_catalogo: proporción/tema/fondo del catálogo para que las fotos
+#     que genera el agente encajen con el look del negocio.
+#   - eliminar: quita una foto de la galería o la principal (con promoción
+#     automática de la siguiente).
+#   - reordenar: define el orden de la galería (la primera pasa a principal).
+#
 # Efecto directo (sin borrador→confirmar): adjuntar una foto no corrompe
 # datos de negocio; el límite de defensa es la cuota de escrituras diarias
 # de la clave (contada en server.py antes de llamar aquí) y la cuota de
@@ -36,6 +43,9 @@ from database.actividad import registrar_actividad
 from database.conexion import query
 from database.imagenes import (
     asignar_foto_principal,
+    eliminar_imagen_extra,
+    quitar_foto_principal,
+    reordenar_imagenes,
     subir_foto,
     subir_imagen_extra,
 )
@@ -323,3 +333,194 @@ def adjuntar(
         pass  # el historial nunca bloquea la operación
 
     return respuesta
+
+
+def config_catalogo(tenant_id: str) -> dict:
+    """
+    Configuración VISUAL del catálogo del tenant (rol Diseñador): el agente
+    la consulta ANTES de generar/adjuntar fotos para respetar la proporción
+    y el look del negocio. Devuelve dict tipo MCP con los campos que importan
+    a las fotos; faltantes con defaults seguros (1:1).
+    """
+    try:
+        filas = query(
+            "SELECT titulo AS titulo, tema AS tema, fondo_color AS fondo_color, "
+            "relacion_imagen AS relacion_imagen "
+            "FROM catalogo_config WHERE tenant_id = %s LIMIT 1",
+            (tenant_id,),
+        )
+    except Exception as e:
+        print(f"[MCP] config_catalogo fallo: {type(e).__name__}: {e}")
+        return {"error": "No se pudo leer la configuración del catálogo."}
+
+    if not filas:
+        return {
+            "ok": True,
+            "titulo": "",
+            "tema": "",
+            "fondo_color": "",
+            "relacion_imagen": "1:1",
+            "orientacion": "cuadrada",
+            "nota": "El negocio no configuró su catálogo todavía: usa fotos 1:1 (cuadradas).",
+        }
+
+    cfg = filas[0]
+    relacion = str(cfg.get("relacion_imagen") or "1:1").strip() or "1:1"
+    if relacion not in ("1:1", "4:5"):
+        relacion = "1:1"
+    return {
+        "ok": True,
+        "titulo": str(cfg.get("titulo") or ""),
+        "tema": str(cfg.get("tema") or ""),
+        "fondo_color": str(cfg.get("fondo_color") or "").strip(),
+        "relacion_imagen": relacion,
+        "orientacion": "vertical (retrato)" if relacion == "4:5" else "cuadrada",
+        "nota": (
+            "Genera o elige las fotos en esta proporción; adjuntar_imagen con "
+            "encaje 'marco' ya rellena el borde hasta ella automáticamente."
+        ),
+    }
+
+
+def eliminar(tenant_id: str, producto_id, imagen_id, destino) -> dict:
+    """
+    Elimina una imagen de un producto (rol Diseñador). Exige UNA de las dos
+    vías, nunca ambas:
+      - imagen_id: fila de producto_imagenes (el id de fotos.galeria en
+        datos_para_publicar) → eliminar_imagen_extra, que borra de Cloudinary
+        y promueve la siguiente si era la principal.
+      - destino='principal': la foto principal del producto →
+        quitar_foto_principal (promoción automática, borrado de asset solo
+        si quedó huérfano).
+    Devuelve dict tipo MCP: {"ok": ...} o {"error": ...}.
+    """
+    try:
+        producto_id = int(producto_id)
+    except (TypeError, ValueError):
+        return {"error": "El 'producto_id' debe ser un número."}
+
+    tiene_imagen_id = imagen_id is not None and str(imagen_id).strip() != ""
+    destino_limpio = (destino or "").strip().lower()
+
+    if destino_limpio and destino_limpio != "principal":
+        return {"error": "destino inválido: solo se acepta 'principal'."}
+    if tiene_imagen_id and destino_limpio:
+        return {"error": "Envía imagen_id O destino='principal', no ambos."}
+    if not tiene_imagen_id and not destino_limpio:
+        return {
+            "error": (
+                "Indica qué eliminar: imagen_id (el id de una foto de la "
+                "galería, según datos_para_publicar) o destino='principal' "
+                "(la foto principal del producto)."
+            )
+        }
+    if tiene_imagen_id:
+        try:
+            imagen_id = int(imagen_id)
+        except (TypeError, ValueError):
+            return {"error": "El 'imagen_id' debe ser un número."}
+
+    producto_nombre, error = _producto_del_tenant(tenant_id, producto_id)
+    if error:
+        return {"error": error}
+
+    if tiene_imagen_id:
+        # La imagen debe pertenecer a ESTE producto y tenant: un agente no
+        # puede borrar fotos de otra galería ni de otro negocio.
+        fila = query(
+            "SELECT id FROM producto_imagenes "
+            "WHERE id = %s AND producto_id = %s AND tenant_id = %s",
+            (imagen_id, producto_id, tenant_id),
+        )
+        if not fila:
+            return {
+                "error": (
+                    "Esa imagen no existe en la galería de este producto. "
+                    "Consulta datos_para_publicar para ver los ids reales "
+                    "(fotos.galeria)."
+                )
+            }
+        resultado = eliminar_imagen_extra(imagen_id, tenant_id)
+        descripcion = f"la foto de galería (imagen {imagen_id})"
+    else:
+        resultado = quitar_foto_principal(producto_id, tenant_id)
+        descripcion = "la foto principal"
+
+    if not isinstance(resultado, dict) or not resultado.get("ok"):
+        mensaje = resultado.get("mensaje") if isinstance(resultado, dict) else None
+        return {"error": mensaje or "No se pudo eliminar la imagen."}
+
+    respuesta = {
+        "ok": True,
+        "producto_id": producto_id,
+        "eliminado": descripcion,
+    }
+    if resultado.get("nueva_principal"):
+        respuesta["nueva_principal"] = resultado["nueva_principal"]
+
+    try:
+        registrar_actividad(
+            tenant_id, "producto", "producto", "editar",
+            resumen=f"El agente IA eliminó {descripcion} de {producto_nombre}",
+            entidad_id=producto_id,
+            detalle={"origen": "agente_ia", "eliminado": descripcion},
+        )
+    except Exception:
+        pass  # el historial nunca bloquea la operación
+
+    return respuesta
+
+
+def reordenar(tenant_id: str, producto_id, orden_ids) -> dict:
+    """
+    Reordena la galería de un producto (rol Diseñador, plan Plus). orden_ids
+    es el array COMPLETO de ids en el nuevo orden: el primero pasa a ser la
+    foto principal. Delega en imagenes.reordenar_imagenes, que ya valida el
+    plan Plus y que todos los ids pertenezcan al producto y tenant.
+    """
+    try:
+        producto_id = int(producto_id)
+    except (TypeError, ValueError):
+        return {"error": "El 'producto_id' debe ser un número."}
+
+    if not isinstance(orden_ids, list) or not orden_ids:
+        return {
+            "error": (
+                "orden_ids debe ser un array NO vacío con TODOS los ids de "
+                "las fotos del producto (los de fotos.galeria en "
+                "datos_para_publicar): el primero pasa a ser la principal."
+            )
+        }
+    limpios: list[int] = []
+    for valor in orden_ids:
+        try:
+            limpios.append(int(valor))
+        except (TypeError, ValueError):
+            return {"error": "orden_ids debe contener solo números (ids de fotos)."}
+    if len(set(limpios)) != len(limpios):
+        return {"error": "orden_ids tiene ids repetidos: envía cada foto una sola vez."}
+
+    producto_nombre, error = _producto_del_tenant(tenant_id, producto_id)
+    if error:
+        return {"error": error}
+
+    resultado = reordenar_imagenes(producto_nombre, limpios, tenant_id)
+    if not isinstance(resultado, dict) or not resultado.get("ok"):
+        mensaje = resultado.get("mensaje") if isinstance(resultado, dict) else None
+        return {"error": mensaje or "No se pudo reordenar las imágenes."}
+
+    try:
+        registrar_actividad(
+            tenant_id, "producto", "producto", "editar",
+            resumen=f"El agente IA reordenó la galería de fotos de {producto_nombre}",
+            entidad_id=producto_id,
+            detalle={"origen": "agente_ia", "orden_ids": limpios},
+        )
+    except Exception:
+        pass  # el historial nunca bloquea la operación
+
+    return {
+        "ok": True,
+        "producto_id": producto_id,
+        "nota": "La primera foto del array es ahora la principal del producto.",
+    }

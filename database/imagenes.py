@@ -949,6 +949,77 @@ def eliminar_imagen_extra(imagen_id: int, tenant_id: str) -> dict:
     return {"ok": True, "id": imagen_id}
 
 
+def quitar_foto_principal(producto_id: int, tenant_id: str) -> dict:
+    """
+    Elimina la foto PRINCIPAL de un producto (la que ve el catálogo público).
+    Usada por el conector MCP (eliminar_imagen con destino='principal').
+
+    - Plan Plus con fila orden 1 → la principal es UNA fila de la galería:
+      eliminar_imagen_extra la borra, promueve la siguiente a principal y
+      sincroniza productos.imagen.
+    - Sin fila orden 1 (plan básico o desync pre-galería): promueve la
+      primera fila de la galería si existe, o deja 'No hay foto'.
+
+    El asset de Cloudinary de la foto vieja SOLO se destruye si quedó
+    huérfano (_url_sigue_referenciada): la misma URL puede seguir viva en
+    otra galería, variación, logo o banner del tenant.
+    """
+    fila1 = query(
+        "SELECT id FROM producto_imagenes "
+        "WHERE producto_id = %s AND tenant_id = %s AND orden = 1",
+        (producto_id, tenant_id),
+    )
+    if fila1:
+        # Plan Plus: la principal vive como fila orden 1 de la galería.
+        return eliminar_imagen_extra(fila1[0]["id"], tenant_id)
+
+    filas = query(
+        "SELECT Imagen AS imagen FROM productos WHERE id = %s AND tenant_id = %s",
+        (producto_id, tenant_id),
+    )
+    if not filas:
+        return {"ok": False, "status": 404, "mensaje": "Producto no encontrado"}
+    url_vieja = (filas[0].get("imagen") or "").strip()
+    if not url_vieja or url_vieja == "No hay foto":
+        return {"ok": False, "status": 400, "mensaje": "El producto no tiene foto principal que eliminar."}
+
+    siguiente = query(
+        "SELECT id, url FROM producto_imagenes "
+        "WHERE producto_id = %s AND tenant_id = %s ORDER BY orden ASC LIMIT 1",
+        (producto_id, tenant_id),
+    )
+    if siguiente and siguiente[0]["url"] != url_vieja:
+        # Promover la primera de la galería: pasa a orden 1 (invariante Plus:
+        # la principal es una fila de la galería) y productos.imagen la refleja.
+        execute(
+            "UPDATE producto_imagenes SET orden = 1 WHERE id = %s",
+            (siguiente[0]["id"],),
+        )
+        execute(
+            "UPDATE productos SET Imagen = %s WHERE id = %s AND tenant_id = %s",
+            (siguiente[0]["url"], producto_id, tenant_id),
+        )
+        nueva = siguiente[0]["url"]
+    elif siguiente:
+        # La primera de la galería YA apunta a la url de la principal (fila
+        # duplicada residual): sobra, la foto sigue siendo la principal.
+        execute("DELETE FROM producto_imagenes WHERE id = %s", (siguiente[0]["id"],))
+        _compactar_orden_galeria(producto_id, tenant_id)
+        nueva = url_vieja
+    else:
+        execute(
+            "UPDATE productos SET Imagen = 'No hay foto' WHERE id = %s AND tenant_id = %s",
+            (producto_id, tenant_id),
+        )
+        nueva = "No hay foto"
+
+    # Destruir el asset solo si quedó huérfano (puede seguir referenciada).
+    if url_vieja != nueva and not _url_sigue_referenciada(url_vieja, tenant_id):
+        borrar_imagen_cloudinary(url_vieja)
+
+    return {"ok": True, "id": None, "nueva_principal": nueva}
+
+
 def reordenar_imagenes(producto: str, ids: list, tenant_id: str) -> dict:
     """
     Reordena las imágenes de la galería de un producto (Plan Plus).

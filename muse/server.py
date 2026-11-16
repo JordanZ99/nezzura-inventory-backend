@@ -9,19 +9,14 @@
 #   URL:     https://<backend>/mcp
 #   Header:  X-API-Key: <clave del tenant>
 #
-# NIVELES (el dueño elige al crear la clave, con advertencia en el gestor):
-#   1 "Lectura básica"    → catálogo para publicar (6 tools). Nunca costos.
-#   2 "Lectura avanzada"  → + análisis del negocio con datos REALES
-#                           (resumen_negocio, hallazgos_inteligentes). Agregados
-#                           sí, costos unitarios nunca. Requiere plan Plus.
-#   3 "Escritura básica"  → + crear productos con patrón borrador→confirmar
-#                           (proponer_producto, confirmar_producto), editar
-#                           productos/ventas/gastos (proponer_edicion,
-#                           confirmar_edicion) y adjuntar imágenes a productos
-#                           (adjuntar_imagen). Las confirmaciones y la subida
-#                           de imagen son destructiveHint: Muse debe pedir
-#                           aprobación humana en cada llamada, y cada acción
-#                           queda en el Historial como hecha por el agente.
+# ROLES (el dueño elige al crear la clave, con toggles en el gestor — 081;
+# muse/roles.py es la fuente única de verdad; el nivel se deriva del máximo):
+#   "publicador"  → catálogo para publicar en redes/Marketplace (4 tools).
+#   "analista"    → + análisis del negocio con datos REALES (6 tools, plan Plus).
+#   "disenador"   → fotos: adjuntar/encajar/eliminar/reordenar y ver la config
+#                   del catálogo (7 tools).
+#   "inventario"  → + crear y editar productos con patrón borrador→confirmar
+#                   (9 tools).
 #
 # Modo del transporte:
 #   - stateless_http=True: cada POST es autosuficiente (sin sesiones en el
@@ -37,12 +32,14 @@
 # Seguridad (en capas):
 #   1. Nivel de la clave: el tenant y el nivel se resuelven en muse/auth.py
 #      desde la clave, NUNCA desde datos que envíe el agente.
-#   2. tools/list filtrado por nivel (ServidorMuse) + re-verificación DENTRO
-#      de cada tool (defensa en profundidad: si el filtro falla, el tool
-#      responde error en vez de ejecutar).
+#   2. tools/list filtrado por ROLES de la clave (ServidorMuse) +
+#      re-verificación DENTRO de cada tool (_requiere_permiso: defensa en
+#      profundidad — si el filtro falla, el tool responde error en vez de
+#      ejecutar).
 #   3. Las queries usan columnas explícitas: los costos unitarios nunca salen
 #      de la base de datos (el nivel 2 solo expone agregados).
-#   4. La escritura (nivel 3) pasa por borrador con token de un solo uso:
+#   4. La escritura (roles disenador/inventario) pasa por borrador con token
+#      de un solo uso:
 #      confirmar crea SOLO desde lo guardado, el agente no puede alterar
 #      datos entre mensajes.
 #
@@ -64,70 +61,49 @@ from database.mcp_claves import contar_escritura
 from muse.auth import (
     AutenticacionAPIKey,
     clave_de_request,
-    nivel_de_request,
+    roles_de_request,
     tenant_de_request,
     ver_costos_de_request,
 )
-
-# Nivel mínimo por tool (buscar_productos, listar_productos, stock_actual,
-# listar_categorias y datos_para_publicar son nivel 1). Las fichas de detalle
-# viven SOLO en datos_para_publicar: obtener_producto y obtener_fotos_producto
-# se retiraron por redundantes (Muse las señalaba) y para no dejar dos vías
-# con reglas de privacidad distintas.
-_NIVEL_MINIMO = {
-    "ventas_recientes": 2,
-    "top_vendidos": 2,
-    "resumen_negocio": 2,
-    "hallazgos_inteligentes": 2,
-    "proponer_producto": 3,
-    "confirmar_producto": 3,
-    "proponer_edicion": 3,
-    "confirmar_edicion": 3,
-    "adjuntar_imagen": 3,
-}
+from muse.roles import (
+    ROLES,
+    herramienta_en_roles,
+    instrucciones_para,
+    nombres_de_rol,
+    tools_de_roles,
+)
 
 
 class ServidorMuse(MCPServer):
-    """MCPServer que filtra tools/list según el nivel de la clave: una clave
-    nivel 1 (catálogo) jamás ve los tools de análisis o escritura, así el
-    agente solo conoce lo que puede usar."""
+    """MCPServer que filtra tools/list según los ROLES de la clave (081): el
+    dueño activa toggles por clave (publicador, analista, disenador,
+    inventario) y el agente solo conoce la UNIÓN de las tools de esos roles —
+    modelo 'toolsets' como el servidor MCP oficial de GitHub. Menos tools
+    visibles = mejor selección y menos alucinación. Roles vacíos (claves
+    pre-081) = todas las tools."""
 
     async def list_tools(self) -> list[Tool]:
-        nivel = nivel_de_request() or 1
+        roles = roles_de_request()
         tools = await super().list_tools()
-        return [t for t in tools if _NIVEL_MINIMO.get(t.name, 1) <= nivel]
+        return [t for t in tools if herramienta_en_roles(t.name, roles)]
 
 
 servidor = ServidorMuse(
     "Nezzura Inventario",
     instructions=(
         "Conector del gestor de inventario de este negocio. Las herramientas "
-        "disponibles dependen del nivel de permiso de la clave: TODAS las "
-        "claves pueden leer el catálogo (productos físicos con precio de "
-        "venta al público, descripción, tamaño, stock y fotos) y listar el "
-        "inventario completo con filtros (listar_productos: por categoría, "
-        "stock bajo, agotados, sin foto/descripción/tamaño, paginado). Las "
-        "claves nivel 2 pueden además leer el análisis del negocio: métricas "
-        "y hallazgos calculados sobre datos reales, ventas recientes una por "
-        "una y top vendidos — úsalos cuando el dueño pregunte cómo va el "
-        "negocio, nunca inventes cifras; requieren plan Plus. Las claves "
-        "nivel 3 pueden además crear productos nuevos y EDITAR productos, "
-        "ventas y gastos, SIEMPRE con proponer_* primero y confirmar_* "
-        "después (borrador que el dueño revisa; cada cambio queda en el "
-        "Historial del gestor como hecho por el agente IA), y adjuntar "
-        "IMÁGENES a productos con adjuntar_imagen: si tienes la foto de un "
-        "producto como archivo/base64, esa es la vía — el gestor la reduce de "
-        "peso y la hospeda (destino 'principal' o 'galeria'). Algunas claves "
-        "tienen el permiso 'ver costos': si una respuesta incluye campos de "
-        "costo o margen, son datos internos del dueño — NUNCA los menciones "
-        "en publicaciones, frente a compradores ni en el catálogo público; "
-        "datos_para_publicar nunca los incluye. Para VER el detalle de un "
-        "producto o PUBLICARLO, la única vía es datos_para_publicar con el "
-        "id que te dio la búsqueda o el listado: incluye ficha completa y "
-        "fotos en una llamada. Cuando el dueño pida publicar un producto en "
-        "Marketplace o redes sociales, obtén los datos con estos tools en "
-        "lugar de pedírselos: busca el producto, luego usa "
-        "datos_para_publicar con su id."
+        "que ves son EXACTAMENTE las de tu rol: úsalas todas con confianza y "
+        "no asumas que existen otras (si algo no está en tu lista, dilo y "
+        "pediráselo al dueño). El catálogo son productos físicos con precio "
+        "de venta al público, descripción, tamaño, stock y fotos. Algunas "
+        "claves tienen el permiso 'ver costos': si una respuesta incluye "
+        "campos de costo o margen, son datos internos del dueño — NUNCA los "
+        "menciones en publicaciones, frente a compradores ni en el catálogo "
+        "público; datos_para_publicar nunca los incluye. Para VER el detalle "
+        "de un producto o PUBLICARLO, la única vía es datos_para_publicar "
+        "con el id que te dio la búsqueda o el listado: incluye ficha "
+        "completa y fotos en una llamada. Nunca inventes precios, stock ni "
+        "cifras: todo sale de las herramientas."
     ),
 )
 
@@ -137,19 +113,21 @@ SOLO_LECTURA = ToolAnnotations(readOnlyHint=True)
 
 # confirmar_producto modifica el inventario: la flag le indica al cliente
 # (Muse) que pida aprobación humana ANTES de cada llamada — la red anti-bucle
-# del nivel 3. proponer_producto NO es destructive: solo guarda un borrador.
+# de los roles con escritura. proponer_producto NO es destructive: solo
+# guarda un borrador.
 CONFIRMACION = ToolAnnotations(destructiveHint=True)
 
 
-def _requiere_nivel(minimo: int) -> dict | None:
-    """Verificación interna por tool (defensa en profundidad)."""
-    if nivel_de_request() < minimo:
-        etiqueta = "2 (lectura avanzada)" if minimo == 2 else "3 (escritura básica)"
+def _requiere_permiso(tool: str) -> dict | None:
+    """Verificación interna por tool (defensa en profundidad): si el filtro
+    de tools/list fallara o el agente llama una tool que no le corresponde,
+    esta guarda responde error en vez de ejecutar."""
+    if not herramienta_en_roles(tool, roles_de_request()):
         return {
             "error": (
-                "Tu clave no tiene permiso para esta herramienta. Pídele al "
-                f"dueño una clave de nivel {etiqueta} en Ajustes → Negocio → "
-                "Conectar mi IA."
+                f"Tu clave no tiene el rol para '{tool}' (lo dan: "
+                f"{nombres_de_rol(tool)}). Pídele al dueño activar ese rol "
+                "en Ajustes → Negocio → Conectar mi IA."
             )
         }
     return None
@@ -284,12 +262,12 @@ def ventas_recientes(periodo: str = "30dias", pagina: int = 1, limite: int = 20)
     trae fecha, producto, cantidad, precio unitario y total. Paginado
     (máximo 50 por página): itera con 'pagina' para recorrer el periodo.
     Úsalo para responder 'qué se vendió ayer', 'qué se llevó el último
-    cliente' o revisar ventas registradas. Requiere clave nivel 2 y plan
+    cliente' o revisar ventas registradas. Requiere el rol Analista y plan
     Plus. Si la clave tiene permiso 'ver costos', incluye costo_unitario y
     ganancia por venta (datos internos)."""
-    nivel = _requiere_nivel(2)
-    if nivel:
-        return nivel
+    permiso = _requiere_permiso("ventas_recientes")
+    if permiso:
+        return permiso
     tenant = tenant_de_request()
     try:
         return mcp_ventas.ventas_recientes(
@@ -309,11 +287,11 @@ def top_vendidos(periodo: str = "30dias", limite: int = 10) -> dict:
     vendidas y el stock ACTUAL de cada uno ('agotado' y 'por_agotarse'
     marcados). Úsalo para decirle al dueño qué repetir, qué reponer antes
     de volver a publicar y por qué un mes fue mejor que otro. Requiere
-    clave nivel 2 y plan Plus. Si la clave tiene permiso 'ver costos',
+    el rol Analista y plan Plus. Si la clave tiene permiso 'ver costos',
     incluye costo_unitario y margen del ranking (datos internos)."""
-    nivel = _requiere_nivel(2)
-    if nivel:
-        return nivel
+    permiso = _requiere_permiso("top_vendidos")
+    if permiso:
+        return permiso
     tenant = tenant_de_request()
     try:
         return mcp_ventas.top_vendidos(
@@ -336,9 +314,9 @@ def resumen_negocio(periodo: str = "mes") -> dict:
     que TIENEN ventas dentro de la ventana; 'rango_solicitado' es la ventana
     completa. Si la ventana no tiene ventas, las métricas van en 0 y eso es
     la respuesta correcta — infórmale al dueño que no hay registros del periodo."""
-    nivel = _requiere_nivel(2)
-    if nivel:
-        return nivel
+    permiso = _requiere_permiso("resumen_negocio")
+    if permiso:
+        return permiso
     tenant = tenant_de_request()
     try:
         return mcp_analisis.resumen_negocio(tenant, periodo)
@@ -359,9 +337,9 @@ def hallazgos_inteligentes(tipo: str = "todos", periodo: str = "mes") -> dict:
     datos reales, no una opinión. 'tipo' filtra: 'todos', 'dinero' (márgenes
     y gastos), 'stock' (inventario) o 'ventas' (tendencias). 'periodo' igual
     que resumen_negocio. Úsalo para dar consejos concretos al dueño."""
-    nivel = _requiere_nivel(2)
-    if nivel:
-        return nivel
+    permiso = _requiere_permiso("hallazgos_inteligentes")
+    if permiso:
+        return permiso
     tenant = tenant_de_request()
     try:
         return mcp_analisis.hallazgos_inteligentes(tenant, periodo, tipo)
@@ -396,7 +374,7 @@ def proponer_producto(
     sufijo_precio: str = "",
     fraccionable: bool = False,
 ) -> dict:
-    """PRIMER paso para crear un producto nuevo (requiere clave nivel 3):
+    """PRIMER paso para crear un producto nuevo (rol Administrador de inventario):
     valida los datos y guarda un borrador — NO crea nada todavía. Si algún
     dato falta o es inválido, devuelve el error exacto para corregirlo.
     Devuelve un borrador_id que DEBE confirmarse con confirmar_producto.
@@ -406,9 +384,9 @@ def proponer_producto(
     al público. El campo 'imagen' solo acepta una URL pública http(s); si
     tienes la foto como archivo/base64, crea primero el producto y luego
     adjúntala con adjuntar_imagen."""
-    nivel = _requiere_nivel(3)
-    if nivel:
-        return nivel
+    permiso = _requiere_permiso("proponer_producto")
+    if permiso:
+        return permiso
     tenant = tenant_de_request()
     try:
         return mcp_escritura.proponer(tenant, clave_de_request(), {
@@ -433,15 +411,15 @@ def proponer_producto(
 
 @servidor.tool(annotations=CONFIRMACION)
 def confirmar_producto(borrador_id: str) -> dict:
-    """SEGUNDO y último paso para crear un producto (requiere clave nivel 3):
+    """SEGUNDO y último paso para crear un producto (rol Administrador de inventario):
     crea el producto en el inventario DESDE el borrador que el dueño ya
     revisó. Usa SIEMPRE el borrador_id que devolvió proponer_producto — no
     reenvíes los datos. El borrador se consume: cada uno solo puede
     confirmarse una vez y expira a los 15 minutos. El alta queda registrada
     en el Historial del gestor como creada por el agente IA."""
-    nivel = _requiere_nivel(3)
-    if nivel:
-        return nivel
+    permiso = _requiere_permiso("confirmar_producto")
+    if permiso:
+        return permiso
     tenant = tenant_de_request()
     try:
         datos = mcp_borradores.consumir_borrador(
@@ -477,7 +455,7 @@ def confirmar_producto(borrador_id: str) -> dict:
 def proponer_edicion(
     tipo: str, entidad_id: int, cambios: dict
 ) -> dict:
-    """PRIMER paso para EDITAR algo del inventario (requiere clave nivel 3):
+    """PRIMER paso para EDITAR algo del inventario (rol Administrador de inventario):
     valida los cambios y guarda un borrador con el diff antes→después — NO
     edita nada todavía. tipos y campos:
     - tipo 'producto' (entidad_id = id del producto): descripcion, nombre,
@@ -490,9 +468,9 @@ def proponer_edicion(
     - tipo 'gasto' (id del gasto): monto, categoria, descripcion.
     Devuelve el diff legible y un borrador_id que DEBE confirmarse con
     confirmar_edicion. Si un campo no aplica, devuelve el error exacto."""
-    nivel = _requiere_nivel(3)
-    if nivel:
-        return nivel
+    permiso = _requiere_permiso("proponer_edicion")
+    if permiso:
+        return permiso
     tenant = tenant_de_request()
     try:
         return mcp_escritura.proponer_edicion(
@@ -505,15 +483,15 @@ def proponer_edicion(
 
 @servidor.tool(annotations=CONFIRMACION)
 def confirmar_edicion(borrador_id: str) -> dict:
-    """SEGUNDO y último paso para EDITAR (requiere clave nivel 3): aplica los
+    """SEGUNDO y último paso para EDITAR (rol Administrador de inventario): aplica los
     cambios que el dueño ya revisó. Usa SIEMPRE el borrador_id que devolvió
     proponer_edicion — no reenvíes los cambios. El borrador se consume (una
     sola vez, expira a los 15 minutos). La edición queda registrada en el
     Historial del gestor como hecha por el agente IA ('El agente IA editó
     el producto/la venta/el gasto...')."""
-    nivel = _requiere_nivel(3)
-    if nivel:
-        return nivel
+    permiso = _requiere_permiso("confirmar_edicion")
+    if permiso:
+        return permiso
     tenant = tenant_de_request()
     try:
         datos = mcp_borradores.consumir_borrador(
@@ -550,7 +528,7 @@ def adjuntar_imagen(
     producto_id: int, imagen_base64: str, destino: str = "principal",
     encaje: str = "marco", fondo: str = "blanco",
 ) -> dict:
-    """Adjunta una IMAGEN a un producto del inventario (requiere clave nivel 3).
+    """Adjunta una IMAGEN a un producto del inventario (roles Diseñador o Administrador de inventario).
     Úsala SIEMPRE que tengas una foto de un producto como archivo/base64, sea
     para un producto recién creado o para cambiar/agregar la foto de uno que
     ya existe — es la única vía para fotos que no son una URL pública.
@@ -573,9 +551,9 @@ def adjuntar_imagen(
     Efecto inmediato: la foto queda en el producto en esta misma llamada y en
     el Historial del gestor como adjuntada por el agente IA. Cuenta para la
     cuota diaria de escrituras de la clave."""
-    nivel = _requiere_nivel(3)
-    if nivel:
-        return nivel
+    permiso = _requiere_permiso("adjuntar_imagen")
+    if permiso:
+        return permiso
     tenant = tenant_de_request()
     if not contar_escritura(clave_de_request()):
         return {
@@ -591,6 +569,84 @@ def adjuntar_imagen(
     except Exception as e:
         print(f"[MCP] adjuntar_imagen fallo: {type(e).__name__}: {e}")
         return {"error": f"No se pudo adjuntar la imagen: {e}"}
+
+
+# ── Rol Diseñador: gestión de las fotos del catálogo ──────────────────────────
+# Solo el rol disenador las ve. eliminar y reordenar son escritura: destructiveHint
+# (aprobación humana por llamada) + cuota de escrituras, mismo patrón que el resto.
+
+@servidor.tool(annotations=SOLO_LECTURA)
+def config_catalogo() -> dict:
+    """Configuración VISUAL del catálogo del negocio (rol Diseñador): la
+    relación de aspecto con la que se muestran las fotos de producto
+    ('1:1' cuadrada o '4:5' vertical), el color de fondo del catálogo, el
+    tema visual y el título. CONSÚLTALA ANTES de generar o adjuntar imágenes:
+    las fotos que generes deben usar esa MISMA relación de aspecto y combinar
+    con el fondo/tema — adjuntar_imagen con encaje 'marco' ya rellena el
+    borde automáticamente hasta esa proporción."""
+    permiso = _requiere_permiso("config_catalogo")
+    if permiso:
+        return permiso
+    tenant = tenant_de_request()
+    try:
+        return mcp_imagenes.config_catalogo(tenant)
+    except Exception as e:
+        return {"error": f"No se pudo leer la configuración del catálogo: {e}"}
+
+
+@servidor.tool(annotations=CONFIRMACION)
+def eliminar_imagen(producto_id: int, imagen_id: int | None = None, destino: str | None = None) -> dict:
+    """Elimina una imagen de un producto (rol Diseñador). Úsala cuando el
+    dueño diga que una foto se ve mal, quedó repetida o hay que sacar la que
+    se reemplazó:
+    - imagen_id (id de una foto de la GALERÍA, el que devuelve
+      datos_para_publicar en fotos.galeria): borra esa foto, y si era la
+      principal promueve la siguiente automáticamente.
+    - destino 'principal': elimina SOLO la foto principal del producto (la
+      siguiente de la galería asciende a principal si existe).
+    Envía imagen_id O destino, no ambos. El borrado es definitivo (la foto
+    desaparece del producto y del almacenamiento)."""
+    permiso = _requiere_permiso("eliminar_imagen")
+    if permiso:
+        return permiso
+    tenant = tenant_de_request()
+    if not contar_escritura(clave_de_request()):
+        return {
+            "error": (
+                "Límite diario de escrituras alcanzado para esta clave. "
+                "El dueño puede ajustarla en Ajustes → Negocio → Conectar mi IA."
+            )
+        }
+    try:
+        return mcp_imagenes.eliminar(tenant, producto_id, imagen_id, destino)
+    except Exception as e:
+        print(f"[MCP] eliminar_imagen fallo: {type(e).__name__}: {e}")
+        return {"error": f"No se pudo eliminar la imagen: {e}"}
+
+
+@servidor.tool(annotations=CONFIRMACION)
+def reordenar_imagenes(producto_id: int, orden_ids: list[int]) -> dict:
+    """Reordena las fotos de la galería de un producto (rol Diseñador, plan
+    Plus). Recibe TODOS los ids de las fotos (los de datos_para_publicar en
+    fotos.galeria) en el orden nuevo: la PRIMERA del array pasa a ser la foto
+    principal del producto, el resto le sigue. Úsala cuando el dueño diga
+    'que la foto X sea la principal' o 'pon esta foto primero'."""
+    permiso = _requiere_permiso("reordenar_imagenes")
+    if permiso:
+        return permiso
+    tenant = tenant_de_request()
+    if not contar_escritura(clave_de_request()):
+        return {
+            "error": (
+                "Límite diario de escrituras alcanzado para esta clave. "
+                "El dueño puede ajustarla en Ajustes → Negocio → Conectar mi IA."
+            )
+        }
+    try:
+        return mcp_imagenes.reordenar(tenant, producto_id, orden_ids or [])
+    except Exception as e:
+        print(f"[MCP] reordenar_imagenes fallo: {type(e).__name__}: {e}")
+        return {"error": f"No se pudo reordenar las imágenes: {e}"}
 
 
 # ── App ASGI: streamable HTTP + middleware de API key ────────────────────────
