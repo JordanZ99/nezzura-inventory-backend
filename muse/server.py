@@ -229,9 +229,10 @@ def datos_para_publicar(producto_id: int) -> dict:
     """Única vía para VER el detalle completo de un producto o PUBLICARLO:
     agrega en UNA llamada todo lo necesario — ficha completa (nombre,
     descripción, precio de venta, stock, tamaño, categoría, variaciones) más
-    sus fotos con URLs descargables. Nunca incluye costos internos (es el
-    canal público); el costo individual con permiso 'ver costos' se lee con
-    buscar_productos o listar_productos."""
+    sus fotos con URLs descargables e ids (el 'id' de cada foto de
+    fotos.galeria es el que piden eliminar_imagen y reordenar_imagenes).
+    Nunca incluye costos internos (es el canal público); el costo individual
+    con permiso 'ver costos' se lee con buscar_productos o listar_productos."""
     tenant = tenant_de_request()
     try:
         paquete = cat.datos_para_publicar(tenant, producto_id)

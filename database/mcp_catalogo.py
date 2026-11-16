@@ -270,6 +270,12 @@ def obtener_fotos(tenant_id: str, producto_id: int) -> dict | None:
     Galería del producto: foto principal (productos.Imagen) + extras
     (producto_imagenes, tenants Plus), sin duplicados ni "No hay foto".
     Son URLs públicas de Cloudinary: el agente las descarga directo.
+
+    Cada foto llega como objeto {"id", "url", "orden", "es_principal"}: el
+    "id" es el de producto_imagenes y es lo que las tools del rol Diseñador
+    (eliminar_imagen / reordenar_imagenes) piden. La foto principal sin fila
+    en la galería (plan básico o desync pre-galería) llega con id null —
+    para esa existe eliminar_imagen con destino='principal'.
     """
     filas = query(
         """
@@ -283,24 +289,56 @@ def obtener_fotos(tenant_id: str, producto_id: int) -> dict | None:
     if not filas:
         return None
 
-    galeria: list[str] = []
-    principal = filas[0].get("imagen")
-    if principal and principal != "No hay foto":
-        galeria.append(principal)
+    principal_url = filas[0].get("imagen")
 
     extras = query(
-        "SELECT url FROM producto_imagenes "
+        "SELECT id, url, orden FROM producto_imagenes "
         "WHERE producto_id = %s AND tenant_id = %s ORDER BY orden ASC",
         (producto_id, tenant_id),
     )
+
+    galeria: list[dict] = []
+    vistas: set[str] = set()
+    foto_principal_id: int | None = None
+
+    # La fila orden=1 es la principal oficial de la galería (invariante Plus:
+    # se sincroniza con productos.Imagen). Si la URL no coincide (desync
+    # pre-galería), la primera foto es la de productos.Imagen SIN id.
+    fila1 = next((e for e in extras if e["orden"] == 1), None)
+    if principal_url and principal_url != "No hay foto":
+        if fila1 and fila1["url"] == principal_url:
+            foto_principal_id = fila1["id"]
+        galeria.append({
+            "id": foto_principal_id,
+            "url": principal_url,
+            "orden": fila1["orden"] if foto_principal_id is not None else None,
+            "es_principal": True,
+        })
+        vistas.add(principal_url)
+
     for e in extras:
-        if e.get("url") and e["url"] not in galeria:
-            galeria.append(e["url"])
+        url = e.get("url")
+        if not url or url in vistas:
+            continue
+        galeria.append({
+            "id": e["id"],
+            "url": url,
+            "orden": e["orden"],
+            "es_principal": False,
+        })
+        vistas.add(url)
 
     return {
-        "foto_principal": galeria[0] if galeria else None,
+        "foto_principal": galeria[0]["url"] if galeria else None,
+        "foto_principal_id": foto_principal_id,
         "galeria": galeria,
         "total": len(galeria),
+        "nota": (
+            "Usa el id de cada foto de galeria para eliminar_imagen y "
+            "reordenar_imagenes; la foto con id null (solo principal, sin "
+            "fila de galería) se elimina con eliminar_imagen y "
+            "destino='principal'."
+        ),
     }
 
 
