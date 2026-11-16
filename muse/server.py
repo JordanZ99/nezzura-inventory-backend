@@ -484,13 +484,20 @@ def proponer_venta(
     pagos: [{metodo, monto}, ...] que cuadren con el total); déjalo vacío para
     un ticket sin método), fecha del ticket ('YYYY-MM-DD', para tickets de
     otro día; nunca futura) y nota libre para el Historial.
-    REGLA DE ORO con tickets ilegibles: registra SOLO los renglones que puedas
-    leer con certeza y pregúntale al dueño por el resto — nunca adivines un
-    renglón ni lo omitas en silencio (mejor 2 renglones correctos que 5
-    inventados). Un producto que no existe devuelve error: NO inventes uno,
-    usa buscar_productos o propón venta libre.
-    Devuelve el desglose REAL del carrito (nombres y precios del inventario):
-    muéstraselo al dueño tal cual y espera su aprobación. Si la da, llama
+    REGLAS DE PROPUESTA (propón, no interrogues): ante un renglón ambiguo
+    arma el carrito con tu MEJOR interpretación usando señales reales —
+    precio del ticket = precio del inventario, nombre parcial, stock que el
+    desglose te devuelve — y márcala. Corregir es solo volver a proponer
+    (nada se registra sin la aprobación del dueño): cierra con UNA sola
+    pregunta, '¿lo registro así o corriges algo?'. Precio del ticket = precio
+    unitario por default. Un nombre que no existe: propón el producto cuyo
+    precio coincida o sea el más cercano (di por qué) o regístralo como venta
+    libre con motivo. Vender más del stock está permitido y el desglose lo
+    avisa. Con tickets ilegibles: registra solo lo que puedas leer con
+    certeza y di en la MISMA pregunta qué no pudiste leer — nunca inventes
+    un renglón, un producto_id ni un precio.
+    Devuelve el desglose REAL del carrito (nombres, precios y stock del
+    inventario): muéstraselo al dueño tal cual. Si aprueba, llama
     confirmar_venta con el borrador_id; si pide corregir, vuelve a proponer la
     venta corregida (el borrador anterior expira solo)."""
     permiso = _requiere_permiso("proponer_venta")

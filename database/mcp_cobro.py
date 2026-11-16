@@ -44,9 +44,13 @@ METODOS_VENTA = ("efectivo", "tarjeta_debito", "tarjeta_credito", "mixto")
 # Resolución de UN producto por id (o nombre exacto) con su precio default
 # de lotes: MAX(Precio_Venta) entre lotes CON stock; si ninguno tiene stock,
 # el MAX histórico de los lotes activos (idéntico al catálogo público).
+# El stock disponible viaja en el desglose: es la evidencia que le permite al
+# agente mostrar "propones 2 y hay 1" sin inventar números.
 _SQL_PRODUCTO = f"""
     SELECT p.id, p.Producto AS producto, p.tipo_producto, p.fraccionable,
-           p.Estado AS estado, {_PRECIO_VENTA} AS precio
+           p.Estado AS estado,
+           COALESCE(SUM(CASE WHEN l.Stock_Lote > 0 THEN l.Stock_Lote END), 0) AS stock,
+           {_PRECIO_VENTA} AS precio
     FROM productos p
     LEFT JOIN lotes l ON l.producto_id = p.id AND l.tenant_id = p.tenant_id
                       AND l.Estado = 'Activo'
@@ -56,7 +60,9 @@ _SQL_PRODUCTO = f"""
 
 _SQL_PRODUCTO_POR_NOMBRE = f"""
     SELECT p.id, p.Producto AS producto, p.tipo_producto, p.fraccionable,
-           p.Estado AS estado, {_PRECIO_VENTA} AS precio
+           p.Estado AS estado,
+           COALESCE(SUM(CASE WHEN l.Stock_Lote > 0 THEN l.Stock_Lote END), 0) AS stock,
+           {_PRECIO_VENTA} AS precio
     FROM productos p
     LEFT JOIN lotes l ON l.producto_id = p.id AND l.tenant_id = p.tenant_id
                       AND l.Estado = 'Activo'
@@ -244,6 +250,7 @@ def proponer_venta(tenant_id: str, clave_id: int, items, pago=None, fecha=None, 
     # ── 1-4: normalizar y resolver cada item contra la BD ──
     resueltos: list[dict] = []
     desglose: list[dict] = []
+    avisos: list[str] = []       # sobreventa + anti-flojera (el dueño los ve al aprobar)
     libres_descripcion: list[str] = []
     for i, item in enumerate(items, 1):
         if not isinstance(item, dict):
@@ -365,6 +372,12 @@ def proponer_venta(tenant_id: str, clave_id: int, items, pago=None, fecha=None, 
         if (prod.get("estado") or "Activo") != "Activo":
             return {"error": f"'{nombre_real}' está inactivo en el inventario: no se puede vender."}
 
+        # Stock disponible (suma de lotes activos con stock): viaja al desglose
+        # y dispara el aviso de sobreventa. Vender MÁS del stock está permitido
+        # (el motor PEPS deja el lote en negativo, igual que el POS) — el dueño
+        # lo ve al aprobar y decide si el conteo del inventario estaba mal.
+        stock_disponible = float(prod.get("stock") or 0)
+
         # Precio: el del item si lo envió; el default de lotes si no. El agente
         # nunca calcula precios — y si la BD no tiene precio, se pide explícito.
         if item.get("precio_real") is not None:
@@ -428,6 +441,7 @@ def proponer_venta(tenant_id: str, clave_id: int, items, pago=None, fecha=None, 
             "cantidad": cantidad,
             "precio_unitario": precio_real,
             "subtotal": round(precio_real * cantidad, 2),
+            "stock": stock_disponible,
         }
         if precio_default is not None:
             renglon["precio_de_lista"] = True  # el agente no lo inventó: salió de la BD
@@ -437,15 +451,24 @@ def proponer_venta(tenant_id: str, clave_id: int, items, pago=None, fecha=None, 
             renglon["lote_elegido"] = {"id": id_lote, "stock": stock_lote}
         desglose.append(renglon)
 
+        if cantidad > stock_disponible:
+            avisos.append(
+                f"⚠ '{nombre_real}': propones vender {cantidad:g} y el gestor "
+                f"registra {stock_disponible:g} — el cobro dejará el stock en "
+                "negativo; ajusta el conteo del inventario si no era así."
+            )
+
     # ── 5: anti-flojera de la venta libre (aviso, no bloqueo) ──
-    avisos = [
+    avisos.extend(
         (
             f"⚠ '{a['descripcion']}' parece estar en tu inventario como "
             f"'{a['producto']}' (${a['precio']:.2f}): confirma con el dueño que "
             "realmente es venta libre y no un producto del inventario."
         )
         for a in _avisos_venta_libre(libres_descripcion, tenant_id)
-    ]
+    )
+    # Sin duplicados (el mismo renglón repetido no repite el aviso).
+    avisos = list(dict.fromkeys(avisos))
 
     total_estimado = round(sum(d["subtotal"] for d in desglose), 2)
 
@@ -481,10 +504,12 @@ def proponer_venta(tenant_id: str, clave_id: int, items, pago=None, fecha=None, 
         "metodo_pago": pago.get("metodo") if isinstance(pago, dict) else None,
         "avisos": avisos,
         "siguiente_paso": (
-            "Nada se ha registrado todavía. Muestra ESTE desglose al dueño y "
-            "espera su aprobación; solo si la da, llama a confirmar_venta con "
-            "este borrador_id. Si pide corregir algo, vuelve a proponer la "
-            "venta corregida (este borrador expira solo)."
+            "Nada se ha registrado todavía. Muestra ESTE desglose al dueño tal "
+            "cual —con el porqué de cada renglón dudoso si lo hubo— y haz UNA "
+            "sola pregunta: '¿lo registro así o corriges algo?'. Solo si "
+            "aprueba, llama a confirmar_venta con este borrador_id; si pide "
+            "corregir, vuelve a proponer la venta corregida (este borrador "
+            "expira solo)."
         ),
     }
     if fecha:
