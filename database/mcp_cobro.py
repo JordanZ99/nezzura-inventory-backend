@@ -29,6 +29,7 @@ from datetime import date
 
 from database import mcp_borradores
 from database.actividad import registrar_actividad
+from database.conexion import query
 from database.helpers import hoy_negocio
 from database.mcp_catalogo import _PRECIO_VENTA, _normalizar
 from database.ventas import METODOS_PAGO, actualizar_orden, cobrar_carrito
