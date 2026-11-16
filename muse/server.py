@@ -17,6 +17,9 @@
 #                   del catálogo (7 tools).
 #   "inventario"  → + crear y editar productos con patrón borrador→confirmar
 #                   (9 tools).
+#   "cajero"      → registrar ventas por chat (proponer_venta →
+#                   confirmar_venta; 3 tools). El dueño aprueba el desglose
+#                   del carrito antes de que se registre nada.
 #
 # Modo del transporte:
 #   - stateless_http=True: cada POST es autosuficiente (sin sesiones en el
@@ -54,6 +57,7 @@ from mcp.types import Tool, ToolAnnotations
 from database import mcp_analisis
 from database import mcp_borradores
 from database import mcp_catalogo as cat
+from database import mcp_cobro
 from database import mcp_escritura
 from database import mcp_imagenes
 from database import mcp_ventas
@@ -445,6 +449,101 @@ def confirmar_producto(borrador_id: str) -> dict:
             )
         }
     return mcp_escritura.confirmar(tenant, datos)
+
+
+# ── Rol Cajero: registrar ventas por chat (borrador → confirmar) ──────────────
+# El humano es el guardián: proponer_venta resuelve cada producto contra la BD,
+# arma el desglose REAL (nombres/precios del inventario) y lo devuelve para que
+# el dueño lo apruebe en el chat; confirmar_venta registra con el MISMO motor
+# del POS (cobrar_carrito: PEPS, pago, orden con n_ticket). El borrador solo
+# guarda productos resueltos por el backend — un producto inventado es
+# estructuralmente imposible de registrar. La venta queda en el Historial como
+# hecha por el agente IA (origen 'agente_ia'), sin costos en la respuesta.
+
+@servidor.tool(annotations=SOLO_LECTURA)
+def proponer_venta(
+    items: list[dict],
+    pago: dict | None = None,
+    fecha: str | None = None,
+    nota: str = "",
+) -> dict:
+    """PRIMER paso para registrar una VENTA (rol Cajero): arma el carrito, lo
+    valida y guarda un borrador — NO registra nada todavía. Úsalo cuando el
+    dueño te diga qué vendió o te pase la FOTO de un ticket.
+    Cada item de 'items' es un dict:
+    - producto_id: el id que devuelve buscar_productos, con cantidad (número
+      > 0). También acepta 'producto' (nombre EXACTO del inventario), pero el
+      id es más seguro. Opcionales: precio_real (si no lo envías se usa el
+      precio de los lotes — nunca calcules precios tú), variacion ('Grande')
+      e id_lote (deja vacío y el sistema elige el lote más viejo, PEPS).
+    - Venta libre (lo vendido NO está en el inventario): venta_libre=true con
+      descripcion (qué se vendió), precio_real (>0) y motivo (por qué no está
+      en el inventario — queda en el Historial del gestor).
+    Opcionales a nivel de venta: pago ({metodo: 'efectivo' (con
+    monto_recibido), 'tarjeta_debito', 'tarjeta_credito' o 'mixto' (con
+    pagos: [{metodo, monto}, ...] que cuadren con el total); déjalo vacío para
+    un ticket sin método), fecha del ticket ('YYYY-MM-DD', para tickets de
+    otro día; nunca futura) y nota libre para el Historial.
+    REGLA DE ORO con tickets ilegibles: registra SOLO los renglones que puedas
+    leer con certeza y pregúntale al dueño por el resto — nunca adivines un
+    renglón ni lo omitas en silencio (mejor 2 renglones correctos que 5
+    inventados). Un producto que no existe devuelve error: NO inventes uno,
+    usa buscar_productos o propón venta libre.
+    Devuelve el desglose REAL del carrito (nombres y precios del inventario):
+    muéstraselo al dueño tal cual y espera su aprobación. Si la da, llama
+    confirmar_venta con el borrador_id; si pide corregir, vuelve a proponer la
+    venta corregida (el borrador anterior expira solo)."""
+    permiso = _requiere_permiso("proponer_venta")
+    if permiso:
+        return permiso
+    tenant = tenant_de_request()
+    try:
+        return mcp_cobro.proponer_venta(
+            tenant, clave_de_request(), items or [], pago, fecha, nota
+        )
+    except Exception as e:
+        print(f"[MCP] proponer_venta fallo: {type(e).__name__}: {e}")
+        return {"error": f"No se pudo proponer la venta: {e}"}
+
+
+@servidor.tool(annotations=CONFIRMACION)
+def confirmar_venta(borrador_id: str) -> dict:
+    """SEGUNDO y último paso para registrar una venta (rol Cajero): cobra el
+    carrito DESDE el borrador que el dueño ya aprobó — descuenta el stock
+    (PEPS), genera el ticket y el pago, igual que el POS. Usa SIEMPRE el
+    borrador_id que devolvió proponer_venta — no reenvíes los items. Llámalo
+    SOLO cuando el dueño haya visto el desglose y lo haya aprobado: cada
+    confirmación registra una venta real con su ticket. El borrador se consume
+    (una sola vez, expira a los 15 minutos). La venta queda en el Historial
+    del gestor como registrada por el agente IA; si el ticket era de otro día,
+    queda con ESA fecha."""
+    permiso = _requiere_permiso("confirmar_venta")
+    if permiso:
+        return permiso
+    tenant = tenant_de_request()
+    try:
+        datos = mcp_borradores.consumir_borrador(
+            tenant, clave_de_request(), (borrador_id or "").strip()
+        )
+    except Exception as e:
+        return {"error": f"No se pudo recuperar el borrador: {e}"}
+    if datos is None:
+        return {
+            "error": (
+                "El borrador no existe, ya se confirmó antes o expiró (15 min). "
+                "Vuelve a proponer la venta con proponer_venta."
+            )
+        }
+    # Cuota de escrituras ANTES de ejecutar (patrón de confirmar_producto):
+    # cada venta registrada gasta una escritura de la clave.
+    if not contar_escritura(clave_de_request()):
+        return {
+            "error": (
+                "Límite diario de escrituras alcanzado para esta clave. "
+                "El dueño puede ajustarla en Ajustes → Negocio → Conectar mi IA."
+            )
+        }
+    return mcp_cobro.confirmar_venta(tenant, datos)
 
 
 # ── Nivel 3: EDICIONES (mismo patrón borrador → confirmar) ───────────────────

@@ -113,6 +113,32 @@ ROLES = {
             "Historial como hecho por el agente IA."
         ),
     },
+    # ── CAJERO: registrar ventas por chat (el dueño aprueba el desglose). ──
+    # Escritura de VENTAS (nivel 3): descuenta stock y genera tickets con el
+    # MISMO motor del POS, pero SIEMPRE vía borrador→confirmar; el dueño ve
+    # el desglose real del carrito antes de aprobar.
+    "cajero": {
+        "nombre": "Cajero",
+        "nivel": 3,
+        "tools": (
+            "buscar_productos",
+            "proponer_venta",
+            "confirmar_venta",
+        ),
+        "instrucciones": (
+            "Tu rol es REGISTRAR VENTAS: cuando el dueño te diga qué vendió o "
+            "te pase la FOTO de un ticket, identifica cada producto con "
+            "buscar_productos y arma la venta con proponer_venta (envía el "
+            "producto_id de cada renglón). Muestra al dueño el desglose que "
+            "te devuelve y espera su aprobación ANTES de llamar a "
+            "confirmar_venta. Si un renglón del ticket no puedes leerlo con "
+            "certeza, pregúntale — nunca lo adivines ni lo omitas en "
+            "silencio: mejor registrar 2 renglones correctos que 5 "
+            "inventados. Si vendió algo que NO está en el inventario, "
+            "regístralo como venta libre con su motivo (queda en el "
+            "Historial)."
+        ),
+    },
 }
 
 # Tool → roles que la incluyen (derivado, nunca se edita a mano).
