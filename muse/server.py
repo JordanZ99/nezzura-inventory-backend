@@ -62,6 +62,7 @@ from database import mcp_borradores
 from database import mcp_catalogo as cat
 from database import mcp_cobro
 from database import mcp_escritura
+from database import mcp_estilos
 from database import mcp_gastos
 from database import mcp_compras
 from database import mcp_imagenes
@@ -89,12 +90,43 @@ class ServidorMuse(MCPServer):
     inventario) y el agente solo conoce la UNIÓN de las tools de esos roles —
     modelo 'toolsets' como el servidor MCP oficial de GitHub. Menos tools
     visibles = mejor selección y menos alucinación. Roles vacíos (claves
-    pre-081) = todas las tools."""
+    pre-081) = todas las tools.
+
+    Además REFRESCA la descripción de estilos_foto en cada tools/list con los
+    COMANDOS de foto vigentes del tenant (database/mcp_estilos): el dueño
+    puede cambiar el comando o añadir otros, y el agente lo ve en el próximo
+    tools/list sin re-desplegar nada."""
 
     async def list_tools(self) -> list[Tool]:
         roles = roles_de_request()
         tools = await super().list_tools()
-        return [t for t in tools if herramienta_en_roles(t.name, roles)]
+        visibles = []
+        for t in tools:
+            if not herramienta_en_roles(t.name, roles):
+                continue
+            if t.name == "estilos_foto":
+                # Copia con los comandos vigentes (nunca se muta el original:
+                # otros requests de otros tenants leen el mismo objeto).
+                try:
+                    comandos = mcp_estilos.comandos_resumen(tenant_de_request())
+                except Exception:
+                    comandos = mcp_estilos.DEFAULT_ESTUDIO["comando"]
+                t = t.model_copy(update={"description": _descripcion_estilos_foto(comandos)})
+            visibles.append(t)
+        return visibles
+
+
+def _descripcion_estilos_foto(comandos: str) -> str:
+    return (
+        "Devuelve los COMANDOS DE FOTO del negocio con su prompt exacto. "
+        f"Vigentes: {comandos}. Cuando el dueño escriba uno de esos "
+        "comandos —o pida quitar/limpiar el fondo, retocar la foto o "
+        "ponerla en fondo de estudio—: elige el preset que corresponda, "
+        "copia su prompt TAL CUAL y aplícalo a la imagen que te dio el "
+        "dueño (sin cambiar el producto), luego adjunta el resultado con "
+        "adjuntar_imagen. Consulta config_catalogo antes para la proporción "
+        "del catálogo. Nunca inventes un prompt propio: usa el del preset."
+    )
 
 
 servidor = ServidorMuse(
@@ -104,7 +136,11 @@ servidor = ServidorMuse(
         "que ves son EXACTAMENTE las de tu rol: úsalas todas con confianza y "
         "no asumas que existen otras (si algo no está en tu lista, dilo y "
         "pediráselo al dueño). El catálogo son productos físicos con precio "
-        "de venta al público, descripción, tamaño, stock y fotos. Algunas "
+        "de venta al público, descripción, tamaño, stock y fotos. Si tu rol "
+        "incluye fotos y el dueño escribe un comando de foto (empieza con "
+        "'/', ej. /img) o pide quitar el fondo, retocar la foto o ponerla "
+        "en fondo de estudio: llama estilos_foto, usa el prompt del preset "
+        "tal cual y adjunta el resultado con adjuntar_imagen. Algunas "
         "claves tienen el permiso 'ver costos': si una respuesta incluye "
         "campos de costo o margen, son datos internos del dueño — NUNCA los "
         "menciones en publicaciones, frente a compradores ni en el catálogo "
@@ -864,6 +900,19 @@ def config_catalogo() -> dict:
         return mcp_imagenes.config_catalogo(tenant)
     except Exception as e:
         return {"error": f"No se pudo leer la configuración del catálogo: {e}"}
+
+
+@servidor.tool(annotations=SOLO_LECTURA)
+def estilos_foto() -> dict:
+    """(La descripción que ve el agente la arma ServidorMuse.list_tools con
+    los comandos vigentes del tenant — ver _descripcion_estilos_foto. Esta
+    docstring es solo para desarrolladores.)"""
+    tenant = tenant_de_request()
+    try:
+        return mcp_estilos.presets_para_mcp(tenant)
+    except Exception as e:
+        print(f"[MCP] estilos_foto fallo: {type(e).__name__}: {e}")
+        return {"error": "No se pudieron leer los comandos de foto del negocio."}
 
 
 @servidor.tool(annotations=CONFIRMACION)

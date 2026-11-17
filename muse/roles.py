@@ -75,6 +75,7 @@ ROLES = {
             "listar_productos",
             "datos_para_publicar",
             "config_catalogo",
+            "estilos_foto",
             "adjuntar_imagen",
             "eliminar_imagen",
             "reordenar_imagenes",
@@ -84,9 +85,15 @@ ROLES = {
             "adjuntar una imagen, consulta config_catalogo para conocer la "
             "relación de aspecto (1:1 o 4:5) y el fondo del catálogo, y "
             "encaja las fotos a esa proporción (adjuntar_imagen lo hace "
-            "solo con encaje 'marco'). Puedes reemplazar la foto principal, "
-            "agregar a la galería, eliminar la que se ve mal y reordenar "
-            "cuál va primero. Nunca tocas precios, stock ni textos."
+            "solo con encaje 'marco'). Cuando el dueño escriba un comando "
+            "de foto o pida quitar/limpiar el fondo, retocar la foto o "
+            "ponerla en fondo de estudio: llama estilos_foto, toma el "
+            "prompt del preset que corresponda, aplícalo a la imagen que te "
+            "dio el dueño (sin cambiar el producto) y adjunta el resultado "
+            "con adjuntar_imagen. Nunca inventes un prompt propio. Puedes "
+            "reemplazar la foto principal, agregar a la galería, eliminar "
+            "la que se ve mal y reordenar cuál va primero. Nunca tocas "
+            "precios, stock ni textos."
         ),
     },
     # ── INVENTARIO: crear y mantener productos (antes nivel 3).
@@ -98,6 +105,7 @@ ROLES = {
             "listar_productos",
             "stock_actual",
             "listar_categorias",
+            "estilos_foto",
             "proponer_producto",
             "confirmar_producto",
             "proponer_edicion",
@@ -109,7 +117,10 @@ ROLES = {
             "primero (guarda el borrador) y confirmar_* después con el "
             "borrador_id. Si un dato falta, el tool te dirá exactamente qué "
             "corregir. Al crear un producto con foto, confírmalo y adjunta "
-            "la imagen con adjuntar_imagen. Cada cambio queda en el "
+            "la imagen con adjuntar_imagen. Cuando el dueño escriba un "
+            "comando de foto o pida quitar el fondo/retocarla: llama "
+            "estilos_foto, usa el prompt del preset tal cual y adjunta el "
+            "resultado con adjuntar_imagen. Cada cambio queda en el "
             "Historial como hecho por el agente IA."
         ),
     },
@@ -238,11 +249,23 @@ def nombres_de_rol(tool: str) -> str:
     return ", ".join(ROLES[r]["nombre"] for r in ROL_DE_TOOL.get(tool, ()))
 
 
-def instrucciones_para(roles) -> str:
+def instrucciones_para(roles, comandos: str | None = None) -> str:
     """Instrucciones del servidor para una clave: reglas globales + el brief
     de cada rol activo (cortos a propósito: el contexto largo genérico es lo
-    que confunde al agente)."""
+    que confunde al agente). `comandos` es el resumen de comandos de foto del
+    tenant (database/mcp_estilos.comandos_resumen): si viene y la clave tiene
+    roles de foto, se añade el párrafo del comando con los comandos VIGENTES."""
     partes = [ROLES[r]["instrucciones"] for r in (roles or ()) if r in ROLES]
+    if comandos and any(r in ("disenador", "inventario") for r in (roles or ())):
+        partes.append(
+            "COMANDOS DE FOTO de este negocio: " + comandos + ". Cuando el "
+            "dueño escriba uno de ellos —o pida quitar/limpiar el fondo, "
+            "retocar la foto o ponerla en fondo de estudio— llama "
+            "estilos_foto, toma el prompt del preset y aplícalo a la imagen "
+            "que te dio el dueño (sin cambiar el producto); luego adjunta el "
+            "resultado con adjuntar_imagen, tras consultar config_catalogo "
+            "para la proporción."
+        )
     if not partes:
         return ""  # legacy: sin roles se usa el texto global del servidor
     return "\n\n".join(partes)

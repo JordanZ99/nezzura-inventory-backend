@@ -15,9 +15,10 @@
 from fastapi import APIRouter, Depends, HTTPException
 
 from database import mcp_claves
+from database import mcp_estilos
 from dependencies import get_tenant_id
 from muse.roles import ROLES
-from schemas.mcp import CrearClaveMcp, EditarClaveMcp
+from schemas.mcp import CrearClaveMcp, CrearPresetFotoMcp, EditarClaveMcp, GuardarPresetFotoMcp
 
 router = APIRouter(prefix="/mcp-conexion", tags=["Conector IA (MCP)"])
 
@@ -107,4 +108,68 @@ def eliminar_clave(clave_id: int, tenant_id: str = Depends(get_tenant_id)):
     """
     if not mcp_claves.revocar_clave(clave_id, tenant_id):
         raise HTTPException(status_code=404, detail="Clave no encontrada")
+    return {"ok": True}
+
+
+# ── Presets de FOTO por comando (082) ────────────────────────────────────────
+# El dueño define comandos de foto (ej. /img) con su prompt: cuando escribe el
+# comando en el chat —o pide quitar el fondo, retocar la foto...— el agente
+# llama estilos_foto y aplica el prompt del preset a la imagen que le dieron.
+
+@router.get("/estilos-foto")
+def listar_estilos(tenant_id: str = Depends(get_tenant_id)):
+    """
+    Presets de foto del tenant para la UI: el DEFAULT ('estudio', con su
+    override si el dueño lo editó y el prompt recomendado para restaurar) +
+    los presets extra (activos e inactivos).
+    """
+    return {"presets": mcp_estilos.listar_para_gestor(tenant_id)}
+
+
+@router.put("/estilos-foto/{clave}")
+def guardar_estilo(
+    clave: str, data: GuardarPresetFotoMcp, tenant_id: str = Depends(get_tenant_id)
+):
+    """
+    Edita un preset: comando, nombre y prompt. El default 'estudio' guarda un
+    override (borrarlo devuelve el prompt recomendado del código); los extras
+    se actualizan directo en su fila.
+    """
+    resultado = mcp_estilos.editar_preset(
+        tenant_id, clave, data.comando, data.nombre or "", data.prompt
+    )
+    if resultado.get("ok") is False:
+        raise HTTPException(
+            status_code=resultado.get("status", 422),
+            detail=resultado.get("mensaje", "No se pudo guardar el preset"),
+        )
+    return {"ok": True}
+
+
+@router.post("/estilos-foto")
+def crear_estilo(data: CrearPresetFotoMcp, tenant_id: str = Depends(get_tenant_id)):
+    """Añade OTRO comando de foto con su preset (ej. /detalle para macros)."""
+    resultado = mcp_estilos.crear_preset(
+        tenant_id, data.comando, data.nombre, data.prompt
+    )
+    if resultado.get("ok") is False:
+        raise HTTPException(
+            status_code=resultado.get("status", 422),
+            detail=resultado.get("mensaje", "No se pudo crear el preset"),
+        )
+    return resultado
+
+
+@router.delete("/estilos-foto/{clave}")
+def eliminar_estilo(clave: str, tenant_id: str = Depends(get_tenant_id)):
+    """
+    Elimina un preset extra. Para el default 'estudio' también vale: borra el
+    override y el prompt recomendado del código vuelve a regir.
+    """
+    resultado = mcp_estilos.eliminar_preset(tenant_id, clave)
+    if resultado.get("ok") is False:
+        raise HTTPException(
+            status_code=resultado.get("status", 422),
+            detail=resultado.get("mensaje", "No se pudo eliminar el preset"),
+        )
     return {"ok": True}

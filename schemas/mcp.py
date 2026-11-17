@@ -51,3 +51,46 @@ class EditarClaveMcp(BaseModel):
             "márgenes (migrations/068). Independiente de los roles. Omitir = no cambiar."
         ),
     )
+
+
+class GuardarPresetFotoMcp(BaseModel):
+    """Edita el preset DEFAULT de foto ('estudio'): su comando y su prompt.
+    El prompt recomendado vive en el código; esta fila solo existe si el
+    dueño lo editó alguna vez (override, migrations/082)."""
+    comando: str = Field(
+        min_length=2,
+        max_length=20,
+        description="Comando que el dueño escribe en el chat (ej. '/img').",
+    )
+    nombre: Optional[str] = Field(
+        default=None,
+        max_length=40,
+        description="Nombre legible del preset (ej. 'Foto de estudio').",
+    )
+    prompt: str = Field(
+        min_length=10,
+        max_length=2000,
+        description=(
+            "Prompt EXACTO que el agente aplica a la imagen (preservar el "
+            "producto → cambio concreto → luz → restricciones)."
+        ),
+    )
+
+
+class CrearPresetFotoMcp(BaseModel):
+    """Añade OTRO preset de foto con su propio comando (ej. /detalle)."""
+    comando: str = Field(
+        min_length=2,
+        max_length=20,
+        description="Comando nuevo para el agente (ej. '/detalle').",
+    )
+    nombre: str = Field(
+        min_length=1,
+        max_length=40,
+        description="Nombre legible del preset (ej. 'Detalle macro').",
+    )
+    prompt: str = Field(
+        min_length=10,
+        max_length=2000,
+        description="Prompt EXACTO que el agente aplica a la imagen.",
+    )
