@@ -113,10 +113,10 @@ ROLES = {
             "Historial como hecho por el agente IA."
         ),
     },
-    # ── CAJERO: registrar ventas por chat (el dueño aprueba el desglose). ──
-    # Escritura de VENTAS (nivel 3): descuenta stock y genera tickets con el
-    # MISMO motor del POS, pero SIEMPRE vía borrador→confirmar; el dueño ve
-    # el desglose real del carrito antes de aprobar.
+    # ── CAJERO: registrar ventas y gastos por chat (el dueño aprueba). ──
+    # Escritura de VENTAS y GASTOS (nivel 3): el que opera la caja registra lo
+    # que entra (tickets) y lo que sale (gastos), SIEMPRE vía borrador→
+    # confirmar; el dueño ve el desglose real antes de aprobar.
     "cajero": {
         "nombre": "Cajero",
         "nivel": 3,
@@ -124,6 +124,8 @@ ROLES = {
             "buscar_productos",
             "proponer_venta",
             "confirmar_venta",
+            "proponer_gasto",
+            "confirmar_gasto",
         ),
         "instrucciones": (
             "Tu rol es REGISTRAR VENTAS: cuando el dueño te diga qué vendió o "
@@ -142,6 +144,33 @@ ROLES = {
             "stock está permitido y el desglose lo avisa. Nunca inventes un "
             "renglón, un producto_id ni un precio; si un renglón es "
             "ilegible, dilo en la misma pregunta única."
+        ),
+    },
+    # ── COMPRAS: entradas de inventario (restock) por chat. ──
+    # Escritura de INVENTARIO VALORADO (nivel 3): agrega stock vía lotes con
+    # el MISMO motor del gestor (agregar_lote), SIEMPRE vía borrador→confirmar
+    # y con el costo real de la compra aprobado por el dueño.
+    "compras": {
+        "nombre": "Compras",
+        "nivel": 3,
+        "tools": (
+            "buscar_productos",
+            "stock_actual",
+            "listar_categorias",
+            "proponer_entrada",
+            "confirmar_entrada",
+        ),
+        "instrucciones": (
+            "Tu rol es RESTOCKEAR el inventario: cuando el dueño te diga qué "
+            "le llegó (ej. 'llegaron 10 Kuromi a $150'), identifica el "
+            "producto con buscar_productos y arma la entrada con "
+            "proponer_entrada (producto_id, cantidad y el COSTO real de la "
+            "compra). Muestra al dueño el desglose (cuánto subirá el stock y "
+            "a qué costo) y haz UNA sola pregunta: '¿aplico la entrada?'. "
+            "Solo si aprueba, llama a confirmar_entrada. El costo es "
+            "obligatorio: si no lo sabes, pregúntale al dueño — no lo "
+            "inventes. Solo productos físicos existentes: si el producto no "
+            "existe, créalo con proponer_producto primero."
         ),
     },
 }

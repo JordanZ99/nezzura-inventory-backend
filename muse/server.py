@@ -17,9 +17,12 @@
 #                   del catálogo (7 tools).
 #   "inventario"  → + crear y editar productos con patrón borrador→confirmar
 #                   (9 tools).
-#   "cajero"      → registrar ventas por chat (proponer_venta →
-#                   confirmar_venta; 3 tools). El dueño aprueba el desglose
-#                   del carrito antes de que se registre nada.
+#   "cajero"      → registrar ventas y gastos por chat (proponer_venta →
+#                   confirmar_venta, proponer_gasto → confirmar_gasto; 5
+#                   tools). El dueño aprueba el desglose antes de que se
+#                   registre nada.
+#   "compras"     → restock: entradas de inventario vía lotes con el costo
+#                   real (proponer_entrada → confirmar_entrada; 5 tools).
 #
 # Modo del transporte:
 #   - stateless_http=True: cada POST es autosuficiente (sin sesiones en el
@@ -59,6 +62,8 @@ from database import mcp_borradores
 from database import mcp_catalogo as cat
 from database import mcp_cobro
 from database import mcp_escritura
+from database import mcp_gastos
+from database import mcp_compras
 from database import mcp_imagenes
 from database import mcp_ventas
 from database.mcp_claves import contar_escritura
@@ -551,6 +556,166 @@ def confirmar_venta(borrador_id: str) -> dict:
             )
         }
     return mcp_cobro.confirmar_venta(tenant, datos)
+
+
+# ── Rol Cajero: registrar GASTOS por chat (borrador → confirmar) ─────────────
+# El que opera la caja registra lo que sale: monto, categoría, descripción y
+# fecha con el MISMO motor del gestor (insertar_gasto). El dueño aprueba el
+# desglose antes; el gasto queda en el Historial como hecho por el agente IA.
+
+@servidor.tool(annotations=SOLO_LECTURA)
+def proponer_gasto(
+    monto: float, categoria: str, descripcion: str,
+    fecha: str | None = None, nota: str = "",
+) -> dict:
+    """PRIMER paso para registrar un GASTO (rol Cajero): valida los datos y
+    guarda un borrador — NO registra nada todavía. Úsalo cuando el dueño diga
+    que gastó algo (ej. 'gasté 80 pesos en bolsas').
+    - monto: cuánto se gastó (número > 0).
+    - categoria: categoría del gasto ('Renta', 'Empaque', 'Insumos'...). Si no
+      existe en el gestor se usa como categoría nueva y te lo aviso.
+    - descripcion: qué se gastó (1-200 caracteres).
+    - fecha: opcional 'YYYY-MM-DD' si el gasto fue de otro día (nunca futura;
+      sin fecha queda con la de hoy). nota: libre para el Historial.
+    Devuelve el desglose y las categorías del negocio: muéstraselo al dueño y
+    haz UNA sola pregunta ('¿lo registro así o corriges algo?'). Si aprueba,
+    llama confirmar_gasto con el borrador_id; si pide corregir, vuelve a
+    proponer (el borrador anterior expira solo)."""
+    permiso = _requiere_permiso("proponer_gasto")
+    if permiso:
+        return permiso
+    tenant = tenant_de_request()
+    try:
+        return mcp_gastos.proponer_gasto(
+            tenant, clave_de_request(), monto, categoria, descripcion, fecha, nota
+        )
+    except Exception as e:
+        print(f"[MCP] proponer_gasto fallo: {type(e).__name__}: {e}")
+        return {"error": f"No se pudo proponer el gasto: {e}"}
+
+
+@servidor.tool(annotations=CONFIRMACION)
+def confirmar_gasto(borrador_id: str) -> dict:
+    """SEGUNDO y último paso para registrar un gasto (rol Cajero): lo registra
+    en el gestor DESDE el borrador que el dueño ya aprobó — queda como 'pagado'
+    en su contabilidad. Usa SIEMPRE el borrador_id que devolvió proponer_gasto
+    — no reenvíes los datos. Llámalo SOLO cuando el dueño haya visto el
+    desglose y lo haya aprobado. El borrador se consume (una sola vez, expira
+    a los 15 minutos). El gasto queda en el Historial como registrado por el
+    agente IA."""
+    permiso = _requiere_permiso("confirmar_gasto")
+    if permiso:
+        return permiso
+    tenant = tenant_de_request()
+    try:
+        datos = mcp_borradores.consumir_borrador(
+            tenant, clave_de_request(), (borrador_id or "").strip()
+        )
+    except Exception as e:
+        return {"error": f"No se pudo recuperar el borrador: {e}"}
+    if datos is None:
+        return {
+            "error": (
+                "El borrador no existe, ya se confirmó antes o expiró (15 min). "
+                "Vuelve a proponer el gasto con proponer_gasto."
+            )
+        }
+    if not contar_escritura(clave_de_request()):
+        return {
+            "error": (
+                "Límite diario de escrituras alcanzado para esta clave. "
+                "El dueño puede ajustarla en Ajustes → Negocio → Conectar mi IA."
+            )
+        }
+    return mcp_gastos.confirmar_gasto(tenant, datos)
+
+
+# ── Rol Compras: ENTRADAS de inventario (restock) por chat ───────────────────
+# Agrega stock vía lotes con el MISMO motor del gestor (agregar_lote: fusiona
+# con el lote existente si coincide costo+precio, o crea lote nuevo, y registra
+# el ledger de movimientos). El borrador solo lleva productos resueltos por el
+# backend y el COSTO real de la compra (el inventario valorado lo exige): el
+# dueño aprueba el desglose antes de que toque sus números.
+
+@servidor.tool(annotations=SOLO_LECTURA)
+def proponer_entrada(
+    producto_id: int | None = None,
+    producto: str | None = None,
+    cantidad: float = 0,
+    costo: float | None = None,
+    precio_venta: float | None = None,
+    variacion: str | None = None,
+    etiqueta: str | None = None,
+    nota: str = "",
+) -> dict:
+    """PRIMER paso para AGREGAR STOCK a un producto existente (restock, rol
+    Compras): valida la entrada y guarda un borrador — NO toca el inventario
+    todavía. Úsalo cuando el dueño diga qué le llegó (ej. 'llegaron 10 Kuromi
+    a $150').
+    - producto_id: el id que devuelve buscar_productos (o 'producto' con el
+      nombre EXACTO). El producto DEBE existir: si es nuevo, créalo primero
+      con proponer_producto.
+    - cantidad: cuántas unidades llegaron (>0).
+    - costo: el costo unitario de COMPRA (>0) — alimenta el inventario
+      valorado, así que debe ser el real: si no lo sabes, pregúntale al dueño.
+    - precio_venta: opcional (default: el del último lote del producto).
+    - variacion: si el producto tiene variaciones, a cuál llegó el stock
+      ('Grande'); si no tiene, déjala vacía. etiqueta: presentación opcional
+      ('Caja de 12'). nota: libre para el Historial.
+    Devuelve el desglose (cuánto subirá el stock, a qué costo y precio, si
+    suma al lote existente o crea uno nuevo): muéstraselo al dueño y haz UNA
+    sola pregunta ('¿aplico la entrada?'). Si aprueba, llama confirmar_entrada
+    con el borrador_id; si pide corregir, vuelve a proponer."""
+    permiso = _requiere_permiso("proponer_entrada")
+    if permiso:
+        return permiso
+    tenant = tenant_de_request()
+    try:
+        return mcp_compras.proponer_entrada(
+            tenant, clave_de_request(), producto_id, producto, cantidad,
+            costo, precio_venta, variacion, etiqueta,
+            con_costos=ver_costos_de_request(), nota=nota,
+        )
+    except Exception as e:
+        print(f"[MCP] proponer_entrada fallo: {type(e).__name__}: {e}")
+        return {"error": f"No se pudo proponer la entrada: {e}"}
+
+
+@servidor.tool(annotations=CONFIRMACION)
+def confirmar_entrada(borrador_id: str) -> dict:
+    """SEGUNDO y último paso para restockear (rol Compras): aplica la entrada
+    con el MISMO motor del gestor — suma al lote existente o crea un lote
+    nuevo con el costo que el dueño aprobó, y queda en su Historial como
+    hecha por el agente IA. Usa SIEMPRE el borrador_id que devolvió
+    proponer_entrada — no reenvíes los datos. Llámalo SOLO cuando el dueño
+    haya visto el desglose y lo haya aprobado: cada confirmación mueve su
+    inventario valorado. El borrador se consume (una sola vez, expira a los
+    15 minutos)."""
+    permiso = _requiere_permiso("confirmar_entrada")
+    if permiso:
+        return permiso
+    tenant = tenant_de_request()
+    try:
+        datos = mcp_borradores.consumir_borrador(
+            tenant, clave_de_request(), (borrador_id or "").strip()
+        )
+    except Exception as e:
+        return {"error": f"No se pudo recuperar el borrador: {e}"}
+    if datos is None:
+        return {
+            "error": (
+                "El borrador no existe, ya se confirmó antes o expiró (15 min). "
+                "Vuelve a proponer la entrada con proponer_entrada."
+            )
+        }
+    if not contar_escritura(clave_de_request()):
+        return {
+            "error": (
+                "Límite diario de escrituras alcanzado para esta clave. "
+                "El dueño puede ajustarla en Ajustes → Negocio → Conectar mi IA."
+            )
+        }
+    return mcp_compras.confirmar_entrada(tenant, datos)
 
 
 # ── Nivel 3: EDICIONES (mismo patrón borrador → confirmar) ───────────────────

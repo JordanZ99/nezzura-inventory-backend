@@ -123,7 +123,11 @@ def agregar_lote(
                                fraccionable, tipo_producto, costo_servicio, precio_servicio)
         VALUES (%s, %s, %s, 'Activo', %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT(Producto, tenant_id) DO UPDATE SET
-            Descripcion = EXCLUDED.Descripcion,
+            -- El restock NO edita el producto: sin descripción nueva se conserva
+            -- la actual (antes EXCLUDED.Descripcion la blanqueaba — el endpoint
+            -- /restock nunca manda descripcion y cada restock la dejaba en '').
+            Descripcion = CASE WHEN EXCLUDED.Descripcion != ''
+                                 THEN EXCLUDED.Descripcion ELSE productos.Descripcion END,
             Imagen = CASE WHEN EXCLUDED.Imagen != 'No hay foto'
                          THEN EXCLUDED.Imagen ELSE productos.Imagen END,
             codigo_interno = COALESCE(EXCLUDED.codigo_interno, productos.codigo_interno),
