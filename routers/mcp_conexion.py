@@ -17,7 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from database import mcp_claves
 from database import mcp_estilos
 from dependencies import get_tenant_id
-from muse.roles import ROLES
+from muse.roles import ROLES, tools_de_roles
 from schemas.mcp import CrearClaveMcp, CrearPresetFotoMcp, EditarClaveMcp, GuardarPresetFotoMcp
 
 router = APIRouter(prefix="/mcp-conexion", tags=["Conector IA (MCP)"])
@@ -54,7 +54,7 @@ def crear_clave(data: CrearClaveMcp, tenant_id: str = Depends(get_tenant_id)):
             status_code=resultado.get("status", 422),
             detail=resultado.get("mensaje", "No se pudo crear la clave"),
         )
-    return {"ok": True, "clave": resultado["clave"]}
+    return {"ok": True, "clave": resultado["clave"], "id": resultado.get("id")}
 
 
 @router.patch("/claves/{clave_id}")
@@ -109,6 +109,72 @@ def eliminar_clave(clave_id: int, tenant_id: str = Depends(get_tenant_id)):
     if not mcp_claves.revocar_clave(clave_id, tenant_id):
         raise HTTPException(status_code=404, detail="Clave no encontrada")
     return {"ok": True}
+
+
+# ── Probar conexión y regenerar (083) ────────────────────────────────────────
+# Son las dos piezas de UX que eliminan el "¿funcionó?" y el ritual "perdí la
+# clave": probar dice qué ve el agente AHORA MISMO; regenerar reemplaza la
+# clave sin reconfigurar roles/límites ni rehacer el conector en el agente
+# (Cursor/Claude solo hay que volver a pegar la clave nueva).
+
+@router.post("/claves/{clave_id}/probar")
+def probar_clave(clave_id: int, tenant_id: str = Depends(get_tenant_id)):
+    """
+    "Probar conexión". El gestor NO puede hablar MCP con la clave en claro
+    (solo guarda su hash), así que valida lo que sí puede saber sin riesgo:
+
+      - la clave existe en este tenant (no fue eliminada),
+      - qué tools ve el agente: la UNIÓN de sus roles,
+      - si el agente YA la usó (ultimo_uso_en).
+
+    `conectado` = el agente hizo al menos un request real con la clave. Con
+    False la clave está lista pero el conector aún no se estrena; la UI lo
+    explica para no vender un "conectado" falso.
+    """
+    fila = next(
+        (c for c in mcp_claves.listar_claves(tenant_id) if c["id"] == clave_id),
+        None,
+    )
+    if not fila:
+        raise HTTPException(status_code=404, detail="Clave no encontrada")
+
+    # roles None/'' = clave legacy pre-081: ve TODAS las tools.
+    roles = tuple(fila["roles"] or ())
+    efectivos = roles or tuple(ROLES)
+    tools = tools_de_roles(roles)  # roles vacíos = todas
+    return {
+        "ok": True,
+        "activa": True,
+        "conectado": fila["ultimo_uso_en"] is not None,
+        "roles": list(efectivos),
+        "nombres_roles": [ROLES[r]["nombre"] for r in efectivos if r in ROLES],
+        "tools": len(tools),
+        "llamadas_hoy": fila["llamadas_hoy"],
+        "ultimo_uso_en": fila["ultimo_uso_en"],
+    }
+
+
+@router.post("/claves/{clave_id}/regenerar")
+def regenerar_clave(clave_id: int, tenant_id: str = Depends(get_tenant_id)):
+    """
+    Reemplaza la clave por otra con los MISMOS roles, límites y permiso de
+    costos (database/mcp_claves.regenerar_clave, en una transacción). La
+    anterior deja de funcionar al instante y la nueva se muestra UNA vez.
+
+    Casos de uso: el dueño perdió la clave antes de conectarla, o quiere
+    cortar el acceso de un agente sospechoso conservando su configuración.
+    """
+    resultado = mcp_claves.regenerar_clave(clave_id, tenant_id)
+    if resultado.get("ok") is False:
+        raise HTTPException(
+            status_code=resultado.get("status", 500),
+            detail=resultado.get("mensaje", "No se pudo regenerar la clave"),
+        )
+    return {
+        "ok": True,
+        "clave": resultado["clave"],
+        "id": resultado.get("id"),
+    }
 
 
 # ── Presets de FOTO por comando (082) ────────────────────────────────────────

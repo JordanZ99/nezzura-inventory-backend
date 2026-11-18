@@ -20,7 +20,9 @@ import hashlib
 import secrets
 from datetime import date
 
-from database.conexion import query, execute
+from psycopg2.extras import RealDictCursor
+
+from database.conexion import query, execute, get_conn, release_conn
 from muse.roles import normalizar_roles, nivel_de_roles, ROLES
 
 # Un negocio no necesita más agentes simultáneos que esto; el tope evita
@@ -60,8 +62,9 @@ def _generar_clave() -> str:
 def crear_clave(tenant_id: str, nombre: str | None, roles=None) -> dict:
     """
     Genera una clave nueva para el tenant con sus ROLES funcionales (081).
-    Devuelve {ok: True, clave} — la clave en claro viaja UNA sola vez al
-    frontend; de aquí en adelante solo existe su hash.
+    Devuelve {ok: True, clave, id} — la clave en claro viaja UNA sola vez al
+    frontend (de aquí en adelante solo existe su hash); el id lo usa la UI
+    para ofrecer "Probar conexión" justo después de crearla.
     """
     roles_norm = normalizar_roles(roles)
     if roles_norm is None:
@@ -90,15 +93,15 @@ def crear_clave(tenant_id: str, nombre: str | None, roles=None) -> dict:
         }
 
     clave = _generar_clave()
-    execute(
+    filas = query(
         "INSERT INTO mcp_api_keys (tenant_id, nombre, key_hash, key_prefix, nivel, roles) "
-        "VALUES (%s, %s, %s, %s, %s, %s)",
+        "VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
         (
             tenant_id, (nombre or "").strip() or "Mi IA", _hashear(clave),
             clave[:12] + "…", nivel, ",".join(roles_norm),
         ),
     )
-    return {"ok": True, "clave": clave}
+    return {"ok": True, "clave": clave, "id": int(filas[0]["id"])}
 
 
 def listar_claves(tenant_id: str) -> list[dict]:
@@ -137,6 +140,73 @@ def revocar_clave(clave_id: int, tenant_id: str) -> bool:
         return False
     execute("DELETE FROM mcp_api_keys WHERE id = %s AND tenant_id = %s", (clave_id, tenant_id))
     return True
+
+
+def regenerar_clave(clave_id: int, tenant_id: str) -> dict:
+    """
+    Reemplaza una clave ACTIVA por otra con los MISMOS roles, nivel, límites
+    y permiso de costos, en UNA sola transacción:
+
+      1. INSERT de la clave nueva (contadores en cero, misma config).
+      2. DELETE de la vieja → deja de validar al instante.
+
+    El INSERT va primero: si falla, el rollback deja viva la clave vieja (el
+    dueño nunca se queda sin acceso). El slot de MAX_CLAVES_POR_TENANT no se
+    ocupa de más porque se libera en la misma transacción.
+
+    Devuelve {ok: True, clave, id} — la clave en claro viaja UNA sola vez,
+    igual que en crear_clave. El `roles` se copia TAL CUAL (NULL = clave
+    legacy pre-081 que ve todas las tools: regenerar no debe recortarle
+    permisos por sorpresa).
+    """
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """SELECT nombre, nivel, roles, limite_llamadas_diarias,
+                          limite_escrituras_diarias, ver_costos
+                   FROM mcp_api_keys
+                   WHERE id = %s AND tenant_id = %s
+                   FOR UPDATE""",
+                (clave_id, tenant_id),
+            )
+            fila = cur.fetchone()
+            if not fila:
+                return {"ok": False, "status": 404, "mensaje": "Clave no encontrada"}
+
+            clave = _generar_clave()
+            cur.execute(
+                """INSERT INTO mcp_api_keys
+                       (tenant_id, nombre, key_hash, key_prefix, nivel, roles,
+                        limite_llamadas_diarias, limite_escrituras_diarias,
+                        ver_costos)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                   RETURNING id""",
+                (
+                    tenant_id,
+                    fila["nombre"] or "Mi IA",
+                    _hashear(clave),
+                    clave[:12] + "…",
+                    int(fila["nivel"] or 1),
+                    fila["roles"],
+                    fila["limite_llamadas_diarias"],
+                    fila["limite_escrituras_diarias"],
+                    bool(fila["ver_costos"]),
+                ),
+            )
+            nuevo_id = int(cur.fetchone()["id"])
+            cur.execute(
+                "DELETE FROM mcp_api_keys WHERE id = %s AND tenant_id = %s",
+                (clave_id, tenant_id),
+            )
+        conn.commit()
+        return {"ok": True, "clave": clave, "id": nuevo_id}
+    except Exception as e:
+        conn.rollback()
+        print(f"[MCP] regenerar_clave fallo: {type(e).__name__}: {e}")
+        return {"ok": False, "status": 500, "mensaje": "No se pudo regenerar la clave."}
+    finally:
+        release_conn(conn)
 
 
 def cambiar_roles(clave_id: int, tenant_id: str, roles) -> bool:
