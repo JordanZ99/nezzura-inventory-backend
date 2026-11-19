@@ -15,8 +15,8 @@
 #   "analista"    → + análisis del negocio con datos REALES (6 tools, plan Plus).
 #   "disenador"   → fotos: adjuntar/encajar/eliminar/reordenar y ver la config
 #                   del catálogo (7 tools).
-#   "inventario"  → + crear y editar productos con patrón borrador→confirmar
-#                   (9 tools).
+#   "inventario"  → + crear y editar productos (y la RECETA de los compuestos)
+#                   con patrón borrador→confirmar (13 tools).
 #   "cajero"      → registrar ventas y gastos por chat (proponer_venta →
 #                   confirmar_venta, proponer_gasto → confirmar_gasto; 5
 #                   tools). El dueño aprueba el desglose antes de que se
@@ -66,6 +66,7 @@ from database import mcp_estilos
 from database import mcp_gastos
 from database import mcp_compras
 from database import mcp_imagenes
+from database import mcp_recetas
 from database import mcp_ventas
 from database.mcp_claves import contar_escritura
 from muse.auth import (
@@ -135,20 +136,26 @@ servidor = ServidorMuse(
         "Conector del gestor de inventario de este negocio. Las herramientas "
         "que ves son EXACTAMENTE las de tu rol: úsalas todas con confianza y "
         "no asumas que existen otras (si algo no está en tu lista, dilo y "
-        "pediráselo al dueño). El catálogo son productos físicos con precio "
-        "de venta al público, descripción, tamaño, stock y fotos. Si tu rol "
-        "incluye fotos y el dueño escribe un comando de foto (empieza con "
-        "'/', ej. /img) o pide quitar el fondo, retocar la foto o ponerla "
-        "en fondo de estudio: llama estilos_foto, usa el prompt del preset "
-        "tal cual y adjunta el resultado con adjuntar_imagen. Algunas "
+        "pediráselo al dueño). El catálogo son productos activos con precio "
+        "de venta al público, descripción, tamaño, stock y fotos: físicos y "
+        "COMPUESTOS (ej. los platillos de un restaurante). Un compuesto no "
+        "tiene stock propio: se agota por los ingredientes de su receta y su "
+        "disponibilidad se lee con ver_receta. Las herramientas de recetas "
+        "(ver_receta, proponer_receta, confirmar_receta) solo existen si tu "
+        "rol las incluye. Si tu rol incluye fotos y el dueño escribe un "
+        "comando de foto (empieza con '/', ej. /img) o pide quitar el fondo, "
+        "retocar la foto o ponerla en fondo de estudio: llama estilos_foto, "
+        "usa el prompt del preset tal cual y adjunta el resultado con "
+        "adjuntar_imagen. Algunas "
         "claves tienen el permiso 'ver costos': si una respuesta incluye "
         "campos de costo o margen, son datos internos del dueño — NUNCA los "
         "menciones en publicaciones, frente a compradores ni en el catálogo "
         "público; datos_para_publicar nunca los incluye. Para VER el detalle "
-        "de un producto o PUBLICARLO, la única vía es datos_para_publicar "
-        "con el id que te dio la búsqueda o el listado: incluye ficha "
-        "completa y fotos en una llamada. Nunca inventes precios, stock ni "
-        "cifras: todo sale de las herramientas."
+        "de un producto FÍSICO o PUBLICARLO, la única vía es "
+        "datos_para_publicar con el id que te dio la búsqueda o el listado: "
+        "incluye ficha completa y fotos en una llamada (los compuestos no se "
+        "publican). Nunca inventes precios, stock ni cifras: todo sale de las "
+        "herramientas."
     ),
 )
 
@@ -180,15 +187,19 @@ def _requiere_permiso(tool: str) -> dict | None:
 
 @servidor.tool(annotations=SOLO_LECTURA)
 def buscar_productos(consulta: str, solo_con_stock: bool = False, limite: int = 15) -> dict:
-    """Busca productos físicos del inventario. La búsqueda es tolerante:
-    ignora mayúsculas, acentos y espacios ("My Melody" encuentra "MyMelody"),
-    divide la consulta en palabras y busca cada una en el nombre, la
-    descripción, la categoría y los códigos ("Sanrio" trae todo lo de esa
-    categoría). Devuelve id, nombre, precio de venta al público, stock
-    disponible y categoría. Si la clave tiene el permiso 'ver costos',
+    """Busca productos del inventario: físicos Y compuestos (ej. platillos de
+    un restaurante). La búsqueda es tolerante: ignora mayúsculas, acentos y
+    espacios ("My Melody" encuentra "MyMelody"), divide la consulta en
+    palabras y busca cada una en el nombre, la descripción, la categoría y
+    los códigos ("Sanrio" trae todo lo de esa categoría). Devuelve id,
+    nombre, tipo ('stock' o 'compuesto'), precio de venta al público, stock
+    disponible y categoría. En un compuesto el stock propio es null y el dato
+    real es disponibilidad_estimada (unidades que alcanzan con los
+    ingredientes de su receta). Si la clave tiene el permiso 'ver costos',
     incluye costo_unitario y margen (datos internos: nunca los muestres a
     compradores). Úsalo para encontrar el id de un producto antes de obtener
-    sus detalles o fotos."""
+    sus detalles, su receta o sus fotos. 'solo_con_stock' deja fuera a los
+    compuestos (no tienen lotes propios)."""
     tenant = tenant_de_request()
     try:
         productos = cat.buscar_productos(
@@ -213,16 +224,19 @@ def listar_productos(
     filtros combinables — cubre lo que la búsqueda por términos no puede:
     - categoria: todo lo de una categoría ("Sanrio", "Pokémon"...).
     - estado_stock: 'stock_bajo' (para saber qué reponer), 'sin_stock' (lo
-      que NO conviene publicar) o 'disponible'.
+      que NO conviene publicar) o 'disponible'. Aplica solo a productos
+      físicos: un compuesto no tiene lotes propios, su disponibilidad se
+      calcula con ver_receta.
     - sin_datos: 'sin_foto', 'sin_descripcion', 'sin_tamanio' o
       'incompletos' (cualquiera de las tres) — para limpiar el catálogo y
       mejorar las publicaciones.
     - orden: 'nombre' (default), 'stock_asc' (lo que falta primero) o
       'recientes'.
-    Cada producto trae tiene_foto / sin_descripcion / sin_tamano para que
-    puedas reportar al dueño qué le falta a cada publicación. Itera con
-    'pagina' para recorrer todo. Nunca incluye costos (salvo permiso
-    'ver costos' de la clave)."""
+    Incluye físicos y compuestos; cada producto trae tipo ('stock' o
+    'compuesto') y los compuestos añaden disponibilidad_estimada. También
+    trae tiene_foto / sin_descripcion / sin_tamano para que puedas reportar
+    al dueño qué le falta a cada publicación. Itera con 'pagina' para
+    recorrer todo. Nunca incluye costos (salvo permiso 'ver costos')."""
     tenant = tenant_de_request()
     try:
         return cat.listar_productos(
@@ -245,7 +259,9 @@ def stock_actual(producto_id: int | None = None, consulta: str | None = None) ->
     """Devuelve el stock disponible actual de uno o varios productos: por id
     exacto o buscando por nombre, descripción o categoría (búsqueda tolerante:
     ignora acentos, mayúsculas y espacios; funciona por palabras). Úsalo
-    cuando el dueño pregunte cuántas unidades quedan de algo."""
+    cuando el dueño pregunte cuántas unidades quedan de algo. En un producto
+    COMPUESTO no hay stock propio: devuelve stock_disponible null y
+    disponibilidad_estimada (cuántas unidades alcanzan con sus ingredientes)."""
     tenant = tenant_de_request()
     try:
         if producto_id is None and not (consulta or "").strip():
@@ -254,14 +270,35 @@ def stock_actual(producto_id: int | None = None, consulta: str | None = None) ->
     except Exception as e:
         return {"error": f"No se pudo consultar el stock: {e}"}
     if not filas:
-        return {"error": "No se encontró ningún producto físico activo con ese criterio."}
+        return {"error": "No se encontró ningún producto activo con ese criterio."}
     return {"productos": filas}
 
 
 @servidor.tool(annotations=SOLO_LECTURA)
+def ver_receta(producto: str | int) -> dict:
+    """Devuelve la RECETA de un producto COMPUESTO (ej. un platillo de
+    restaurante): sus materiales con la cantidad por unidad, la variación a la
+    que pertenece cada fila (null = receta base) y disponibilidad_estimada
+    (cuántas unidades se pueden vender con el stock actual de los
+    ingredientes). Acepta el nombre o el id del producto. Usa el 'receta_id'
+    de cada material para cambiar su cantidad o quitarlo con proponer_receta.
+    Si el producto es simple (no compuesto), te lo dirá: su stock va por
+    lotes, no por receta."""
+    permiso = _requiere_permiso("ver_receta")
+    if permiso:
+        return permiso
+    tenant = tenant_de_request()
+    try:
+        return mcp_recetas.ver_receta(tenant, producto)
+    except Exception as e:
+        print(f"[MCP] ver_receta fallo: {type(e).__name__}: {e}")
+        return {"error": f"No se pudo leer la receta: {e}"}
+
+
+@servidor.tool(annotations=SOLO_LECTURA)
 def listar_categorias() -> dict:
-    """Lista las categorías de productos físicos del negocio. Útil para
-    explorar el inventario por categoría antes de buscar productos."""
+    """Lista las categorías de productos del negocio (físicos y compuestos).
+    Útil para explorar el inventario por categoría antes de buscar productos."""
     tenant = tenant_de_request()
     try:
         return {"categorias": cat.listar_categorias(tenant)}
@@ -271,20 +308,26 @@ def listar_categorias() -> dict:
 
 @servidor.tool(annotations=SOLO_LECTURA)
 def datos_para_publicar(producto_id: int) -> dict:
-    """Única vía para VER el detalle completo de un producto o PUBLICARLO:
-    agrega en UNA llamada todo lo necesario — ficha completa (nombre,
-    descripción, precio de venta, stock, tamaño, categoría, variaciones) más
-    sus fotos con URLs descargables e ids (el 'id' de cada foto de
-    fotos.galeria es el que piden eliminar_imagen y reordenar_imagenes).
-    Nunca incluye costos internos (es el canal público); el costo individual
-    con permiso 'ver costos' se lee con buscar_productos o listar_productos."""
+    """Única vía para VER el detalle completo de un producto FÍSICO o
+    PUBLICARLO: agrega en UNA llamada todo lo necesario — ficha completa
+    (nombre, descripción, precio de venta, stock, tamaño, categoría,
+    variaciones) más sus fotos con URLs descargables e ids (el 'id' de cada
+    foto de fotos.galeria es el que piden eliminar_imagen y
+    reordenar_imagenes). Nunca incluye costos internos (es el canal público);
+    el costo individual con permiso 'ver costos' se lee con buscar_productos
+    o listar_productos. Los productos COMPUESTOS no se publican (su receta
+    es interna): para ellos usa ver_receta."""
     tenant = tenant_de_request()
     try:
         paquete = cat.datos_para_publicar(tenant, producto_id)
     except Exception as e:
         return {"error": f"No se pudo armar el paquete de publicación: {e}"}
     if paquete is None:
-        return {"error": f"No existe un producto físico activo con id {producto_id}."}
+        return {"error": (
+            f"No existe un producto FÍSICO activo con id {producto_id}. Si es "
+            "un producto compuesto, no se publica en Marketplace (su receta "
+            "es interna): usa ver_receta para verlo."
+        )}
     if not paquete["fotos"]["total"]:
         return {
             "error": (
@@ -822,6 +865,79 @@ def confirmar_edicion(borrador_id: str) -> dict:
             )
         }
     return mcp_escritura.confirmar_edicion(tenant, datos)
+
+
+# ── Rol Inventario: RECETA de un compuesto (borrador → confirmar) ────────────
+# Un compuesto se vende contra sus materiales (BOM). El agente NO reescribe la
+# receta entera: envía cambios puntuales (agregar/cambiar/quitar) y proponer
+# los valida contra la receta ACTUAL leída del servidor. confirmar aplica SOLO
+# lo guardado con el motor de recetas del gestor y deja el cambio en el
+# Historial como hecho por el agente IA.
+
+@servidor.tool(annotations=SOLO_LECTURA)
+def proponer_receta(producto: str | int, cambios: list[dict]) -> dict:
+    """PRIMER paso para CAMBIAR los ingredientes de un producto compuesto (rol
+    Administrador de inventario; ej. "a la hamburguesa ponle 2 quesos en vez
+    de 1"): valida los cambios contra la receta actual y guarda un borrador —
+    NO modifica nada todavía.
+    - producto: nombre o id del compuesto (sale de buscar_productos).
+    - cambios: lista de operaciones, cada una un dict:
+        {"accion": "agregar", "material": "Queso", "cantidad": 2}
+          (material por nombre o material_id; variacion opcional para la
+          receta de una presentación, ej. "Doble")
+        {"accion": "cambiar", "receta_id": 12, "cantidad": 3}
+        {"accion": "quitar", "receta_id": 12}
+      Los receta_id salen de ver_receta: NUNCA los inventes.
+    Devuelve la receta actual, los cambios propuestos y un resumen legible.
+    Muéstraselo al dueño y, solo si lo aprueba, llama a confirmar_receta con
+    el borrador_id. Si un material no existe o el id no pertenece, te dirá
+    exactamente qué corregir."""
+    permiso = _requiere_permiso("proponer_receta")
+    if permiso:
+        return permiso
+    tenant = tenant_de_request()
+    try:
+        return mcp_recetas.proponer_receta(
+            tenant, clave_de_request(), producto, cambios or []
+        )
+    except Exception as e:
+        print(f"[MCP] proponer_receta fallo: {type(e).__name__}: {e}")
+        return {"error": f"No se pudo proponer el cambio de receta: {e}"}
+
+
+@servidor.tool(annotations=CONFIRMACION)
+def confirmar_receta(borrador_id: str) -> dict:
+    """SEGUNDO y último paso para cambiar los ingredientes de un compuesto
+    (rol Administrador de inventario): aplica los cambios que el dueño ya
+    revisó. Usa SIEMPRE el borrador_id que devolvió proponer_receta — no
+    reenvíes los cambios. El borrador se consume (una sola vez, expira a los
+    15 minutos) y el cambio queda en el Historial del gestor como hecho por
+    el agente IA. La próxima venta descontará los materiales nuevos."""
+    permiso = _requiere_permiso("confirmar_receta")
+    if permiso:
+        return permiso
+    tenant = tenant_de_request()
+    try:
+        datos = mcp_borradores.consumir_borrador(
+            tenant, clave_de_request(), (borrador_id or "").strip()
+        )
+    except Exception as e:
+        return {"error": f"No se pudo recuperar el borrador: {e}"}
+    if datos is None:
+        return {
+            "error": (
+                "El borrador no existe, ya se confirmó antes o expiró (15 min). "
+                "Vuelve a proponer los cambios con proponer_receta."
+            )
+        }
+    if not contar_escritura(clave_de_request()):
+        return {
+            "error": (
+                "Límite diario de escrituras alcanzado para esta clave. "
+                "El dueño puede ajustarla en Ajustes → Negocio → Conectar mi IA."
+            )
+        }
+    return mcp_recetas.confirmar_receta(tenant, datos)
 
 
 # ── Nivel 3: IMÁGENES (efecto directo, con cuota de escrituras) ───────────────

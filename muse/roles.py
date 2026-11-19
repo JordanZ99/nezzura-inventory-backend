@@ -42,7 +42,11 @@ ROLES = {
             "un producto en Marketplace o redes sociales, busca el producto y "
             "arma la publicación con datos_para_publicar (ficha completa + "
             "fotos en una llamada) en lugar de pedirle los datos. Nunca "
-            "inventes precios, stock ni características: todo sale de los tools."
+            "inventes precios, stock ni características: todo sale de los tools. "
+            "Ojo: los productos COMPUESTOS (ej. los platillos de un "
+            "restaurante) se pueden buscar y ver, pero NO se publican en "
+            "Marketplace porque su receta es interna; si te piden publicar "
+            "uno, explícalo y ofrece publicar sus ingredientes por separado."
         ),
     },
     # ── ANALISTA: cómo va el negocio (antes nivel 2, requiere plan Plus).
@@ -105,11 +109,14 @@ ROLES = {
             "listar_productos",
             "stock_actual",
             "listar_categorias",
+            "ver_receta",
             "estilos_foto",
             "proponer_producto",
             "confirmar_producto",
             "proponer_edicion",
             "confirmar_edicion",
+            "proponer_receta",
+            "confirmar_receta",
             "adjuntar_imagen",
         ),
         "instrucciones": (
@@ -117,11 +124,20 @@ ROLES = {
             "primero (guarda el borrador) y confirmar_* después con el "
             "borrador_id. Si un dato falta, el tool te dirá exactamente qué "
             "corregir. Al crear un producto con foto, confírmalo y adjunta "
-            "la imagen con adjuntar_imagen. Cuando el dueño escriba un "
-            "comando de foto o pida quitar el fondo/retocarla: llama "
-            "estilos_foto, usa el prompt del preset tal cual y adjunta el "
-            "resultado con adjuntar_imagen. Cada cambio queda en el "
-            "Historial como hecho por el agente IA."
+            "la imagen con adjuntar_imagen. "
+            "PRODUCTOS COMPUESTOS (ej. restaurante): no tienen stock propio, "
+            "se venden contra los materiales de su RECETA. Para cambiar los "
+            "ingredientes exactos de uno: primero ver_receta (te da cada "
+            "material con su receta_id, la cantidad por unidad y cuántas "
+            "unidades alcanzan), luego proponer_receta con los cambios "
+            "({accion:'agregar', material, cantidad}, {accion:'cambiar', "
+            "receta_id, cantidad} o {accion:'quitar', receta_id}), muestra el "
+            "resumen al dueño y solo si lo aprueba llama a confirmar_receta. "
+            "Nunca inventes receta_id: salen de ver_receta. "
+            "Cuando el dueño escriba un comando de foto o pida quitar el "
+            "fondo/retocarla: llama estilos_foto, usa el prompt del preset "
+            "tal cual y adjunta el resultado con adjuntar_imagen. Cada cambio "
+            "queda en el Historial como hecho por el agente IA."
         ),
     },
     # ── CAJERO: registrar ventas y gastos por chat (el dueño aprueba). ──

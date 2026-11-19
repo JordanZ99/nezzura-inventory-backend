@@ -13,11 +13,17 @@
 # el catálogo web.
 #
 # Alcance definido con el dueño:
-#   - Solo productos físicos (tipo_producto = 'stock'): Marketplace es de
-#     bienes, servicios y compuestos quedan fuera.
+#   - LECTURAS (buscar/listar/stock): físicos + COMPUESTOS. Un restaurante
+#     vende hamburguesas, no sus ingredientes por separado: si el agente no
+#     ve el compuesto no puede responder nada sobre él. Los compuestos no
+#     tienen stock propio: se informa `disponibilidad_estimada` (el motor de
+#     recetas del gestor) y su precio vive en productos.precio_servicio.
+#   - PUBLICACIÓN (datos_para_publicar / obtener_producto / obtener_fotos):
+#     sigue siendo SOLO físicos. Marketplace es de bienes; que los compuestos
+#     se publiquen es una decisión de negocio aparte.
 #   - Stock en unidades exactas: el agente puede responder "cuánto queda".
 #   - Sin filtro visible_en_catalogo: publicar en Marketplace es otro canal
-#     distinto del catálogo web; el agente ve todos los físicos activos.
+#     distinto del catálogo web; el agente ve todos los activos.
 # ==============================================================================
 
 import unicodedata
@@ -38,9 +44,26 @@ _JOIN_LOTES = (
     "AND l.Estado = 'Activo'"
 )
 
-# Filtro de alcance: productos físicos activos del tenant dueño de la clave.
+# Filtro de alcance para PUBLICAR: solo productos físicos activos del tenant.
+# No se toca: datos_para_publicar es el canal de Marketplace.
 _FILTRO_ALCANCE = (
     "p.Estado = 'Activo' AND p.tenant_id = %s AND p.tipo_producto = 'stock'"
+)
+
+# Filtro de las LECTURAS del agente: físicos + compuestos (restaurantes). Los
+# servicios siguen fuera: su cobro es otro flujo.
+_ALCANCE_LECTURA = (
+    "p.Estado = 'Activo' AND p.tenant_id = %s "
+    "AND p.tipo_producto IN ('stock', 'compuesto')"
+)
+
+# Precio de las lecturas con compuestos: un compuesto no tiene lotes, así que
+# su precio de venta vive en productos.precio_servicio (igual que el gestor:
+# database/productos.py). Los físicos siguen usando sus lotes y solo caen a
+# precio_servicio si no tienen ningún lote, igual que la pantalla de inventario.
+_PRECIO_VENTA_LECTURA = (
+    "COALESCE(MAX(CASE WHEN l.Stock_Lote > 0 THEN l.Precio_Venta END), "
+    "MAX(l.Precio_Venta), p.precio_servicio, 0)"
 )
 
 # Costo promedio ponderado de los lotes ACTIVOS con stock (espejo del
@@ -69,6 +92,37 @@ def _stock(valor) -> float:
         return float(valor or 0)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _con_disponibilidad(items: list[dict], tenant_id: str) -> None:
+    """
+    Añade `disponibilidad_estimada` a los COMPUESTOS del resultado mutando la
+    lista. Reutiliza el motor de recetas del gestor (database/recetas.py): no
+    se recalcula nada aquí, así el agente ve el mismo número que el dueño.
+
+    Los productos físicos quedan igual (su dato es stock_disponible). Un
+    compuesto sin receta queda en None.
+    """
+    compuestos = [
+        {"producto": it["nombre"], "tipo_producto": "compuesto"}
+        for it in items if it.get("tipo") == "compuesto"
+    ]
+    if not compuestos:
+        return
+
+    from database.recetas import (  # import local: evita ciclo al cargar el MCP
+        _adjuntar_recetas,
+        _calcular_disponibilidad_compuestos,
+    )
+
+    _adjuntar_recetas(compuestos, tenant_id)
+    _calcular_disponibilidad_compuestos(compuestos, tenant_id)
+    disponibles = {
+        c["producto"]: c.get("disponibilidad_estimada") for c in compuestos
+    }
+    for item in items:
+        if item.get("tipo") == "compuesto":
+            item["disponibilidad_estimada"] = disponibles.get(item["nombre"])
 
 
 # ── Búsqueda tolerante ────────────────────────────────────────────────────────
@@ -150,7 +204,9 @@ def buscar_productos(
     """
     Búsqueda tolerante: por palabras (no frase completa), en nombre,
     descripción, códigos y categoría, ignorando acentos, mayúsculas y
-    espacios. Ordenada por relevancia.
+    espacios. Ordenada por relevancia. Incluye productos físicos Y compuestos
+    (los compuestos traen `tipo` y `disponibilidad_estimada`; su stock propio
+    es null porque se agota por ingredientes).
 
     con_costos (migrations/068): SOLO claves con el permiso ver_costos ven
     el costo promedio ponderado y el margen. Default False: el costo no se
@@ -161,14 +217,14 @@ def buscar_productos(
     campo_costo = f"{_COSTO_PROMEDIO} AS costo_unitario," if con_costos else ""
     filas = query(
         f"""
-        SELECT p.id, p.producto AS nombre, p.sufijo_precio,
-               {_PRECIO_VENTA} AS precio_venta,
+        SELECT p.id, p.producto AS nombre, p.sufijo_precio, p.tipo_producto,
+               {_PRECIO_VENTA_LECTURA} AS precio_venta,
                {campo_costo}
                COALESCE(SUM(l.Stock_Lote), 0) AS stock_disponible,
                {_CATEGORIAS}
         FROM productos p
         {_JOIN_LOTES}
-        WHERE {_FILTRO_ALCANCE}
+        WHERE {_ALCANCE_LECTURA}
           {f"AND {filtro_tokens}" if filtro_tokens else ""}
         GROUP BY p.id
         {filtro_stock}
@@ -179,19 +235,26 @@ def buscar_productos(
     )
     resultado = []
     for f in filas:
+        tipo = f.get("tipo_producto") or "stock"
         item = {
             "id": f["id"],
             "nombre": f["nombre"],
+            "tipo": tipo,
             "precio_venta": _num(f["precio_venta"]),
             "sufijo_precio": f.get("sufijo_precio") or "",
-            "stock_disponible": _stock(f["stock_disponible"]),
+            "stock_disponible": (
+                None if tipo == "compuesto" else _stock(f["stock_disponible"])
+            ),
             "categoria": f.get("categoria") or ["General"],
         }
+        if tipo == "compuesto":
+            item["disponibilidad_estimada"] = None
         if con_costos:
             costo = _num(f.get("costo_unitario"))
             item["costo_unitario"] = costo
             item["margen"] = round(item["precio_venta"] - costo, 2)
         resultado.append(item)
+    _con_disponibilidad(resultado, tenant_id)
     return resultado
 
 
@@ -348,15 +411,17 @@ def stock_actual(
     tenant_id: str, producto_id: int | None = None, consulta: str | None = None,
     limite: int = 10,
 ) -> list[dict]:
-    """Stock por id exacto o por búsqueda de nombre (todas las coincidencias)."""
+    """Stock por id exacto o por búsqueda de nombre (todas las coincidencias).
+    Incluye compuestos: en ellos `stock_disponible` es None y el dato real es
+    `disponibilidad_estimada` (cuántas unidades alcanzan con los ingredientes)."""
     if producto_id is not None:
         filas = query(
             f"""
-            SELECT p.id, p.producto AS nombre,
+            SELECT p.id, p.producto AS nombre, p.tipo_producto,
                    COALESCE(SUM(l.Stock_Lote), 0) AS stock_disponible
             FROM productos p
             {_JOIN_LOTES}
-            WHERE {_FILTRO_ALCANCE} AND p.id = %s
+            WHERE {_ALCANCE_LECTURA} AND p.id = %s
             GROUP BY p.id
             """,
             (tenant_id, producto_id),
@@ -365,11 +430,11 @@ def stock_actual(
         filtro_tokens, params_tokens, orden, params_orden = _condicion_busqueda(consulta or "")
         filas = query(
             f"""
-            SELECT p.id, p.producto AS nombre,
+            SELECT p.id, p.producto AS nombre, p.tipo_producto,
                    COALESCE(SUM(l.Stock_Lote), 0) AS stock_disponible
             FROM productos p
             {_JOIN_LOTES}
-            WHERE {_FILTRO_ALCANCE}
+            WHERE {_ALCANCE_LECTURA}
               {f"AND {filtro_tokens}" if filtro_tokens else ""}
             GROUP BY p.id
             ORDER BY {orden}
@@ -377,20 +442,28 @@ def stock_actual(
             """,
             tuple([tenant_id] + params_tokens + params_orden + [limite]),
         )
-    return [
-        {
+    resultado = []
+    for f in filas:
+        tipo = f.get("tipo_producto") or "stock"
+        item = {
             "id": f["id"],
             "nombre": f["nombre"],
-            "stock_disponible": _stock(f["stock_disponible"]),
+            "tipo": tipo,
+            "stock_disponible": (
+                None if tipo == "compuesto" else _stock(f["stock_disponible"])
+            ),
         }
-        for f in filas
-    ]
+        if tipo == "compuesto":
+            item["disponibilidad_estimada"] = None
+        resultado.append(item)
+    _con_disponibilidad(resultado, tenant_id)
+    return resultado
 
 
 # ── Tool: listar_categorias ───────────────────────────────────────────────────
 
 def listar_categorias(tenant_id: str) -> list[str]:
-    """Categorías con al menos un producto físico activo."""
+    """Categorías con al menos un producto activo (físico o compuesto)."""
     filas = query(
         """
         SELECT DISTINCT c.nombre
@@ -398,7 +471,8 @@ def listar_categorias(tenant_id: str) -> list[str]:
         JOIN producto_categorias pc ON pc.categoria_id = c.id
         JOIN productos p ON pc.producto_id = p.id
         WHERE c.tenant_id = %s AND p.tenant_id = %s
-          AND p.Estado = 'Activo' AND p.tipo_producto = 'stock'
+          AND p.Estado = 'Activo'
+          AND p.tipo_producto IN ('stock', 'compuesto')
         ORDER BY c.nombre ASC
         """,
         (tenant_id, tenant_id),
@@ -441,12 +515,15 @@ def listar_productos(
     con_costos: bool = False,
 ) -> dict:
     """
-    Listado paginado del catálogo físico activo con filtros. Cubre lo que la
+    Listado paginado del catálogo activo con filtros. Cubre lo que la
     búsqueda por términos no puede: "todo el stock bajo", "lo de Sanrio",
-    "productos sin foto o sin descripción".
+    "productos sin foto o sin descripción". Incluye físicos Y compuestos; los
+    compuestos traen `tipo` y `disponibilidad_estimada` (su stock se agota
+    por ingredientes, no por lotes propios).
 
     estado_stock: 'disponible' (>0) · 'stock_bajo' (0 < stock <= umbral) ·
-                  'sin_stock' (<= 0). 'disponible' incluye a los bajos.
+                  'sin_stock' (<= 0). 'disponible' incluye a los bajos. El
+                  filtro aplica SOLO a físicos: un compuesto no tiene lotes.
     sin_datos:    'sin_foto' · 'sin_descripcion' · 'sin_tamanio' ·
                   'incompletos' (cualquiera de las tres).
     orden:        'nombre' (default) · 'stock_asc' (lo que falta primero) ·
@@ -476,6 +553,9 @@ def listar_productos(
 
     estado = (estado_stock or "").strip().lower()
     if estado in ("disponible", "stock_bajo", "sin_stock"):
+        # El stock propio solo existe en físicos: un compuesto sin lotes no es
+        # "agotado" (su disponibilidad sale de la receta, en Python).
+        filtros.append("p.tipo_producto = 'stock'")
         # Agregados → van en HAVING, no en WHERE.
         stock = "COALESCE(SUM(l.Stock_Lote), 0)"
         if estado == "sin_stock":
@@ -501,14 +581,21 @@ def listar_productos(
 
     orden_sql = "p.producto ASC"
     if estado in ("stock_bajo", "sin_stock") and not orden:
-        orden_sql = "COALESCE(SUM(l.Stock_Lote), 0) ASC, p.producto ASC"
+        # Los compuestos no tienen lote: no son "lo que falta primero".
+        orden_sql = (
+            "CASE WHEN p.tipo_producto = 'compuesto' THEN 1 ELSE 0 END, "
+            "COALESCE(SUM(l.Stock_Lote), 0) ASC, p.producto ASC"
+        )
     elif orden == "stock_asc":
-        orden_sql = "COALESCE(SUM(l.Stock_Lote), 0) ASC, p.producto ASC"
+        orden_sql = (
+            "CASE WHEN p.tipo_producto = 'compuesto' THEN 1 ELSE 0 END, "
+            "COALESCE(SUM(l.Stock_Lote), 0) ASC, p.producto ASC"
+        )
     elif orden == "recientes":
         orden_sql = "p.id DESC"
 
     campo_costo = f"{_COSTO_PROMEDIO} AS costo_unitario," if con_costos else ""
-    where = f"WHERE {_FILTRO_ALCANCE}" + (" AND " + " AND ".join(filtros) if filtros else "")
+    where = f"WHERE {_ALCANCE_LECTURA}" + (" AND " + " AND ".join(filtros) if filtros else "")
     having = f" HAVING {' AND '.join(havings)}" if havings else ""
     base = f"FROM productos p {_JOIN_LOTES} {where} GROUP BY p.id{having}"
 
@@ -520,8 +607,8 @@ def listar_productos(
     filas = query(
         f"""
         SELECT p.id, p.producto AS nombre, p.sufijo_precio, p.descripcion,
-               p.imagen, p.tamano_cm,
-               {_PRECIO_VENTA} AS precio_venta,
+               p.imagen, p.tamano_cm, p.tipo_producto,
+               {_PRECIO_VENTA_LECTURA} AS precio_venta,
                {campo_costo}
                COALESCE(SUM(l.Stock_Lote), 0) AS stock_disponible,
                {_CATEGORIAS}
@@ -537,22 +624,29 @@ def listar_productos(
 
     productos = []
     for f in filas:
+        tipo = f.get("tipo_producto") or "stock"
         item = {
             "id": f["id"],
             "nombre": f["nombre"],
+            "tipo": tipo,
             "precio_venta": _num(f["precio_venta"]),
             "sufijo_precio": f.get("sufijo_precio") or "",
-            "stock_disponible": _stock(f["stock_disponible"]),
+            "stock_disponible": (
+                None if tipo == "compuesto" else _stock(f["stock_disponible"])
+            ),
             "categoria": f.get("categoria") or ["General"],
             "tiene_foto": _tiene_foto(f.get("imagen")),
             "sin_descripcion": not (f.get("descripcion") or "").strip(),
             "sin_tamano": f.get("tamano_cm") is None,
         }
+        if tipo == "compuesto":
+            item["disponibilidad_estimada"] = None
         if con_costos:
             costo = _num(f.get("costo_unitario"))
             item["costo_unitario"] = costo
             item["margen"] = round(item["precio_venta"] - costo, 2)
         productos.append(item)
+    _con_disponibilidad(productos, tenant_id)
 
     return {
         "total": int(total),
