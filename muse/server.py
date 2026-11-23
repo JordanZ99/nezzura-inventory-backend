@@ -455,6 +455,8 @@ def proponer_producto(
     descripcion: str = "",
     categoria: list[str] | None = None,
     variaciones: list[dict] | None = None,
+    recetas: list[dict] | None = None,
+    tipo: str = "stock",
     imagen: str = "",
     codigo_interno: str = "",
     codigo_barras: str = "",
@@ -467,12 +469,21 @@ def proponer_producto(
     valida los datos y guarda un borrador — NO crea nada todavía. Si algún
     dato falta o es inválido, devuelve el error exacto para corregirlo.
     Devuelve un borrador_id que DEBE confirmarse con confirmar_producto.
-    Reglas: solo productos físicos; si defines variaciones [{nombre, precio,
-    stock_inicial, costo}], el stock general debe ir en cada variación, no en
-    'stock'. El costo es interno y solo se usa para el lote: nunca lo cites
-    al público. El campo 'imagen' solo acepta una URL pública http(s); si
-    tienes la foto como archivo/base64, crea primero el producto y luego
-    adjúntala con adjuntar_imagen."""
+    Tipos:
+    - tipo 'stock' (por defecto): producto físico que se controla por lotes.
+      Si defines variaciones [{nombre, precio, stock_inicial, costo}], el stock
+      general debe ir en cada variación, no en 'stock'.
+    - tipo 'compuesto': platillo o producto con RECETA (restaurante, velas,
+      jabones, panadería...). Exige precio_venta > 0; su stock no se cuenta
+      (se calcula con los ingredientes) y siempre se vende por unidades
+      enteras. 'recetas' es [{material, cantidad}] con productos FÍSICOS ya
+      existentes (tipo stock): no se anidan platillos. Puedes crear el
+      compuesto SIN receta, pero avisa al dueño que no se podrá vender hasta
+      agregarla con proponer_receta.
+    El costo es interno y solo se usa como estimado: nunca lo cites al
+    público. El campo 'imagen' solo acepta una URL pública http(s); si tienes
+    la foto como archivo/base64, crea primero el producto y luego adjúntala
+    con adjuntar_imagen."""
     permiso = _requiere_permiso("proponer_producto")
     if permiso:
         return permiso
@@ -486,6 +497,8 @@ def proponer_producto(
             "descripcion": descripcion,
             "categoria": categoria,
             "variaciones": variaciones,
+            "recetas": recetas,
+            "tipo_producto": tipo,
             "imagen": imagen,
             "codigo_interno": codigo_interno,
             "codigo_barras": codigo_barras,
@@ -558,8 +571,11 @@ def proponer_venta(
     - producto_id: el id que devuelve buscar_productos, con cantidad (número
       > 0). También acepta 'producto' (nombre EXACTO del inventario), pero el
       id es más seguro. Opcionales: precio_real (si no lo envías se usa el
-      precio de los lotes — nunca calcules precios tú), variacion ('Grande')
-      e id_lote (deja vacío y el sistema elige el lote más viejo, PEPS).
+      precio de la BD — lotes para un físico; precio de venta del platillo o
+      de su variación para un compuesto; nunca calcules precios tú) y
+      variacion ('Grande'). id_lote solo existe en productos físicos: el
+      sistema elige el lote más viejo (PEPS). Un compuesto no tiene lote:
+      descuenta los ingredientes de su receta.
     - Venta libre (lo vendido NO está en el inventario): venta_libre=true con
       descripcion (qué se vendió), precio_real (>0) y motivo (por qué no está
       en el inventario — queda en el Historial del gestor).
@@ -577,7 +593,9 @@ def proponer_venta(
     unitario por default. Un nombre que no existe: propón el producto cuyo
     precio coincida o sea el más cercano (di por qué) o regístralo como venta
     libre con motivo. Vender más del stock está permitido y el desglose lo
-    avisa. Con tickets ilegibles: registra solo lo que puedas leer con
+    avisa; en un compuesto, vender más de lo que alcanza la receta también se
+    avisa (el cobro deja los ingredientes en negativo). Con tickets ilegibles:
+    registra solo lo que puedas leer con
     certeza y di en la MISMA pregunta qué no pudiste leer — nunca inventes
     un renglón, un producto_id ni un precio.
     Devuelve el desglose REAL del carrito (nombres, precios y stock del
@@ -813,7 +831,10 @@ def proponer_edicion(
       precio_venta, estado ('Activo'/'Inactivo'), visible_en_catalogo,
       tamano_cm, codigo_interno, codigo_barras, ubicacion, categoria (lista
       de hasta 5). El campo 'costo' solo si la clave tiene permiso 'ver
-      costos'. Para agregar o cambiar la FOTO usa la herramienta adjuntar_imagen.
+      costos'. En un COMPUESTO (platillo), 'precio_venta' es su precio de
+      venta y 'costo' NO se edita: se calcula de la receta (cambia los
+      materiales con proponer_receta). Para agregar o cambiar la FOTO usa la
+      herramienta adjuntar_imagen.
     - tipo 'venta' (id de la venta): fecha ('2026-11-12 15:30'), cantidad
       (>0) y precio_real. Los totales y el stock se recalculan solos.
     - tipo 'gasto' (id del gasto): monto, categoria, descripcion.

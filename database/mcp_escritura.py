@@ -6,14 +6,14 @@
 #   - El único punto de entrada es crear_producto_desde_borrador(datos): los
 #     datos vienen de mcp_borradores (guardados por proponer_producto), nunca
 #     re-enviados por el agente en la confirmación.
-#   - Solo productos físicos ('stock'): servicios y compuestos quedan fuera
-#     del alcance del agente (los compuestos manejan recetas; servicio es otro
-#     flujo de cobro).
+#   - Productos físicos ('stock') y COMPUESTOS con receta ('compuesto').
+#     Los servicios quedan fuera (su cobro es otro flujo). Un compuesto se
+#     crea con su receta en la MISMA transacción; su stock no se cuenta.
 #   - Cada creación queda en registro_actividad con detalle.origen =
 #     'agente_ia': el Historial del gestor muestra qué hizo el agente.
 #   - validar_datos_producto NO acepta campos que el dueño controla a nivel
-#     negocio (visible_en_catalogo, etiqueta, tipo): el agente crea el
-#     producto simple; lo fino se ajusta desde el gestor.
+#     negocio (visible_en_catalogo, etiqueta): el agente crea el producto o
+#     platillo; lo fino se ajusta desde el gestor.
 # ==============================================================================
 
 from database import mcp_borradores
@@ -43,6 +43,92 @@ def _imagen_segura(valor) -> str:
     return "No hay foto"
 
 
+_TIPOS_PRODUCTO = ("stock", "compuesto")
+
+
+def _validar_recetas(valor) -> list[dict]:
+    """
+    Normaliza la receta de un compuesto: [{material, cantidad}].
+    No toca la BD: la existencia y el tipo de cada material se validan en
+    proponer() (ahí sí hay tenant) y otra vez en la transacción del alta.
+    """
+    if valor in (None, ""):
+        return []
+    if not isinstance(valor, list):
+        raise ValueError(
+            "'recetas' debe ser una lista de {material, cantidad}."
+        )
+
+    limpias: list[dict] = []
+    vistos: set[str] = set()
+    for i, r in enumerate(valor, start=1):
+        if not isinstance(r, dict):
+            raise ValueError(
+                f"La receta #{i} debe ser un objeto {{material, cantidad}}."
+            )
+        material = _texto(r.get("material") or r.get("material_id"))
+        if not material:
+            raise ValueError(
+                f"La receta #{i}: falta 'material' (nombre del ingrediente)."
+            )
+        clave = material.lower()
+        if clave in vistos:
+            raise ValueError(
+                f"El material '{material}' aparece dos veces en la receta: "
+                "deja una sola fila."
+            )
+        vistos.add(clave)
+        cantidad = _num(r.get("cantidad"), f"cantidad del material '{material}'")
+        if cantidad <= 0:
+            raise ValueError(
+                f"La receta #{i}: la cantidad de '{material}' debe ser mayor a 0."
+            )
+        limpias.append({"material": material, "cantidad": cantidad})
+    return limpias
+
+
+def _resolver_materiales_receta(
+    tenant_id: str, recetas: list[dict],
+) -> tuple[list[dict], str | None]:
+    """
+    Valida que cada material exista, esté activo y sea FÍSICO (tipo stock).
+    Devuelve la receta con el nombre REAL de la BD (tolera mayúsculas) o un
+    error listo para el agente. El motor solo descuenta un nivel de receta:
+    un compuesto dentro de otro compuesto rompería el cobro.
+    """
+    resueltas: list[dict] = []
+    for r in recetas:
+        material = r["material"]
+        filas = query(
+            "SELECT id, Producto AS producto, tipo_producto FROM productos "
+            "WHERE tenant_id = %s AND Estado = 'Activo' "
+            "AND lower(Producto) = lower(%s) ORDER BY id LIMIT 2",
+            (tenant_id, material),
+        )
+        if not filas:
+            return [], (
+                f"El material '{material}' no existe como producto activo. "
+                "Créalo primero con proponer_producto (tipo stock) y vuelve a "
+                "proponer el platillo."
+            )
+        if len(filas) > 1:
+            return [], (
+                f"Hay más de un producto llamado '{material}'. Usa un nombre "
+                "distinto o renombra el ingrediente en el gestor."
+            )
+        fila = filas[0]
+        if (fila.get("tipo_producto") or "stock") != "stock":
+            return [], (
+                f"'{fila['producto']}' es un compuesto: una receta solo lleva "
+                "ingredientes físicos (tipo stock), no otros platillos."
+            )
+        resueltas.append({
+            "material": fila["producto"],
+            "cantidad": r["cantidad"],
+        })
+    return resueltas, None
+
+
 def validar_datos_producto(datos: dict) -> dict:
     """
     Normaliza y valida el borrador. Lanza ValueError con mensaje claro
@@ -50,6 +136,13 @@ def validar_datos_producto(datos: dict) -> dict:
     """
     if not isinstance(datos, dict):
         raise ValueError("Datos de producto inválidos.")
+
+    tipo = _texto(datos.get("tipo_producto") or datos.get("tipo")).lower() or "stock"
+    if tipo not in _TIPOS_PRODUCTO:
+        raise ValueError(
+            "Tipo de producto inválido: usa 'stock' (producto físico) o "
+            "'compuesto' (platillo/producto con receta)."
+        )
 
     nombre = _texto(datos.get("nombre"))
     if not nombre:
@@ -60,6 +153,24 @@ def validar_datos_producto(datos: dict) -> dict:
     precio_venta = _num(datos.get("precio_venta"), "precio_venta")
     costo = _num(datos.get("costo") or 0, "costo")
     stock = _num(datos.get("stock") or 0, "stock")
+
+    if tipo == "compuesto":
+        if precio_venta <= 0:
+            raise ValueError(
+                "Un producto compuesto necesita 'precio_venta' mayor a 0 "
+                "(es el precio del platillo o producto con receta)."
+            )
+        stock = 0.0
+        fraccionable = False
+    else:
+        fraccionable = bool(datos.get("fraccionable"))
+
+    recetas = _validar_recetas(datos.get("recetas"))
+    if tipo == "stock" and recetas:
+        raise ValueError(
+            "'recetas' solo aplica a productos compuestos: para un producto "
+            "físico usa lotes (precio_venta, costo y stock)."
+        )
 
     descripcion = _texto(datos.get("descripcion"))
     if len(descripcion) > 2000:
@@ -105,6 +216,7 @@ def validar_datos_producto(datos: dict) -> dict:
         tamano_cm = _num(datos.get("tamano_cm"), "tamano_cm")
 
     return {
+        "tipo_producto": tipo,
         "nombre": nombre,
         "descripcion": descripcion,
         "imagen": _imagen_segura(datos.get("imagen")),
@@ -116,18 +228,28 @@ def validar_datos_producto(datos: dict) -> dict:
         "codigo_barras": _texto(datos.get("codigo_barras")) or None,
         "ubicacion": _texto(datos.get("ubicacion")) or None,
         "sufijo_precio": _texto(datos.get("sufijo_precio"))[:20],
-        "fraccionable": bool(datos.get("fraccionable")),
+        "fraccionable": fraccionable,
         "tamano_cm": tamano_cm,
         "variaciones": limpias_var,
+        "recetas": recetas,
     }
 
 
 def _resumen_legible(d: dict) -> str:
     variaciones = d.get("variaciones") or []
-    parts = [
-        f"{d['nombre']} — precio ${d['precio_venta']:g}, costo ${d['costo']:g}, "
-        f"stock {d['stock']:g}, categoría {', '.join(d['categoria'])}"
-    ]
+    if d.get("tipo_producto") == "compuesto":
+        receta = ", ".join(
+            f"{r['material']} x{r['cantidad']:g}" for r in (d.get("recetas") or [])
+        )
+        parts = [
+            f"{d['nombre']} — precio ${d['precio_venta']:g}, "
+            f"receta: {receta or 'SIN RECETA (no se podrá vender hasta agregarla)'}"
+        ]
+    else:
+        parts = [
+            f"{d['nombre']} — precio ${d['precio_venta']:g}, costo ${d['costo']:g}, "
+            f"stock {d['stock']:g}, categoría {', '.join(d['categoria'])}"
+        ]
     if variaciones:
         parts.append("variaciones: " + "; ".join(
             f"{v['nombre']} (${v['precio']:g}, {v['stock_inicial']:g} u.)" for v in variaciones
@@ -141,6 +263,29 @@ def proponer(tenant_id: str, clave_id: int, datos_crudos: dict) -> dict:
         datos = validar_datos_producto(datos_crudos)
     except ValueError as e:
         return {"error": str(e)}
+
+    if datos.get("tipo_producto") == "compuesto":
+        # Un upsert silencioso conservaría el tipo viejo del producto y dejaría
+        # la receta colgada de un físico: mejor frenar y decir qué hacer.
+        existente = query(
+            "SELECT id, tipo_producto FROM productos "
+            "WHERE tenant_id = %s AND lower(Producto) = lower(%s) LIMIT 1",
+            (tenant_id, datos["nombre"]),
+        )
+        if existente:
+            tipo_prev = existente[0].get("tipo_producto") or "stock"
+            return {"error": (
+                f"Ya existe un producto llamado '{datos['nombre']}' "
+                f"(#{existente[0]['id']}, tipo {tipo_prev}). Para un platillo "
+                "nuevo usa otro nombre; para cambiar su receta usa "
+                "proponer_receta y para su ficha proponer_edicion."
+            )}
+        if datos["recetas"]:
+            recetas, error = _resolver_materiales_receta(tenant_id, datos["recetas"])
+            if error:
+                return {"error": error}
+            datos["recetas"] = recetas
+
     datos["tipo"] = "crear_producto"  # distingue el borrador de una EDICIÓN
     borrador = mcp_borradores.crear_borrador(tenant_id, clave_id, datos)
     return {
@@ -158,8 +303,6 @@ def proponer(tenant_id: str, clave_id: int, datos_crudos: dict) -> dict:
 def confirmar(tenant_id: str, datos: dict) -> dict:
     """Crea el producto desde el borrador consumido. El Historial queda en
     registrar_actividad (productos.py) con origen 'agente_ia'."""
-    from database.actividad import registrar_actividad
-
     if datos.get("tipo") not in (None, "crear_producto"):
         return {
             "error": (
@@ -173,13 +316,16 @@ def confirmar(tenant_id: str, datos: dict) -> dict:
     except ValueError as e:
         return {"error": f"El borrador ya no es válido: {e}"}
 
+    tipo = datos.get("tipo_producto") or "stock"
+    es_compuesto = tipo == "compuesto"
+
     try:
         resultado = crear_producto_completo(
             producto=datos["nombre"],
             descripcion=datos["descripcion"],
             costo=datos["costo"],
             precio_venta=datos["precio_venta"],
-            stock=datos["stock"],
+            stock=0 if es_compuesto else datos["stock"],
             imagen=datos["imagen"],
             categoria=datos["categoria"],
             tenant_id=tenant_id,
@@ -189,8 +335,11 @@ def confirmar(tenant_id: str, datos: dict) -> dict:
             sufijo_precio=datos["sufijo_precio"],
             fraccionable=datos["fraccionable"],
             tamano_cm=datos["tamano_cm"],
-            tipo_producto="stock",
+            tipo_producto=tipo,
+            costo_servicio=datos["costo"] if es_compuesto else None,
+            precio_servicio=datos["precio_venta"] if es_compuesto else None,
             variaciones=datos["variaciones"] or None,
+            recetas=datos["recetas"] if es_compuesto else None,
             origen="agente_ia",
         )
     except Exception as e:
@@ -201,15 +350,37 @@ def confirmar(tenant_id: str, datos: dict) -> dict:
         return {"error": f"No se pudo crear el producto: {mensaje or 'error desconocido'}"}
 
     producto_id = resultado.get("id")
-    return {
+    respuesta = {
         "ok": True,
         "producto_id": producto_id,
+        "tipo": tipo,
         "resumen": _resumen_legible(datos),
         "nota": (
             "El producto ya existe en tu inventario y quedó registrado en el "
             "Historial como creado por el agente IA."
         ),
     }
+    if es_compuesto:
+        respuesta["recetas_creadas"] = len(datos["recetas"])
+        respuesta["nota"] = (
+            "El platillo/producto compuesto ya existe con su receta y quedó "
+            "registrado en el Historial como creado por el agente IA. Su stock "
+            "no se cuenta: se calcula con los ingredientes."
+        )
+        try:
+            from database import mcp_recetas
+            ficha = mcp_recetas.ver_receta(tenant_id, producto_id)
+            if isinstance(ficha, dict) and "error" not in ficha:
+                respuesta["disponibilidad_estimada"] = ficha.get("disponibilidad_estimada")
+                respuesta["materiales"] = ficha.get("materiales") or []
+        except Exception:
+            pass
+        if not datos["recetas"]:
+            respuesta["aviso"] = (
+                "El platillo se creó sin receta: no se podrá vender hasta "
+                "agregar materiales con proponer_receta."
+            )
+    return respuesta
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -221,9 +392,11 @@ def confirmar(tenant_id: str, datos: dict) -> dict:
 # con atribución "El agente IA editó..." (068: productos, ventas y gastos).
 #
 # Alcance a propósito (lo que el agente puede tocar sin corromper el negocio):
-#   producto → descripción, nombre, precio de venta, costo (solo con permiso
-#              ver_costos), estado, visibilidad, tamaño, códigos, ubicación,
-#              categorías. NUNCA imagen (binario) ni recetas/variaciones.
+#   producto → descripción, nombre, precio de venta (en un compuesto es su
+#              precio_servicio), costo (solo con permiso ver_costos y NUNCA en
+#              compuestos), estado, visibilidad, tamaño, códigos, ubicación,
+#              categorías. NUNCA imagen (binario) ni recetas/variaciones: la
+#              receta se edita con proponer_receta.
 #   venta    → fecha, cantidad, precio. Los totales y el stock se recalculan
 #              en el server (actualizar_venta ya maneja PEPS y compuestos).
 #   gasto    → monto, categoría, descripción.
@@ -267,8 +440,9 @@ def _lista_categoria(valor) -> list[str]:
 
 
 def _producto_actual(tenant_id: str, producto_id: int) -> dict | None:
-    """Fila ACTUAL del producto (físico activo) + costo/precio del lote más
-    reciente + categorías vigentes. None si no existe o no es del tenant."""
+    """Fila ACTUAL del producto activo (físico o compuesto) + costo/precio del
+    lote más reciente + precio de compuesto + categorías vigentes. None si no
+    existe o no es del tenant."""
     filas = query(
         """
         SELECT p.id, p.Producto AS producto, COALESCE(p.Descripcion, '') AS descripcion,
@@ -276,6 +450,8 @@ def _producto_actual(tenant_id: str, producto_id: int) -> dict | None:
                p.codigo_interno, p.codigo_barras, p.ubicacion, p.visible_en_catalogo,
                COALESCE(p.sufijo_precio, '') AS sufijo_precio,
                COALESCE(p.fraccionable, false) AS fraccionable, p.tamano_cm,
+               COALESCE(p.tipo_producto, 'stock') AS tipo_producto,
+               COALESCE(p.precio_servicio, 0) AS precio_servicio,
                (SELECT l.Costo FROM lotes l WHERE l.producto_id = p.id
                   AND l.tenant_id = p.tenant_id AND l.Estado = 'Activo'
                   ORDER BY l.Fecha_Entrada DESC LIMIT 1) AS costo_lote,
@@ -288,7 +464,8 @@ def _producto_actual(tenant_id: str, producto_id: int) -> dict | None:
                          WHERE pc.producto_id = p.id), '{}') AS categorias
         FROM productos p
         WHERE p.id = %s AND p.tenant_id = %s
-          AND p.Estado = 'Activo' AND p.tipo_producto = 'stock'
+          AND p.Estado = 'Activo'
+          AND p.tipo_producto IN ('stock', 'compuesto')
         """,
         (producto_id, tenant_id),
     )
@@ -365,13 +542,20 @@ def _proponer_edicion_producto(
 ) -> dict:
     actual = _producto_actual(tenant_id, producto_id)
     if actual is None:
-        return {"error": f"No existe un producto físico activo con id {producto_id}."}
+        return {"error": f"No existe un producto activo con id {producto_id}."}
+
+    es_compuesto = (actual.get("tipo_producto") or "stock") == "compuesto"
 
     desconocidos = set(cambios) - set(_CAMPOS_PRODUCTO)
     if desconocidos:
         return {"error": (
             f"Campos no editables por el agente: {', '.join(sorted(desconocidos))}. "
             f"Permitidos: {', '.join(_CAMPOS_PRODUCTO)}."
+        )}
+    if es_compuesto and "costo" in cambios:
+        return {"error": (
+            "El costo de un compuesto se calcula de su receta: para cambiarlo "
+            "edita los materiales con proponer_receta."
         )}
     if "costo" in cambios and not con_costos:
         return {"error": (
@@ -385,9 +569,13 @@ def _proponer_edicion_producto(
         "imagen": actual["imagen"],
         "estado": actual["estado"],
         "categorias": list(actual["categorias"]) if actual["categorias"] else ["General"],
+        "tipo_producto": actual.get("tipo_producto") or "stock",
         "costo_lote": _num_simple(actual.get("costo_lote")),
         "precio_lote": _num_simple(actual.get("precio_lote")),
+        "precio_servicio": _num_simple(actual.get("precio_servicio")),
     }
+    # El precio vigente de un compuesto vive en precio_servicio (no hay lote).
+    precio_actual = base["precio_servicio"] if es_compuesto else base["precio_lote"]
 
     resueltos: dict = {}
     diff: dict = {}
@@ -435,7 +623,7 @@ def _proponer_edicion_producto(
         "nombre": (base["producto"], resueltos.get("nombre")),
         "descripcion": (base["descripcion"], resueltos.get("descripcion")),
         "estado": (base["estado"], resueltos.get("estado")),
-        "precio_venta": (base["precio_lote"], resueltos.get("precio_venta")),
+        "precio_venta": (precio_actual, resueltos.get("precio_venta")),
         "costo": (base["costo_lote"], resueltos.get("costo")),
         "visible_en_catalogo": (bool(actual["visible_en_catalogo"]), resueltos.get("visible_en_catalogo")),
         "tamano_cm": (float(actual["tamano_cm"]) if actual["tamano_cm"] is not None else None,
@@ -630,6 +818,7 @@ def _confirmar_edicion_producto(tenant_id: str, datos: dict) -> dict:
     base = datos.get("base") or {}
     cambios = datos.get("cambios") or {}
     producto_id = datos.get("entidad_id")
+    es_compuesto = (base.get("tipo_producto") or "stock") == "compuesto"
 
     nombre_nuevo = cambios.get("nombre")
     resultado = actualizar_producto(
@@ -641,8 +830,10 @@ def _confirmar_edicion_producto(tenant_id: str, datos: dict) -> dict:
         imagen=base.get("imagen") or "No hay foto",
         estado=cambios.get("estado") or base.get("estado") or "Activo",
         categoria=cambios.get("categoria") or base.get("categorias") or ["General"],
-        costo=(None if cambios.get("costo") is None else float(cambios["costo"])),
-        precio_venta=(None if cambios.get("precio_venta") is None else float(cambios["precio_venta"])),
+        costo=(None if es_compuesto or cambios.get("costo") is None
+               else float(cambios["costo"])),
+        precio_venta=(None if es_compuesto or cambios.get("precio_venta") is None
+                      else float(cambios["precio_venta"])),
         tenant_id=tenant_id,
         nuevo_producto=nombre_nuevo,
         codigo_interno=(None if "codigo_interno" not in cambios else cambios["codigo_interno"]),
@@ -650,6 +841,9 @@ def _confirmar_edicion_producto(tenant_id: str, datos: dict) -> dict:
         ubicacion=(None if "ubicacion" not in cambios else cambios["ubicacion"]),
         visible_en_catalogo=(None if "visible_en_catalogo" not in cambios else bool(cambios["visible_en_catalogo"])),
         tamano_cm=(None if "tamano_cm" not in cambios else cambios["tamano_cm"]),
+        precio_servicio=(float(cambios["precio_venta"])
+                         if es_compuesto and cambios.get("precio_venta") is not None
+                         else None),
         origen="agente_ia",
     )
     if not isinstance(resultado, dict) or not resultado.get("ok"):
@@ -659,6 +853,7 @@ def _confirmar_edicion_producto(tenant_id: str, datos: dict) -> dict:
         "ok": True,
         "entidad": "producto",
         "entidad_id": producto_id,
+        "tipo": base.get("tipo_producto") or "stock",
         "nombre_final": resultado.get("producto"),
         "nota": "Los cambios ya están aplicados y quedaron en el Historial como hechos por el agente IA.",
     }

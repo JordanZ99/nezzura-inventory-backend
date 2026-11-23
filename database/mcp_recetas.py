@@ -14,8 +14,12 @@
 #     con los helpers probados de database/recetas.py (los mismos que usa la
 #     pantalla de inventario) y deja el cambio en el Historial con origen
 #     'agente_ia'.
+#   - disponibilidad_compuesto / variacion_compuesto: helpers que reutiliza
+#     mcp_cobro para vender platillos con su disponibilidad y precio reales.
 #
-# Lo que NO hace (a propósito, v1): crear compuestos ni venderlos por chat.
+# La CREACIÓN de compuestos vive en mcp_escritura (proponer_producto con
+# tipo='compuesto' + recetas) y la VENTA en mcp_cobro (proponer_venta con el
+# mismo motor cobrar_carrito). Aquí solo se administra la receta.
 # Los compuestos no tienen lotes: su precio vive en productos.precio_servicio.
 # ==============================================================================
 
@@ -141,47 +145,29 @@ def _variacion_de(
     tenant_id: str, producto_id: int, variacion,
 ) -> tuple[int | None, str | None]:
     """Resuelve la variación de una receta por nombre o id. None = base."""
-    if variacion in (None, ""):
-        return None, None
-    texto = _texto(variacion)
+    fila, error = variacion_compuesto(tenant_id, producto_id, variacion)
+    if error:
+        return None, error
+    return (fila["id"] if fila else None), None
 
-    if texto.isdigit():
-        vid = int(texto)
-        filas = query(
-            "SELECT id FROM producto_variaciones "
-            "WHERE id = %s AND producto_id = %s AND tenant_id = %s",
-            (vid, producto_id, tenant_id),
-        )
-        if not filas:
-            return None, f"La variación #{vid} no pertenece a este producto."
-        return filas[0]["id"], None
 
-    filas = query(
-        "SELECT id FROM producto_variaciones "
-        "WHERE producto_id = %s AND tenant_id = %s AND lower(nombre) = lower(%s)",
-        (producto_id, tenant_id, texto),
+def _error_material_no_fisico(fila: dict) -> str | None:
+    """El motor de cobro solo descuenta UN nivel de receta: si un compuesto
+    fuera material de otro, la venta no consumiría los ingredientes reales."""
+    if (fila.get("tipo_producto") or "stock") == "stock":
+        return None
+    return (
+        f"'{fila['producto']}' es un compuesto (tiene su propia receta), no un "
+        "ingrediente físico. Una receta solo lleva productos tipo stock: no se "
+        "pueden anidar platillos."
     )
-    if filas:
-        return filas[0]["id"], None
-
-    opciones = query(
-        "SELECT nombre FROM producto_variaciones "
-        "WHERE producto_id = %s AND tenant_id = %s ORDER BY nombre",
-        (producto_id, tenant_id),
-    )
-    if opciones:
-        return None, (
-            f"'{texto}' no es una variación de este producto. Opciones: "
-            + ", ".join(o["nombre"] for o in opciones)
-            + "."
-        )
-    return None, "Este producto no tiene variaciones: deja 'variacion' vacía."
 
 
 def _resolver_material(
     tenant_id: str, material, material_id,
 ) -> tuple[dict | None, str | None]:
-    """Resuelve el material de una receta por id (material_id) o por nombre."""
+    """Resuelve el material de una receta por id (material_id) o por nombre.
+    Solo acepta productos físicos (tipo stock)."""
     mid = None
     if material_id not in (None, ""):
         try:
@@ -193,36 +179,39 @@ def _resolver_material(
 
     if mid is not None:
         filas = query(
-            "SELECT id, Producto AS producto FROM productos "
+            "SELECT id, Producto AS producto, tipo_producto FROM productos "
             "WHERE id = %s AND tenant_id = %s AND Estado = 'Activo'",
             (mid, tenant_id),
         )
         if not filas:
             return None, f"No existe un material activo con id {mid}."
-        return filas[0], None
+        error = _error_material_no_fisico(filas[0])
+        return (None, error) if error else (filas[0], None)
 
     texto = _texto(material)
     if not texto:
         return None, "Falta el material (nombre o material_id)."
 
     filas = query(
-        "SELECT id, Producto AS producto FROM productos "
+        "SELECT id, Producto AS producto, tipo_producto FROM productos "
         "WHERE tenant_id = %s AND Estado = 'Activo' AND lower(Producto) = lower(%s)",
         (tenant_id, texto),
     )
     if len(filas) == 1:
-        return filas[0], None
+        error = _error_material_no_fisico(filas[0])
+        return (None, error) if error else (filas[0], None)
     if len(filas) > 1:
         return None, f"Hay más de un producto llamado '{texto}'. Pásame el material_id."
 
     parciales = query(
-        "SELECT id, Producto AS producto FROM productos "
+        "SELECT id, Producto AS producto, tipo_producto FROM productos "
         "WHERE tenant_id = %s AND Estado = 'Activo' "
         "AND lower(Producto) LIKE lower(%s) ORDER BY Producto LIMIT 6",
         (tenant_id, f"%{texto}%"),
     )
     if len(parciales) == 1:
-        return parciales[0], None
+        error = _error_material_no_fisico(parciales[0])
+        return (None, error) if error else (parciales[0], None)
     if parciales:
         return None, (
             f"No encontré un material '{texto}' exacto. ¿Cuál es? "
@@ -230,6 +219,106 @@ def _resolver_material(
             + "."
         )
     return None, f"No existe un material activo llamado '{texto}'."
+
+
+def variacion_compuesto(
+    tenant_id: str, producto_id: int, variacion,
+) -> tuple[dict | None, str | None]:
+    """
+    Resuelve la presentación de un compuesto por nombre o id para el COBRO.
+    Devuelve ({id, nombre, precio}, None); (None, None) si no hay variación
+    (receta base); (None, error) si el texto no es una variación del producto.
+    """
+    if variacion in (None, ""):
+        return None, None
+    texto = _texto(variacion)
+
+    if texto.isdigit():
+        vid = int(texto)
+        filas = query(
+            "SELECT id, nombre, COALESCE(precio, 0) AS precio "
+            "FROM producto_variaciones "
+            "WHERE id = %s AND producto_id = %s AND tenant_id = %s",
+            (vid, producto_id, tenant_id),
+        )
+        if not filas:
+            return None, f"La variación #{vid} no pertenece a este producto."
+    else:
+        filas = query(
+            "SELECT id, nombre, COALESCE(precio, 0) AS precio "
+            "FROM producto_variaciones "
+            "WHERE producto_id = %s AND tenant_id = %s "
+            "AND lower(nombre) = lower(%s)",
+            (producto_id, tenant_id, texto),
+        )
+        if not filas:
+            opciones = query(
+                "SELECT nombre FROM producto_variaciones "
+                "WHERE producto_id = %s AND tenant_id = %s ORDER BY nombre",
+                (producto_id, tenant_id),
+            )
+            if opciones:
+                return None, (
+                    f"'{texto}' no es una variación de este producto. Opciones: "
+                    + ", ".join(o["nombre"] for o in opciones)
+                    + "."
+                )
+            return None, "Este producto no tiene variaciones: deja 'variacion' vacía."
+
+    fila = filas[0]
+    return {
+        "id": fila["id"],
+        "nombre": fila["nombre"],
+        "precio": _decimal(fila.get("precio")),
+    }, None
+
+
+def disponibilidad_compuesto(
+    tenant_id: str, producto, variacion=None,
+) -> int | None:
+    """
+    Unidades vendibles de UNA presentación concreta (receta base o la receta
+    de `variacion`, cayendo a la base igual que el motor de cobro).
+
+    None = no hay receta para esa presentación: venderlo no descontaría nada,
+    así que mcp_cobro lo rechaza. `producto` acepta la fila de _buscar_producto
+    (con id y producto) o el nombre/id.
+    """
+    if isinstance(producto, dict):
+        nombre = _texto(producto.get("producto"))
+        producto_id = producto.get("id")
+    else:
+        fila, error = _buscar_producto(tenant_id, producto)
+        if error:
+            return None
+        nombre = fila["producto"]
+        producto_id = fila["id"]
+
+    materiales = _materiales(nombre, tenant_id)
+    if not materiales:
+        return None
+
+    variacion_id = None
+    if variacion not in (None, ""):
+        var, error = variacion_compuesto(tenant_id, producto_id, variacion)
+        if error:
+            return None
+        variacion_id = var["id"] if var else None
+
+    if variacion_id is not None:
+        receta = [m for m in materiales if m.get("variacion_id") == variacion_id]
+        if not receta:
+            # Esa presentación no tiene receta propia: usa la base (motor de ventas).
+            receta = [m for m in materiales if m.get("variacion_id") is None]
+    else:
+        receta = [m for m in materiales if m.get("variacion_id") is None]
+
+    if not receta:
+        return None
+
+    fila = [{"producto": nombre, "tipo_producto": "compuesto", "recetas": receta}]
+    _calcular_disponibilidad_compuestos(fila, tenant_id)
+    return fila[0].get("disponibilidad_estimada")
 
 
 # ── Tool: ver_receta ─────────────────────────────────────────────────────────

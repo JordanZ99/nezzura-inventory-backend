@@ -20,8 +20,10 @@
 #   - Fail-closed: cualquier dato que no resuelva aborta ANTES de crear el
 #     borrador. Sin costos ni ganancia en la respuesta (nunca viajan — el
 #     motor los captura internamente y esta capa no los expone).
-#   - Alcance v1: solo productos físicos ('stock'); compuestos/servicios,
-#     clientes y canje de puntos quedan fuera (igual que el resto del MCP).
+#   - Alcance: productos físicos ('stock') y COMPUESTOS ('compuesto': platillos
+#     con receta, que descuentan sus ingredientes vía cobrar_carrito). Los
+#     servicios, clientes y canje de puntos quedan fuera (igual que el resto
+#     del MCP).
 # ==============================================================================
 
 import re
@@ -31,7 +33,7 @@ from database import mcp_borradores
 from database.actividad import registrar_actividad
 from database.conexion import query
 from database.helpers import hoy_negocio
-from database.mcp_catalogo import _PRECIO_VENTA, _normalizar
+from database.mcp_catalogo import _PRECIO_VENTA_LECTURA, _normalizar
 from database.ventas import METODOS_PAGO, actualizar_orden, cobrar_carrito
 
 # Cota anti-abuso: un ticket razonable no tiene más renglones que esto.
@@ -50,24 +52,28 @@ _SQL_PRODUCTO = f"""
     SELECT p.id, p.Producto AS producto, p.tipo_producto, p.fraccionable,
            p.Estado AS estado,
            COALESCE(SUM(CASE WHEN l.Stock_Lote > 0 THEN l.Stock_Lote END), 0) AS stock,
-           {_PRECIO_VENTA} AS precio
+           COALESCE(p.precio_servicio, 0) AS precio_servicio,
+           {_PRECIO_VENTA_LECTURA} AS precio
     FROM productos p
     LEFT JOIN lotes l ON l.producto_id = p.id AND l.tenant_id = p.tenant_id
                       AND l.Estado = 'Activo'
     WHERE p.id = %s AND p.tenant_id = %s
-    GROUP BY p.id, p.Producto, p.tipo_producto, p.fraccionable, p.Estado
+    GROUP BY p.id, p.Producto, p.tipo_producto, p.fraccionable, p.Estado,
+             p.precio_servicio
 """
 
 _SQL_PRODUCTO_POR_NOMBRE = f"""
     SELECT p.id, p.Producto AS producto, p.tipo_producto, p.fraccionable,
            p.Estado AS estado,
            COALESCE(SUM(CASE WHEN l.Stock_Lote > 0 THEN l.Stock_Lote END), 0) AS stock,
-           {_PRECIO_VENTA} AS precio
+           COALESCE(p.precio_servicio, 0) AS precio_servicio,
+           {_PRECIO_VENTA_LECTURA} AS precio
     FROM productos p
     LEFT JOIN lotes l ON l.producto_id = p.id AND l.tenant_id = p.tenant_id
                       AND l.Estado = 'Activo'
     WHERE p.Producto = %s AND p.tenant_id = %s
-    GROUP BY p.id, p.Producto, p.tipo_producto, p.fraccionable, p.Estado
+    GROUP BY p.id, p.Producto, p.tipo_producto, p.fraccionable, p.Estado,
+             p.precio_servicio
 """
 
 # Lote del producto que el agente pidió explícitamente (id_lote): debe existir,
@@ -79,18 +85,20 @@ _SQL_LOTE = """
       AND l.Estado = 'Activo'
 """
 
-# Nombres del inventario físico activo (para el aviso anti-flojera de la venta
-# libre): si la descripcion contiene TODOS los tokens del nombre de un
-# producto, probablemente ese producto sí existía. Solo se ejecuta si hay
-# renglones de venta libre; es la única consulta extra y el precio sale gratis
-# de la misma expresión del catálogo (para mostrarlo en el aviso).
+# Nombres del inventario activo (físicos + compuestos) para el aviso
+# anti-flojera de la venta libre: si la descripcion contiene TODOS los tokens
+# del nombre de un producto, probablemente ese producto sí existía. Solo se
+# ejecuta si hay renglones de venta libre; es la única consulta extra y el
+# precio sale gratis de la misma expresión del catálogo (para mostrarlo en el
+# aviso).
 _SQL_NOMBRES = f"""
-    SELECT p.id, p.Producto AS producto, {_PRECIO_VENTA} AS precio
+    SELECT p.id, p.Producto AS producto, {_PRECIO_VENTA_LECTURA} AS precio
     FROM productos p
     LEFT JOIN lotes l ON l.producto_id = p.id AND l.tenant_id = p.tenant_id
                       AND l.Estado = 'Activo'
-    WHERE p.tenant_id = %s AND p.Estado = 'Activo' AND p.tipo_producto = 'stock'
-    GROUP BY p.id, p.Producto
+    WHERE p.tenant_id = %s AND p.Estado = 'Activo'
+      AND p.tipo_producto IN ('stock', 'compuesto')
+    GROUP BY p.id, p.Producto, p.precio_servicio
 """
 
 # El producto genérico 'Venta libre' del tenant (migración 036): el motor de
@@ -354,24 +362,130 @@ def proponer_venta(tenant_id: str, clave_id: int, items, pago=None, fecha=None, 
             return {
                 "error": (
                     f"No existe el producto {referencia} en el inventario (o no "
-                    "es un producto físico activo). Usa buscar_productos para "
-                    "encontrar el producto_id exacto y vuelve a proponer la venta."
+                    "está activo). Usa buscar_productos para encontrar el "
+                    "producto_id exacto y vuelve a proponer la venta."
                 )
             }
         prod = filas[0]
         nombre_real = prod["producto"]
 
-        if (prod.get("tipo_producto") or "stock") != "stock":
+        tipo = prod.get("tipo_producto") or "stock"
+        if tipo not in ("stock", "compuesto"):
             return {
                 "error": (
-                    f"'{nombre_real}' es {prod.get('tipo_producto')}: el conector "
-                    "solo vende productos físicos por ahora. Regístralo en el "
-                    "gestor o como venta libre con su motivo."
+                    f"'{nombre_real}' es {tipo}: el conector no vende servicios. "
+                    "Regístralo en el gestor o como venta libre con su motivo."
                 )
             }
         if (prod.get("estado") or "Activo") != "Activo":
             return {"error": f"'{nombre_real}' está inactivo en el inventario: no se puede vender."}
 
+        variacion = str(item.get("variacion") or "").strip() or None
+        id_lote = item.get("id_lote")
+
+        # ── Compuesto (platillo/producto con receta): se vende contra su
+        # disponibilidad real y cobrar_carrito descuenta los ingredientes (BOM),
+        # igual que el POS. Sin receta no se puede vender: se cobraría sin
+        # consumir nada y con costo 0.
+        if tipo == "compuesto":
+            if id_lote is not None:
+                return {
+                    "error": (
+                        f"El renglón {i}: '{nombre_real}' es un compuesto y no "
+                        "tiene lotes: quita id_lote (el cobro descuenta los "
+                        "ingredientes de su receta)."
+                    )
+                }
+            from database import mcp_recetas  # import local: evita ciclo al cargar el MCP
+
+            var_fila, error_var = mcp_recetas.variacion_compuesto(
+                tenant_id, prod["id"], variacion
+            )
+            if error_var:
+                return {"error": f"El renglón {i}: {error_var}"}
+
+            disponible = mcp_recetas.disponibilidad_compuesto(
+                tenant_id, prod, variacion
+            )
+            if disponible is None:
+                etiqueta = (
+                    f"la variación '{variacion}' de '{nombre_real}'"
+                    if variacion else f"'{nombre_real}'"
+                )
+                return {
+                    "error": (
+                        f"{etiqueta} no tiene materiales en su receta: no se "
+                        "puede vender (se cobraría sin descontar ingredientes). "
+                        "Agrégale materiales con proponer_receta y vuelve a "
+                        "proponer la venta."
+                    )
+                }
+
+            # Precio: el del item si lo envió; si no, el de la variación (si
+            # tiene precio propio) o el precio_servicio del compuesto.
+            if item.get("precio_real") is not None:
+                try:
+                    precio_real = round(float(item["precio_real"]), 2)
+                except (TypeError, ValueError):
+                    return {"error": f"El renglón {i}: el precio_real debe ser un número."}
+                if precio_real < 0:
+                    return {"error": f"El renglón {i}: el precio_real no puede ser negativo."}
+                precio_default = None
+            else:
+                precio_default = round(float(prod.get("precio") or 0), 2)
+                if var_fila and float(var_fila.get("precio") or 0) > 0:
+                    precio_default = round(float(var_fila["precio"]), 2)
+                if precio_default <= 0:
+                    return {
+                        "error": (
+                            f"'{nombre_real}' no tiene precio de venta: envía el "
+                            "precio_real que se cobró para este renglón."
+                        )
+                    }
+                precio_real = precio_default
+
+            if cantidad != int(cantidad):
+                return {
+                    "error": (
+                        f"'{nombre_real}' se vende por unidades enteras: "
+                        "corrige la cantidad."
+                    )
+                }
+
+            resueltos.append({
+                "tipo_item": "producto",
+                "producto_id": prod["id"],
+                "producto": nombre_real,
+                "tipo_producto": "compuesto",
+                "cantidad": cantidad,
+                "precio_real": precio_real,
+                "variacion": variacion,
+                "id_lote": None,
+            })
+            renglon = {
+                "producto": nombre_real,
+                "tipo": "compuesto",
+                "cantidad": cantidad,
+                "precio_unitario": precio_real,
+                "subtotal": round(precio_real * cantidad, 2),
+                "disponibilidad_estimada": disponible,
+            }
+            if precio_default is not None:
+                renglon["precio_de_lista"] = True  # salió de la BD, no del agente
+            if variacion:
+                renglon["variacion"] = variacion
+            desglose.append(renglon)
+
+            if cantidad > disponible:
+                avisos.append(
+                    f"⚠ '{nombre_real}': propones vender {cantidad:g} y la "
+                    f"receta alcanza para {disponible:g} — el cobro descontará "
+                    "igual los ingredientes y dejará stock negativo; revisa el "
+                    "inventario si no era así."
+                )
+            continue
+
+        # ── Producto físico: PEPS normal ──
         # Stock disponible (suma de lotes activos con stock): viaja al desglose
         # y dispara el aviso de sobreventa. Vender MÁS del stock está permitido
         # (el motor PEPS deja el lote en negativo, igual que el POS) — el dueño
@@ -408,7 +522,6 @@ def proponer_venta(tenant_id: str, clave_id: int, items, pago=None, fecha=None, 
             }
 
         # Lote pedido explícitamente: validar existencia/propiedad/estado.
-        id_lote = item.get("id_lote")
         if id_lote is not None:
             try:
                 id_lote = int(id_lote)
@@ -425,12 +538,11 @@ def proponer_venta(tenant_id: str, clave_id: int, items, pago=None, fecha=None, 
                 }
             stock_lote = float(lote[0].get("stock") or 0)
 
-        variacion = str(item.get("variacion") or "").strip() or None
-
         resueltos.append({
             "tipo_item": "producto",
             "producto_id": prod["id"],
             "producto": nombre_real,
+            "tipo_producto": "stock",
             "cantidad": cantidad,
             "precio_real": precio_real,
             "variacion": variacion,
@@ -438,6 +550,7 @@ def proponer_venta(tenant_id: str, clave_id: int, items, pago=None, fecha=None, 
         })
         renglon = {
             "producto": nombre_real,
+            "tipo": "stock",
             "cantidad": cantidad,
             "precio_unitario": precio_real,
             "subtotal": round(precio_real * cantidad, 2),
