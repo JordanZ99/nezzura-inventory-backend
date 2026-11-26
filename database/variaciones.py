@@ -10,7 +10,7 @@
 
 import uuid
 from psycopg2.errors import UniqueViolation
-from database.conexion import query
+from database.conexion import query, execute
 from database.helpers import _resolver_producto_id, ahora_negocio, _parsear_ts
 from database.movimientos import registrar_movimiento_inventario
 from database.actividad import registrar_actividad
@@ -122,7 +122,7 @@ def crear_variacion(producto: str, nombre: str, precio: float, tenant_id: str, f
             costo_lote = float(costo or 0) or 0
             fecha_var = str(ahora_negocio(tenant_id))
             id_lote_var = str(uuid.uuid4())[:12]
-            query("""
+            execute("""
                 INSERT INTO lotes (ID_Lote, Producto, producto_id, Costo, Precio_Venta,
                                    Stock_Lote, Fecha_Entrada, fecha_entrada_ts, Estado, tenant_id, variacion_id)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'Activo', %s, %s)

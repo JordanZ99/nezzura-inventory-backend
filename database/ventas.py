@@ -1538,8 +1538,13 @@ def _preparar_venta_servicio(item: dict, prod: dict, variacion: str, tenant_id: 
 
 def _preparar_ventas_stock(conn, item: dict, variacion: str, tenant_id: str) -> list[dict]:
     """
-    Producto con stock: PEPS normal. ¿Stock por variación? Si el producto
-    activó el flag, el descuento va SOLO a los lotes de ESA variación (Fase 6).
+    Producto con stock: PEPS normal. Si el producto maneja variaciones, el
+    descuento va SOLO a los lotes de ESA variación (Fase 6).
+
+    Fail-closed: si el producto tiene variaciones y no llega una (o llega una
+    que no existe), se aborta. Antes se caía a los lotes base, que en estos
+    productos no existen: el PEPS creaba un lote virtual con stock negativo y
+    costo 0, y la venta quedaba "registrada" sin descontar la talla real.
     """
     variacion_id = None
     if variacion:
@@ -1547,6 +1552,23 @@ def _preparar_ventas_stock(conn, item: dict, variacion: str, tenant_id: str) -> 
             variacion_id = _resolver_variacion_venta(
                 cur, {"producto": item["producto"], "variacion": variacion}, tenant_id
             )
+        if variacion_id is None:
+            raise ValueError(
+                f"La variación '{variacion}' no existe para '{item['producto']}'."
+            )
+    else:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM producto_variaciones v "
+                "JOIN productos p ON p.id = v.producto_id "
+                "WHERE p.Producto = %s AND p.tenant_id = %s LIMIT 1",
+                (item["producto"], tenant_id),
+            )
+            if cur.fetchone():
+                raise ValueError(
+                    f"'{item['producto']}' se vende por variaciones: indica cuál "
+                    "(el stock vive en los lotes de cada variación)."
+                )
     resultado = descontar_stock_peps(
         item["producto"],
         item["cantidad"],

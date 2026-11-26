@@ -395,8 +395,10 @@ def confirmar(tenant_id: str, datos: dict) -> dict:
 #   producto → descripción, nombre, precio de venta (en un compuesto es su
 #              precio_servicio), costo (solo con permiso ver_costos y NUNCA en
 #              compuestos), estado, visibilidad, tamaño, códigos, ubicación,
-#              categorías. NUNCA imagen (binario) ni recetas/variaciones: la
-#              receta se edita con proponer_receta.
+#              categorías y VARIACIONES (precio/nombre de las existentes y
+#              creación de nuevas con su stock inicial). NUNCA imagen (binario)
+#              ni recetas: la receta se edita con proponer_receta. Las
+#              variaciones no se BORRAN por el agente (pueden tener ventas).
 #   venta    → fecha, cantidad, precio. Los totales y el stock se recalculan
 #              en el server (actualizar_venta ya maneja PEPS y compuestos).
 #   gasto    → monto, categoría, descripción.
@@ -407,7 +409,7 @@ _TIPOS_EDICION = ("producto", "venta", "gasto")
 _CAMPOS_PRODUCTO = (
     "nombre", "descripcion", "precio_venta", "costo", "estado",
     "visible_en_catalogo", "tamano_cm", "codigo_interno", "codigo_barras",
-    "ubicacion", "categoria",
+    "ubicacion", "categoria", "variaciones", "variaciones_nuevas",
 )
 _CAMPOS_VENTA = ("fecha", "cantidad", "precio_real")
 _CAMPOS_GASTO = ("monto", "categoria", "descripcion")
@@ -470,6 +472,147 @@ def _producto_actual(tenant_id: str, producto_id: int) -> dict | None:
         (producto_id, tenant_id),
     )
     return filas[0] if filas else None
+
+
+def _variaciones_actuales(tenant_id: str, producto_id: int) -> list[dict]:
+    """Variaciones vigentes del producto con su precio y stock por lotes.
+    Base del diff antes→después de las ediciones por variación."""
+    filas = query(
+        """
+        SELECT v.id, v.nombre, v.precio, v.tamano_cm,
+               COALESCE((SELECT SUM(l.Stock_Lote) FROM lotes l
+                         WHERE l.variacion_id = v.id AND l.Estado = 'Activo'
+                           AND l.tenant_id = v.tenant_id), 0) AS stock
+        FROM producto_variaciones v
+        WHERE v.producto_id = %s AND v.tenant_id = %s
+        ORDER BY v.nombre ASC
+        """,
+        (producto_id, tenant_id),
+    )
+    return [
+        {
+            "id": f["id"],
+            "nombre": f["nombre"],
+            "precio": round(float(f["precio"] or 0), 2),
+            "tamano_cm": (
+                float(f["tamano_cm"]) if f.get("tamano_cm") is not None else None
+            ),
+            "stock": _num_simple(f.get("stock")) or 0,
+        }
+        for f in filas
+    ]
+
+
+def _validar_variaciones_edicion(
+    lista, actuales: list[dict], producto: str,
+) -> list[dict]:
+    """Normaliza [{nombre, precio?, nuevo_nombre?, tamano_cm?}] contra las
+    variaciones que YA existen. Solo toca datos; no escribe nada."""
+    if not isinstance(lista, list) or not lista:
+        raise ValueError(
+            "'variaciones' debe ser una lista de {nombre, precio} con "
+            "variaciones que ya existen (para crear una usa 'variaciones_nuevas')."
+        )
+    por_nombre = {v["nombre"].strip().lower(): v for v in actuales}
+    opciones = ", ".join(f"'{v['nombre']}'" for v in actuales) or "(ninguna)"
+    vistas: set[str] = set()
+    out: list[dict] = []
+    for v in lista:
+        if not isinstance(v, dict):
+            raise ValueError("Cada variación a editar debe ser un objeto {nombre, precio}.")
+        nombre = _texto(v.get("nombre"))
+        if not nombre:
+            raise ValueError("Hay una variación sin nombre.")
+        clave = nombre.lower()
+        if clave in vistas:
+            raise ValueError(f"Variación repetida: '{nombre}'.")
+        vistas.add(clave)
+        actual = por_nombre.get(clave)
+        if actual is None:
+            raise ValueError(
+                f"La variación '{nombre}' no existe para '{producto}'. Para "
+                f"crearla usa 'variaciones_nuevas'. Existentes: {opciones}."
+            )
+        precio = (
+            actual["precio"] if v.get("precio") in (None, "")
+            else _num(v.get("precio"), f"precio de la variación {nombre}")
+        )
+        nuevo_nombre = _texto(v.get("nuevo_nombre")) or actual["nombre"]
+        if nuevo_nombre.lower() != clave and nuevo_nombre.lower() in por_nombre:
+            raise ValueError(f"Ya existe una variación llamada '{nuevo_nombre}'.")
+        tamano = actual["tamano_cm"]
+        if "tamano_cm" in v:
+            tamano = (
+                None if v["tamano_cm"] in (None, "")
+                else _num(v["tamano_cm"], "tamano_cm de la variación")
+            )
+        out.append({
+            "id": actual["id"],
+            "nombre": actual["nombre"],
+            "nuevo_nombre": nuevo_nombre,
+            "precio_antes": actual["precio"],
+            "precio": precio,
+            "tamano_cm": tamano,
+        })
+    return out
+
+
+def _validar_variaciones_nuevas(
+    lista, actuales: list[dict], producto: str, es_compuesto: bool,
+) -> list[dict]:
+    """Normaliza [{nombre, precio, stock_inicial?, costo?, tamano_cm?}] para
+    CREAR variaciones en un producto que ya existe. El stock inicial crea el
+    lote de esa presentación (misma semántica que el alta del gestor)."""
+    if not isinstance(lista, list) or not lista:
+        raise ValueError(
+            "'variaciones_nuevas' debe ser una lista de {nombre, precio, "
+            "stock_inicial, costo}."
+        )
+    existentes = {v["nombre"].strip().lower() for v in actuales}
+    vistas: set[str] = set()
+    out: list[dict] = []
+    for v in lista:
+        if not isinstance(v, dict):
+            raise ValueError(
+                "Cada variación nueva debe ser un objeto {nombre, precio, "
+                "stock_inicial, costo}."
+            )
+        nombre = _texto(v.get("nombre"))
+        if not nombre:
+            raise ValueError("Hay una variación nueva sin nombre.")
+        clave = nombre.lower()
+        if clave in existentes:
+            raise ValueError(
+                f"La variación '{nombre}' ya existe para '{producto}': edítala "
+                "en 'variaciones' en vez de crearla."
+            )
+        if clave in vistas:
+            raise ValueError(f"Variación nueva repetida: '{nombre}'.")
+        vistas.add(clave)
+        precio = _num(v.get("precio"), f"precio de la variación {nombre}")
+        if precio <= 0:
+            raise ValueError(
+                f"La variación '{nombre}' necesita un precio mayor a 0."
+            )
+        stock = _num(v.get("stock_inicial") or 0, f"stock de la variación {nombre}")
+        costo = _num(v.get("costo") or 0, f"costo de la variación {nombre}")
+        if es_compuesto and stock > 0:
+            raise ValueError(
+                f"'{producto}' es un compuesto: no tiene stock propio, así que "
+                f"la variación '{nombre}' no lleva stock_inicial (su "
+                "disponibilidad sale de la receta, con proponer_receta)."
+            )
+        tamano = None
+        if v.get("tamano_cm") not in (None, ""):
+            tamano = _num(v["tamano_cm"], "tamano_cm de la variación")
+        out.append({
+            "nombre": nombre,
+            "precio": precio,
+            "stock_inicial": stock,
+            "costo": costo,
+            "tamano_cm": tamano,
+        })
+    return out
 
 
 def _venta_actual(tenant_id: str, venta_id: int) -> dict | None:
@@ -563,6 +706,20 @@ def _proponer_edicion_producto(
             "costos (switch 'ver costos' de esta clave en el gestor)."
         )}
 
+    # Variaciones: un producto con tamaños/presentaciones tiene un precio y un
+    # stock POR variación. Editar 'precio_venta' ahí reescribiría el precio de
+    # TODOS sus lotes y aplanaría los tamaños, así que se rechaza y se guía a
+    # 'variaciones' (precio/nombre de las existentes) y 'variaciones_nuevas'.
+    variaciones_actuales = _variaciones_actuales(tenant_id, producto_id)
+    if variaciones_actuales and "precio_venta" in cambios and not es_compuesto:
+        nombres = ", ".join(f"'{v['nombre']}'" for v in variaciones_actuales)
+        return {"error": (
+            f"'{actual['producto']}' tiene variaciones ({nombres}) y cada una "
+            "tiene su propio precio: no edites 'precio_venta' (cambiaría el "
+            "precio de TODOS sus lotes). Edita cada precio en 'variaciones': "
+            "[{nombre: 'Grande', precio: 250}]."
+        )}
+
     base = {
         "producto": actual["producto"],
         "descripcion": actual["descripcion"],
@@ -579,6 +736,8 @@ def _proponer_edicion_producto(
 
     resueltos: dict = {}
     diff: dict = {}
+    variaciones_editadas: list[dict] = []
+    variaciones_nuevas: list[dict] = []
 
     try:
         if "nombre" in cambios:
@@ -615,6 +774,15 @@ def _proponer_edicion_producto(
             if len(cats) > 5:
                 return {"error": "Máximo 5 categorías por producto."}
             resueltos["categoria"] = cats or ["General"]
+        if "variaciones" in cambios:
+            variaciones_editadas = _validar_variaciones_edicion(
+                cambios["variaciones"], variaciones_actuales, actual["producto"]
+            )
+        if "variaciones_nuevas" in cambios:
+            variaciones_nuevas = _validar_variaciones_nuevas(
+                cambios["variaciones_nuevas"], variaciones_actuales,
+                actual["producto"], es_compuesto,
+            )
     except ValueError as e:
         return {"error": str(e)}
 
@@ -639,6 +807,22 @@ def _proponer_edicion_producto(
         if _round_cmp(antes, despues):
             continue
         diff[campo] = [antes, despues]
+
+    # Variaciones: el diff se ve igual de legible que el resto ("Grande
+    # (precio): 350 → 400") y el dueño aprueba exactamente lo que se aplicará.
+    for v in variaciones_editadas:
+        if v["nombre"].strip().lower() != v["nuevo_nombre"].strip().lower():
+            diff[f"variación {v['nombre']} (nombre)"] = [v["nombre"], v["nuevo_nombre"]]
+        if round(v["precio"] or 0, 2) != round(v["precio_antes"] or 0, 2):
+            diff[f"variación {v['nombre']} (precio)"] = [v["precio_antes"], v["precio"]]
+    for v in variaciones_nuevas:
+        detalle = f"${v['precio']:g}"
+        if v["stock_inicial"] > 0:
+            detalle += f" · {v['stock_inicial']:g} u."
+        if v["costo"] > 0:
+            detalle += f" · costo ${v['costo']:g}"
+        diff[f"variación nueva {v['nombre']}"] = [None, detalle]
+
     if not diff:
         return {"error": "Nada que editar: los valores nuevos son iguales a los actuales."}
 
@@ -648,6 +832,8 @@ def _proponer_edicion_producto(
             "entidad_id": producto_id,
             "base": base,
             "cambios": resueltos,
+            "variaciones": variaciones_editadas,
+            "variaciones_nuevas": variaciones_nuevas,
         },
         "diff": diff,
         "resumen": f"Edición de {base['producto']}: {_diff_legible(diff)}",
@@ -814,11 +1000,89 @@ def confirmar_edicion(tenant_id: str, datos: dict) -> dict:
     return {"error": "Borrador de edición desconocido."}
 
 
+def _aplicar_variaciones(tenant_id: str, datos: dict) -> dict:
+    """Aplica las variaciones del borrador de edición.
+
+    Las CREACIONES van primero: `crear_variacion` resuelve el producto por su
+    nombre ACTUAL y la misma edición puede renombrarlo. Nada de lo aquí hecho
+    toca el precio de los lotes del producto: cada variación manda su precio.
+    """
+    from database.variaciones import actualizar_variacion, crear_variacion
+
+    producto = (datos.get("base") or {}).get("producto") or ""
+    actualizadas: list[str] = []
+    creadas: list[str] = []
+    errores: list[str] = []
+
+    # Pre-chequeo: si alguna variación a editar ya no existe (otra sesión la
+    # borró), se aborta ANTES de crear nada. Así un fallo no deja la edición a
+    # medias (variación nueva creada + precio viejo sin cambiar).
+    a_editar = datos.get("variaciones") or []
+    if a_editar:
+        vigentes = {
+            f["id"] for f in query(
+                "SELECT id FROM producto_variaciones WHERE tenant_id = %s",
+                (tenant_id,),
+            )
+        }
+        faltantes = [v["nombre"] for v in a_editar if v["id"] not in vigentes]
+        if faltantes:
+            return {
+                "actualizadas": [],
+                "creadas": [],
+                "errores": [
+                    "ya no existe la variación " + ", ".join(f"'{n}'" for n in faltantes)
+                    + " (pudo borrarse en el gestor). Vuelve a proponer la edición."
+                ],
+            }
+
+    for v in datos.get("variaciones_nuevas") or []:
+        r = crear_variacion(
+            producto, v["nombre"], v["precio"], tenant_id,
+            stock_inicial=v.get("stock_inicial") or None,
+            costo=v.get("costo") or None,
+            tamano_cm=v.get("tamano_cm"),
+        )
+        if not r.get("ok"):
+            errores.append(
+                f"No se pudo crear la variación '{v['nombre']}': "
+                f"{r.get('mensaje') or 'error desconocido'}."
+            )
+        else:
+            creadas.append(v["nombre"])
+
+    for v in datos.get("variaciones") or []:
+        r = actualizar_variacion(
+            v["id"], v["nuevo_nombre"], v["precio"], tenant_id,
+            tamano_cm=v.get("tamano_cm"),
+        )
+        if not r.get("ok"):
+            errores.append(
+                f"No se pudo actualizar la variación '{v['nombre']}': "
+                f"{r.get('mensaje') or 'error desconocido'}."
+            )
+        else:
+            actualizadas.append(v["nuevo_nombre"])
+
+    return {"actualizadas": actualizadas, "creadas": creadas, "errores": errores}
+
+
 def _confirmar_edicion_producto(tenant_id: str, datos: dict) -> dict:
     base = datos.get("base") or {}
     cambios = datos.get("cambios") or {}
     producto_id = datos.get("entidad_id")
     es_compuesto = (base.get("tipo_producto") or "stock") == "compuesto"
+
+    # Variaciones primero: si algo falla no se toca el producto (el borrador ya
+    # validó todo; un fallo aquí es un cambio externo entre proponer y
+    # confirmar, ej. otra sesión renombró la variación).
+    cambios_var = _aplicar_variaciones(tenant_id, datos)
+    if cambios_var["errores"]:
+        return {
+            "error": "No se aplicó la edición: " + " ".join(cambios_var["errores"]),
+            "variaciones_actualizadas": cambios_var["actualizadas"] or None,
+            "variaciones_creadas": cambios_var["creadas"] or None,
+        }
 
     nombre_nuevo = cambios.get("nombre")
     resultado = actualizar_producto(
@@ -848,8 +1112,12 @@ def _confirmar_edicion_producto(tenant_id: str, datos: dict) -> dict:
     )
     if not isinstance(resultado, dict) or not resultado.get("ok"):
         mensaje = (resultado or {}).get("mensaje") if isinstance(resultado, dict) else None
-        return {"error": f"No se pudo editar el producto: {mensaje or 'error desconocido'}"}
-    return {
+        return {
+            "error": f"No se pudo editar el producto: {mensaje or 'error desconocido'}",
+            "variaciones_actualizadas": cambios_var["actualizadas"] or None,
+            "variaciones_creadas": cambios_var["creadas"] or None,
+        }
+    respuesta = {
         "ok": True,
         "entidad": "producto",
         "entidad_id": producto_id,
@@ -857,6 +1125,11 @@ def _confirmar_edicion_producto(tenant_id: str, datos: dict) -> dict:
         "nombre_final": resultado.get("producto"),
         "nota": "Los cambios ya están aplicados y quedaron en el Historial como hechos por el agente IA.",
     }
+    if cambios_var["actualizadas"]:
+        respuesta["variaciones_actualizadas"] = cambios_var["actualizadas"]
+    if cambios_var["creadas"]:
+        respuesta["variaciones_creadas"] = cambios_var["creadas"]
+    return respuesta
 
 
 def _confirmar_edicion_venta(tenant_id: str, datos: dict) -> dict:

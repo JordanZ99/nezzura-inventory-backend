@@ -125,6 +125,57 @@ def _con_disponibilidad(items: list[dict], tenant_id: str) -> None:
             item["disponibilidad_estimada"] = disponibles.get(item["nombre"])
 
 
+def _con_variaciones(items: list[dict], tenant_id: str) -> None:
+    """
+    Añade a los FÍSICOS: `variaciones` [{nombre, precio, stock, tamano_cm}],
+    `tiene_variaciones` y, si hay precios válidos, `precio_desde`/`precio_hasta`.
+
+    Sin esto el agente solo ve el precio agregado (MAX de lotes) y no puede
+    responder "¿cuánto cuesta la begonia grande?": el tamaño, su precio y su
+    stock viven en producto_variaciones y en los lotes de ESA variación. Se
+    usa el mismo criterio del catálogo público (variaciones.py), nunca los
+    lotes base (en un producto con variaciones no hay lote base).
+
+    Los COMPUESTOS quedan fuera a propósito: su disponibilidad se calcula con
+    la receta (ver_receta) y su variación se resuelve al vender.
+    """
+    ids = [it["id"] for it in items if it.get("tipo") == "stock"]
+    if not ids:
+        return
+    filas = query(
+        """
+        SELECT v.producto_id, v.nombre, v.precio, v.tamano_cm,
+               COALESCE((SELECT SUM(l.Stock_Lote) FROM lotes l
+                         WHERE l.variacion_id = v.id AND l.Estado = 'Activo'
+                           AND l.tenant_id = v.tenant_id), 0) AS stock
+        FROM producto_variaciones v
+        WHERE v.tenant_id = %s AND v.producto_id = ANY(%s)
+        ORDER BY v.nombre ASC
+        """,
+        (tenant_id, ids),
+    )
+    por_producto: dict[int, list[dict]] = {}
+    for f in filas:
+        por_producto.setdefault(f["producto_id"], []).append({
+            "nombre": f["nombre"],
+            "precio": _num(f["precio"]),
+            "stock": _stock(f["stock"]),
+            "tamano_cm": (
+                float(f["tamano_cm"]) if f.get("tamano_cm") is not None else None
+            ),
+        })
+    for it in items:
+        if it.get("tipo") != "stock":
+            continue
+        variaciones = por_producto.get(it["id"], [])
+        it["tiene_variaciones"] = bool(variaciones)
+        it["variaciones"] = variaciones
+        precios = [v["precio"] for v in variaciones if v["precio"] > 0]
+        if precios:
+            it["precio_desde"] = min(precios)
+            it["precio_hasta"] = max(precios)
+
+
 # ── Búsqueda tolerante ────────────────────────────────────────────────────────
 # El dueño escribe "My Melody" y el producto se llama "MyMelody", o escribe
 # "pokemon" y el producto dice "Pokémon". Normalizamos AMBOS lados:
@@ -254,6 +305,7 @@ def buscar_productos(
             item["costo_unitario"] = costo
             item["margen"] = round(item["precio_venta"] - costo, 2)
         resultado.append(item)
+    _con_variaciones(resultado, tenant_id)
     _con_disponibilidad(resultado, tenant_id)
     return resultado
 
@@ -456,6 +508,7 @@ def stock_actual(
         if tipo == "compuesto":
             item["disponibilidad_estimada"] = None
         resultado.append(item)
+    _con_variaciones(resultado, tenant_id)
     _con_disponibilidad(resultado, tenant_id)
     return resultado
 
@@ -646,6 +699,7 @@ def listar_productos(
             item["costo_unitario"] = costo
             item["margen"] = round(item["precio_venta"] - costo, 2)
         productos.append(item)
+    _con_variaciones(productos, tenant_id)
     _con_disponibilidad(productos, tenant_id)
 
     return {

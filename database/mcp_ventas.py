@@ -151,21 +151,23 @@ def top_vendidos(
         params.append(hasta_ts)
 
     # Ranking por ventas SOLO (sin joins que multipliquen), y el stock actual
-    # se une DESPUÉS con un lateral (una fila por producto, sin duplicar).
+    # se une DESPUÉS con un lateral. La fila es (producto, variación): un
+    # vivero con begonias chicas y grandes ve DOS renglones, cada uno con el
+    # stock de SU talla (el stock total escondería que la grande se agotó).
     filas = query(
         f"""
-        SELECT t.producto, t.unidades, t.ingresos, t.producto_id,
+        SELECT t.producto, t.variacion, t.unidades, t.ingresos, t.producto_id,
                {("st.costo_unitario," if con_costos else "")}
                COALESCE(st.stock, 0) AS stock_actual
         FROM (
-            SELECT v.Producto AS producto,
+            SELECT v.Producto AS producto, v.variacion AS variacion,
                    SUM(v.Cantidad) AS unidades,
                    SUM(v.Total_Venta) AS ingresos,
                    MAX(p.id) AS producto_id
             FROM ventas v
             LEFT JOIN productos p ON p.tenant_id = v.tenant_id AND p.Producto = v.Producto
             WHERE {' AND '.join(filtros)}
-            GROUP BY v.Producto
+            GROUP BY v.Producto, v.variacion
             ORDER BY SUM(v.Total_Venta) DESC, SUM(v.Cantidad) DESC
             LIMIT %s
         ) t
@@ -176,8 +178,14 @@ def top_vendidos(
                      "/ SUM(CASE WHEN l.Stock_Lote > 0 THEN l.Stock_Lote END) ELSE 0 END AS costo_unitario"
                      if con_costos else "1::int AS uno")}
             FROM lotes l
+            LEFT JOIN producto_variaciones vv
+                   ON vv.id = l.variacion_id AND vv.tenant_id = l.tenant_id
             WHERE l.producto_id = t.producto_id AND l.tenant_id = %s
               AND l.Estado = 'Activo'
+              AND (
+                    (t.variacion IS NULL AND l.variacion_id IS NULL)
+                 OR (t.variacion IS NOT NULL AND vv.nombre = t.variacion)
+              )
         ) st ON TRUE
         """,
         tuple(params + [limite, tenant_id]),
@@ -188,6 +196,7 @@ def top_vendidos(
         stock = _stock(f.get("stock_actual"))
         item = {
             "producto": f.get("producto"),
+            "variacion": f.get("variacion") or None,
             "producto_id": f.get("producto_id"),
             "unidades": _stock(f.get("unidades")),
             "ingresos": _num(f.get("ingresos")),

@@ -193,8 +193,13 @@ def buscar_productos(consulta: str, solo_con_stock: bool = False, limite: int = 
     palabras y busca cada una en el nombre, la descripción, la categoría y
     los códigos ("Sanrio" trae todo lo de esa categoría). Devuelve id,
     nombre, tipo ('stock' o 'compuesto'), precio de venta al público, stock
-    disponible y categoría. En un compuesto el stock propio es null y el dato
-    real es disponibilidad_estimada (unidades que alcanzan con los
+    disponible y categoría. Si un físico tiene TAMAÑOS/VARIACIONES (ej. una
+    planta chica y una grande con precios distintos), trae
+    tiene_variaciones=true, 'variaciones' [{nombre, precio, stock,
+    tamano_cm}] y precio_desde/precio_hasta: ahí está el precio y el stock
+    REALES de cada presentación — si el dueño no dijo cuál, pregúntale antes
+    de dar un precio o vender. En un compuesto el stock propio es null y el
+    dato real es disponibilidad_estimada (unidades que alcanzan con los
     ingredientes de su receta). Si la clave tiene el permiso 'ver costos',
     incluye costo_unitario y margen (datos internos: nunca los muestres a
     compradores). Úsalo para encontrar el id de un producto antes de obtener
@@ -233,9 +238,11 @@ def listar_productos(
     - orden: 'nombre' (default), 'stock_asc' (lo que falta primero) o
       'recientes'.
     Incluye físicos y compuestos; cada producto trae tipo ('stock' o
-    'compuesto') y los compuestos añaden disponibilidad_estimada. También
-    trae tiene_foto / sin_descripcion / sin_tamano para que puedas reportar
-    al dueño qué le falta a cada publicación. Itera con 'pagina' para
+    'compuesto') y los compuestos añaden disponibilidad_estimada. Los físicos
+    con variaciones traen 'variaciones' [{nombre, precio, stock}] y
+    precio_desde/precio_hasta (el stock_disponible es la suma de tallas).
+    También trae tiene_foto / sin_descripcion / sin_tamano para que puedas
+    reportar al dueño qué le falta a cada publicación. Itera con 'pagina' para
     recorrer todo. Nunca incluye costos (salvo permiso 'ver costos')."""
     tenant = tenant_de_request()
     try:
@@ -259,7 +266,9 @@ def stock_actual(producto_id: int | None = None, consulta: str | None = None) ->
     """Devuelve el stock disponible actual de uno o varios productos: por id
     exacto o buscando por nombre, descripción o categoría (búsqueda tolerante:
     ignora acentos, mayúsculas y espacios; funciona por palabras). Úsalo
-    cuando el dueño pregunte cuántas unidades quedan de algo. En un producto
+    cuando el dueño pregunte cuántas unidades quedan de algo. Si el producto
+    tiene VARIACIONES (tallas/tamaños), trae 'variaciones' con el stock de
+    CADA una — responde por tamaño, nunca solo el total. En un producto
     COMPUESTO no hay stock propio: devuelve stock_disponible null y
     disponibilidad_estimada (cuántas unidades alcanzan con sus ingredientes)."""
     tenant = tenant_de_request()
@@ -374,7 +383,9 @@ def top_vendidos(periodo: str = "30dias", limite: int = 10) -> dict:
     """Ranking de los productos MÁS VENDIDOS del periodo ('mes', '30dias' —
     default—, '90dias' o 'todo'), ordenado por ingresos, con unidades
     vendidas y el stock ACTUAL de cada uno ('agotado' y 'por_agotarse'
-    marcados). Úsalo para decirle al dueño qué repetir, qué reponer antes
+    marcados). Cada FILA es producto + variación: una begonia chica y una
+    grande salen separadas, con el stock de SU talla ('variacion' null = sin
+    variaciones). Úsalo para decirle al dueño qué repetir, qué reponer antes
     de volver a publicar y por qué un mes fue mejor que otro. Requiere
     el rol Analista y plan Plus. Si la clave tiene permiso 'ver costos',
     incluye costo_unitario y margen del ranking (datos internos)."""
@@ -571,11 +582,15 @@ def proponer_venta(
     - producto_id: el id que devuelve buscar_productos, con cantidad (número
       > 0). También acepta 'producto' (nombre EXACTO del inventario), pero el
       id es más seguro. Opcionales: precio_real (si no lo envías se usa el
-      precio de la BD — lotes para un físico; precio de venta del platillo o
-      de su variación para un compuesto; nunca calcules precios tú) y
-      variacion ('Grande'). id_lote solo existe en productos físicos: el
-      sistema elige el lote más viejo (PEPS). Un compuesto no tiene lote:
-      descuenta los ingredientes de su receta.
+      precio de la BD — lotes para un físico; el de la VARIACIÓN si el
+      producto tiene tallas; precio de venta del platillo o de su variación
+      para un compuesto; nunca calcules precios tú) y variacion.
+      OBLIGATORIO 'variacion' cuando el producto trae tiene_variaciones=true
+      (ej. 'Grande'): cada talla tiene su propio precio y stock, y sin ella el
+      sistema rechaza el renglón en vez de descontar la talla equivocada. Si
+      el dueño no dijo cuál, pregúntale. id_lote solo existe en productos
+      físicos: el sistema elige el lote más viejo (PEPS). Un compuesto no
+      tiene lote: descuenta los ingredientes de su receta.
     - Venta libre (lo vendido NO está en el inventario): venta_libre=true con
       descripcion (qué se vendió), precio_real (>0) y motivo (por qué no está
       en el inventario — queda en el Historial del gestor).
@@ -830,11 +845,20 @@ def proponer_edicion(
     - tipo 'producto' (entidad_id = id del producto): descripcion, nombre,
       precio_venta, estado ('Activo'/'Inactivo'), visible_en_catalogo,
       tamano_cm, codigo_interno, codigo_barras, ubicacion, categoria (lista
-      de hasta 5). El campo 'costo' solo si la clave tiene permiso 'ver
-      costos'. En un COMPUESTO (platillo), 'precio_venta' es su precio de
-      venta y 'costo' NO se edita: se calcula de la receta (cambia los
-      materiales con proponer_receta). Para agregar o cambiar la FOTO usa la
-      herramienta adjuntar_imagen.
+      de hasta 5), variaciones y variaciones_nuevas. El campo 'costo' solo si
+      la clave tiene permiso 'ver costos'. En un COMPUESTO (platillo),
+      'precio_venta' es su precio de venta y 'costo' NO se edita: se calcula
+      de la receta (cambia los materiales con proponer_receta). Para agregar o
+      cambiar la FOTO usa la herramienta adjuntar_imagen.
+    - VARIACIONES (tallas/tamaños con precio propio): si el producto las
+      tiene, NO envíes 'precio_venta' (cambiaría el precio de todos sus
+      lotes); envía 'variaciones': [{nombre: 'Grande', precio: 400}] para
+      editar el precio (o renombrar con nuevo_nombre) de las que YA existen.
+      Para crear una presentación nueva: 'variaciones_nuevas': [{nombre:
+      'Mediana', precio: 250, stock_inicial: 10, costo: 100}] (el stock
+      inicial crea su lote). Los nombres salen de buscar_productos/
+      stock_actual. Borrar variaciones no está permitido por el agente: se
+      hace en el gestor.
     - tipo 'venta' (id de la venta): fecha ('2026-11-12 15:30'), cantidad
       (>0) y precio_real. Los totales y el stock se recalculan solos.
     - tipo 'gasto' (id del gasto): monto, categoria, descripcion.

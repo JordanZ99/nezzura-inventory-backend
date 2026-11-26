@@ -79,10 +79,24 @@ _SQL_PRODUCTO_POR_NOMBRE = f"""
 # Lote del producto que el agente pidió explícitamente (id_lote): debe existir,
 # pertenecer a ese producto/tenant y estar activo; el costo JAMÁS se selecciona.
 _SQL_LOTE = """
-    SELECT l.id, l.Stock_Lote AS stock
+    SELECT l.id, l.Stock_Lote AS stock, l.variacion_id
     FROM lotes l
     WHERE l.id = %s AND l.producto_id = %s AND l.tenant_id = %s
       AND l.Estado = 'Activo'
+"""
+
+# Variaciones del producto con su precio PROPIO y el stock de SUS lotes. Es la
+# fuente de verdad para vender un físico con tamaños/presentaciones: el precio
+# agregado (MAX de lotes) y el stock total no sirven para cobrar la grande sin
+# cobrar la chica. Si la lista viene vacía, el producto no maneja variaciones.
+_SQL_VARIACIONES = """
+    SELECT v.id, v.nombre, v.precio,
+           COALESCE((SELECT SUM(l.Stock_Lote) FROM lotes l
+                     WHERE l.variacion_id = v.id AND l.Estado = 'Activo'
+                       AND l.tenant_id = v.tenant_id), 0) AS stock
+    FROM producto_variaciones v
+    WHERE v.producto_id = %s AND v.tenant_id = %s
+    ORDER BY v.nombre ASC
 """
 
 # Nombres del inventario activo (físicos + compuestos) para el aviso
@@ -486,14 +500,61 @@ def proponer_venta(tenant_id: str, clave_id: int, items, pago=None, fecha=None, 
             continue
 
         # ── Producto físico: PEPS normal ──
-        # Stock disponible (suma de lotes activos con stock): viaja al desglose
-        # y dispara el aviso de sobreventa. Vender MÁS del stock está permitido
-        # (el motor PEPS deja el lote en negativo, igual que el POS) — el dueño
-        # lo ve al aprobar y decide si el conteo del inventario estaba mal.
-        stock_disponible = float(prod.get("stock") or 0)
+        # VARIACIONES: si el producto tiene tamaños/presentaciones, TODO su
+        # stock vive en lotes por variación y cada una trae su precio propio.
+        # Se resuelve ANTES de precio/stock: sin esto el agente cobraría el
+        # precio agregado y descontaría lotes base (inexistentes), dejando stock
+        # negativo en el producto en vez de descontar la talla vendida.
+        variaciones = query(_SQL_VARIACIONES, (prod["id"], tenant_id))
+        variacion_elegida = None
+        if variaciones:
+            opciones = ", ".join(f"'{v['nombre']}'" for v in variaciones)
+            if not variacion:
+                return {
+                    "error": (
+                        f"El renglón {i}: '{nombre_real}' se vende por "
+                        f"variaciones ({opciones}). Elige una en 'variacion': "
+                        "cada una tiene su propio precio y stock."
+                    )
+                }
+            buscada = variacion.strip().lower()
+            variacion_elegida = next(
+                (v for v in variaciones
+                 if str(v["nombre"]).strip().lower() == buscada),
+                None,
+            )
+            if variacion_elegida is None:
+                return {
+                    "error": (
+                        f"El renglón {i}: la variación '{variacion}' no existe "
+                        f"para '{nombre_real}'. Opciones: {opciones}."
+                    )
+                }
+            # Nombre canónico de la BD: el borrador y la venta guardan SIEMPRE
+            # el nombre real, no la variante que escribió el agente.
+            variacion = variacion_elegida["nombre"]
+        elif variacion:
+            return {
+                "error": (
+                    f"El renglón {i}: '{nombre_real}' no tiene variaciones: "
+                    "quita 'variacion' del renglón."
+                )
+            }
 
-        # Precio: el del item si lo envió; el default de lotes si no. El agente
-        # nunca calcula precios — y si la BD no tiene precio, se pide explícito.
+        # Stock disponible de la variación elegida (o del producto sin
+        # variaciones): viaja al desglose y dispara el aviso de sobreventa.
+        # Vender MÁS del stock está permitido (el motor PEPS deja el lote en
+        # negativo, igual que el POS) — el dueño lo ve al aprobar y decide si
+        # el conteo del inventario estaba mal.
+        if variacion_elegida is not None:
+            stock_disponible = float(variacion_elegida.get("stock") or 0)
+        else:
+            stock_disponible = float(prod.get("stock") or 0)
+
+        # Precio: el del item si lo envió; si no, el de la VARIACIÓN (que es
+        # el precio de lista de esa talla) y, sin variaciones, el default de
+        # lotes. El agente nunca calcula precios — si la BD no tiene precio, se
+        # pide explícito.
         if item.get("precio_real") is not None:
             try:
                 precio_real = round(float(item["precio_real"]), 2)
@@ -503,11 +564,22 @@ def proponer_venta(tenant_id: str, clave_id: int, items, pago=None, fecha=None, 
                 return {"error": f"El renglón {i}: el precio_real no puede ser negativo."}
             precio_default = None
         else:
-            precio_default = round(float(prod.get("precio") or 0), 2)
+            precio_variacion = (
+                round(float(variacion_elegida.get("precio") or 0), 2)
+                if variacion_elegida is not None else 0.0
+            )
+            precio_default = (
+                precio_variacion if precio_variacion > 0
+                else round(float(prod.get("precio") or 0), 2)
+            )
             if precio_default <= 0:
+                etiqueta = (
+                    f"la variación '{variacion}' de '{nombre_real}'"
+                    if variacion else f"'{nombre_real}'"
+                )
                 return {
                     "error": (
-                        f"'{nombre_real}' no tiene precio en sus lotes: envía el "
+                        f"{etiqueta} no tiene precio de venta: envía el "
                         "precio_real que se cobró para este renglón."
                     )
                 }
@@ -534,6 +606,15 @@ def proponer_venta(tenant_id: str, clave_id: int, items, pago=None, fecha=None, 
                         f"El lote {id_lote} no existe para '{nombre_real}' (o no "
                         "está activo). Deja id_lote vacío y el sistema elige el "
                         "lote más viejo automáticamente (PEPS)."
+                    )
+                }
+            if (variacion_elegida is not None
+                    and lote[0].get("variacion_id") != variacion_elegida["id"]):
+                return {
+                    "error": (
+                        f"El lote {id_lote} no es de la variación "
+                        f"'{variacion}' de '{nombre_real}': elige un lote de "
+                        "esa variación o deja id_lote vacío (PEPS)."
                     )
                 }
             stock_lote = float(lote[0].get("stock") or 0)
@@ -565,8 +646,9 @@ def proponer_venta(tenant_id: str, clave_id: int, items, pago=None, fecha=None, 
         desglose.append(renglon)
 
         if cantidad > stock_disponible:
+            etiqueta = f"'{nombre_real}' ({variacion})" if variacion else f"'{nombre_real}'"
             avisos.append(
-                f"⚠ '{nombre_real}': propones vender {cantidad:g} y el gestor "
+                f"⚠ {etiqueta}: propones vender {cantidad:g} y el gestor "
                 f"registra {stock_disponible:g} — el cobro dejará el stock en "
                 "negativo; ajusta el conteo del inventario si no era así."
             )
