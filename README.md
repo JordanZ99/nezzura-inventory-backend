@@ -9,6 +9,7 @@ Backend del sistema de gestion de inventarios y punto de venta Nezzura. Es una A
 - Autenticacion con JWT de Supabase (verificacion via PyJWKClient)
 - Cloudinary para el manejo de imagenes de productos
 - Openpyxl para exportaciones a Excel
+- SDK `mcp` para el conector de agentes de IA (`muse/`)
 
 ## Requisitos
 
@@ -43,17 +44,47 @@ La API queda disponible en `http://127.0.0.1:8000` con la documentacion de endpo
 ## Base de datos y migraciones
 
 - El esquema inicial lo crea `inicializar_db` (database/conexion.py) al arrancar la aplicacion.
-- Cambios incrementales del esquema se registran como archivos numerados en `migrations/` (por ejemplo `032_ordenes_de_venta.sql`). Se agrupan por dominio: inventario, ventas, mesas, clientes, puntos, catalogo, terminales/turnos.
+- Cambios incrementales del esquema se registran como archivos numerados en `migrations/` (por ejemplo `032_ordenes_de_venta.sql`). Se agrupan por dominio: inventario, ventas, mesas, clientes, puntos, catalogo, terminales/turnos, MCP. La ultima migracion es la `082`.
+
+## Contratos de entidades
+
+`contracts/` es la fuente de verdad de campos, tipos y obligatoriedad por entidad
+(productos, ventas, gastos, cobros, catalogo, ordenes, planes, etc.). Antes de inferir
+la estructura de una tabla leyendo SQL, consulta `contracts/README.md` y el
+`.contract.json` del dominio. Si cambias un modelo Pydantic, actualiza el contrato.
+
+## Conector MCP (agentes de IA)
+
+`muse/` expone el negocio a un agente por chat con tools acotadas por rol:
+
+- `muse/server.py` — definicion de las tools y sus docstrings.
+- `muse/roles.py` — roles funcionales y briefs de comportamiento.
+- `muse/auth.py` — autenticacion por API key.
+- `database/mcp_*.py` — logica de las tools.
+- Migraciones `080_promesas.sql`, `081_mcp_roles.sql` y `082_mcp_estilos_foto.sql`.
+
+Principios: borrador -> confirmar, cuota de escrituras por sesion, HITL obligatorio y
+permisos por rol. No se agregan tools ni permisos nuevos sin pedirlo.
+
+## Pruebas
+
+`tests/e2e/test_mcp_end_to_end.py` prueba el conector de punta a punta contra un
+Postgres de Docker (`127.0.0.1:54399`), uvicorn en el puerto `8001` y el harness
+`tests/e2e/mcp_harness.sql`. En Windows requiere `PYTHONIOENCODING=utf-8`.
 
 ## Estructura
 
 ```
 main.py            App FastAPI: CORS, middlewares, registro de routers
 dependencies.py    Autenticacion: validacion de JWT de Supabase por tenant
-database/          Acceso a datos por dominio (productos, lotes, ventas, mesas, gastos, clientes, puntos, stats, etc.)
-routers/           Endpoints por modulo (inventario, ventas, turnos, stats, mesas, clientes, catalogo_gestion, publico, exportacion)
+database/          Acceso a datos por dominio (productos, lotes, ventas, mesas, gastos, clientes, puntos, stats, MCP, etc.)
+routers/           Endpoints por modulo (inventario, ventas, turnos, stats, mesas, clientes, catalogo_gestion, publico, mcp_conexion, etc.)
 schemas/           Modelos Pydantic de entrada/salida
-migrations/        SQL numerado de cambios incrementales
+muse/              Conector MCP: server.py (tools), roles.py (roles y briefs), auth.py
+migrations/        SQL numerado de cambios incrementales (hoy 082)
+contracts/         Contratos de entidades (.contract.json) — fuente de verdad de campos
+docs/historico/    Registros de fases ya cerradas (no son estado actual)
+tests/e2e/         Suite end-to-end del conector MCP
 scripts/           Utilidades operativas (auditoria de imagenes en Cloudinary)
 ```
 

@@ -1,0 +1,44 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$comment": "Contrato del Historial completo (migración 062): registro de actividad que NO es stock — ediciones de producto (foto, precio, nombre...), CRM (clientes, etiquetas, interacciones, puntos) y cobros del giro 'servicios'. Generado desde backend/database/actividad.py y backend/routers/actividad.py. El detalle de STOCK vive en inventario.contract.json (ledger 040).",
+  "reglas_global": {
+    "descripcion": "registro_actividad es un LEDGER append-only de OBSERVACIÓN: no alimenta ningún saldo ni ecuación de negocio (el saldo de puntos vive en puntos_movimientos, el dinero en cobros.pagos). Es el ÚNICO ledger podable cuando se implemente retención (hoy sin límite). La escritura es interna del backend tras cada mutación; el frontend NUNCA escribe.",
+    "append_only": "Trigger en Postgres prohíbe UPDATE/DELETE desde la app. registrar_actividad() nunca lanza: un fallo del log jamás rompe la operación de negocio.",
+    "instrumentacion": "Se registra tras el commit / best-effort: productos (crear/editar con diff de 13 metadatos + costo_lote + precio_venta + nombre/categorias), variaciones (crear/editar con diff nombre/precio/foto/eliminar), clientes (crear/editar con diff sin valor de pin — solo 'fijado'/'quitado'/eliminar/baja), etiquetas (crear/editar/eliminar), asignar_etiquetas (diff de sets: asignadas/desasignadas), interacciones (crear), puntos (ajustar_puntos con delta y concepto), cobros (crear/editar con diff/eliminar, abonar, quitar_abono, generar (un renglón por periodo), cuotas crear/editar con diff/eliminar).",
+    "tenant_id": { "type": "string", "format": "uuid", "nota": "Nunca se envía — sale del JWT de Supabase en el backend." }
+  },
+  "endpoints": {
+    "GET /actividad": "Feed paginado del historial (más nuevo primero). Query: limit (1..200, default 50), offset, dominio ('producto'|'cliente'|'cobro'), texto (ILIKE sobre resumen), desde / hasta ('YYYY-MM-DD', días en la zona horaria del NEGOCIO, inclusivos)."
+  },
+  "entities": {
+    "EventoActividad": {
+      "description": "Un renglón del registro de actividad (tabla registro_actividad). Solo lectura.",
+      "tabla_sql": "registro_actividad",
+      "campos_lectura": {
+        "id": { "type": "string", "format": "uuid" },
+        "fecha": { "type": "string", "format": "date-time", "description": "timestamptz; la UI lo muestra en hora local del negocio." },
+        "dominio": { "type": "string", "enum": ["producto", "cliente", "cobro"], "description": "Sección de la app — badge de color en la UI." },
+        "entidad": { "type": "string", "enum": ["producto", "variacion", "cliente", "etiqueta", "interaccion", "puntos", "cobro", "abono", "cuota"] },
+        "accion": { "type": "string", "enum": ["crear", "editar", "eliminar", "abonar", "quitar_abono", "generar", "ajustar_puntos"] },
+        "entidad_id": { "type": ["string", "null"], "description": "ID de la fila tocada (TEXT: uuid, record_id de variación, etc.)." },
+        "resumen": { "type": "string", "description": "Texto legible ya redactado por el backend (ej. 'Editó la variación Doble de Café')." },
+        "detalle": { "type": ["object", "null"], "description": "JSONB. Para EDICIONES es un diff estilo ledger: {campo: [antes, despues], ...} — SOLO los campos que cambiaron. Para otras acciones es contexto plano ({monto, fecha, metodo...}). El pin del cliente NUNCA guarda valor, solo 'fijado'/'quitado'; las fotos se truncan a ~60 caracteres." }
+      },
+      "no_escribible": "El frontend no puede crear ni editar eventos: el feed es lectura pura."
+    },
+    "RespuestaActividad": {
+      "description": "Respuesta de GET /actividad.",
+      "campos_lectura": {
+        "eventos": { "type": "array", "items": { "$ref": "#/entities/EventoActividad" } },
+        "total": { "type": "integer" },
+        "limit": { "type": "integer" },
+        "offset": { "type": "integer" }
+      }
+    }
+  },
+  "ui": {
+    "ventana_default": "La UI (Estadísticas > Historial) mira los últimos 90 días por defecto (useState fechaHace90Dias); el selector de rango mira más atrás. Sin límite en BDD",
+    "chips": "Actividad (todos los dominios) | Inventario (ledger 040, con producto_id/id_lote/referencia_id expandidos y filtro origen) | Clientes (dominio cliente) | Cobros (dominio cobro)",
+    "feed_y_ledgers": "El feed expone la actividad NO-stock (062). El detalle de stock vive en inventario_movimientos (040): su ecuacion stock = entradas - salidas es reconcilable. El saldo de puntos vive en puntos_movimientos. Ambos ledgers JAMAS se pueden podar; registro_actividad es el unico podable del sistema."
+  }
+}

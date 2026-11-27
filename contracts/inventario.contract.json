@@ -1,0 +1,244 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$comment": "Contrato de la entidad Producto y entidades relacionadas. Generado automáticamente desde backend/schemas/inventario.py. Este archivo es la fuente de verdad para agentes de IA — refleja exactamente los campos que acepta y devuelve la API.",
+  "entities": {
+
+    "Producto": {
+      "description": "Producto del catálogo de inventario. Puede ser de tipo 'stock' (con lotes), 'servicio' (sin stock) o 'compuesto' (consume materiales al vender).",
+      "tabla_sql": "productos",
+      "campos_lectura": {
+        "id": { "type": "string", "format": "uuid", "description": "UUID único del producto" },
+        "tenant_id": { "type": "string", "format": "uuid", "description": "ID del tenant propietario — NUNCA se manda en requests, se infiere del JWT" },
+        "producto": { "type": "string", "description": "Nombre del producto (único por tenant)" },
+        "descripcion": { "type": "string", "default": "" },
+        "costo": { "type": "number", "description": "Costo del lote activo más reciente (calculado)" },
+        "precio_venta": { "type": "number", "description": "Precio de venta base" },
+        "stock": { "type": "number", "description": "Stock total consolidado (suma de todos los lotes activos)" },
+        "imagen": { "type": "string", "description": "URL de la imagen principal (Cloudinary). Valor por defecto: 'No hay foto'" },
+        "categoria": { "type": "array", "items": { "type": "string" }, "description": "Array de categorías asignadas al producto" },
+        "codigo_interno": { "type": ["string", "null"] },
+        "codigo_barras": { "type": ["string", "null"] },
+        "ubicacion": { "type": ["string", "null"] },
+        "sufijo_precio": { "type": ["string", "null"], "description": "Sufijo libre del precio en catálogo (ej: 'c/u', 'por kilo')" },
+        "fraccionable": { "type": ["boolean", "null"], "description": "Si true, se puede vender por fracciones (0.5 kg, 1.5 lt…)" },
+        "tipo_producto": { "type": "string", "enum": ["stock", "servicio", "compuesto"], "default": "stock" },
+        "costo_servicio": { "type": ["number", "null"] },
+        "precio_servicio": { "type": ["number", "null"] },
+        "visible_en_catalogo": { "type": ["boolean", "null"] },
+        "estado": { "type": "string", "enum": ["activo", "inactivo"], "default": "activo" },
+        "post_override": { "type": ["object", "null"], "description": "Override de tarjeta de post automático por producto. null = usa defaults del negocio" },
+        "created_at": { "type": "string", "format": "date-time" }
+      },
+      "campos_escritura_POST": {
+        "producto": { "type": "string", "required": true },
+        "descripcion": { "type": "string", "default": "" },
+        "costo": { "type": "number", "required": true },
+        "precio_venta": { "type": "number", "required": true },
+        "stock": { "type": "number", "required": true, "description": "Stock del lote inicial" },
+        "imagen": { "type": "string", "default": "No hay foto" },
+        "categoria": { "type": "array", "items": { "type": "string" }, "default": ["General"] },
+        "codigo_interno": { "type": ["string", "null"] },
+        "codigo_barras": { "type": ["string", "null"] },
+        "ubicacion": { "type": ["string", "null"] },
+        "etiqueta": { "type": ["string", "null"], "description": "Presentación del lote inicial (ej: '20cm', 'Premium')" },
+        "sufijo_precio": { "type": ["string", "null"] },
+        "fraccionable": { "type": ["boolean", "null"] },
+        "tipo_producto": { "type": "string", "enum": ["stock", "servicio", "compuesto"], "default": "stock" },
+        "costo_servicio": { "type": ["number", "null"] },
+        "precio_servicio": { "type": ["number", "null"] },
+        "visible_en_catalogo": { "type": ["boolean", "null"] },
+        "variaciones": { "type": ["array", "null"], "items": { "$ref": "#/entities/VariacionAlta" } },
+        "recetas": { "type": ["array", "null"], "items": { "$ref": "#/entities/RecetaAlta" }, "description": "Solo para tipo_producto='compuesto'" }
+      },
+      "campos_escritura_PUT": {
+        "descripcion": { "type": "string", "required": true },
+        "imagen": { "type": "string", "required": true },
+        "estado": { "type": "string", "enum": ["activo", "inactivo"], "required": true },
+        "categoria": { "type": "array", "items": { "type": "string" }, "required": true },
+        "costo": { "type": ["number", "null"] },
+        "precio_venta": { "type": ["number", "null"] },
+        "producto": { "type": ["string", "null"], "description": "Renombrar el producto" },
+        "codigo_interno": { "type": ["string", "null"] },
+        "codigo_barras": { "type": ["string", "null"] },
+        "ubicacion": { "type": ["string", "null"] },
+        "visible_en_catalogo": { "type": ["boolean", "null"] },
+        "sufijo_precio": { "type": ["string", "null"] },
+        "fraccionable": { "type": ["boolean", "null"] },
+        "tipo_producto": { "type": ["string", "null"], "enum": ["stock", "servicio", null] },
+        "costo_servicio": { "type": ["number", "null"] },
+        "precio_servicio": { "type": ["number", "null"] }
+      }
+    },
+
+    "VariacionAlta": {
+      "description": "Variación incluida en el alta de un producto nuevo. Solo se usa en POST /inventario/productos.",
+      "campos": {
+        "nombre": { "type": "string", "required": true, "description": "Ej: 'Doble', 'S', 'Premium'" },
+        "precio": { "type": "number", "default": 0 },
+        "stock_inicial": { "type": ["number", "null"], "description": "Si se provee, se crea un lote propio para esta variación" },
+        "costo": { "type": ["number", "null"], "description": "Costo del lote de esta variación. Si null, usa el costo del producto base" }
+      }
+    },
+
+    "Variacion": {
+      "description": "Variación de un producto (talla, sabor, tamaño…). Tabla: variaciones.",
+      "tabla_sql": "variaciones",
+      "campos_lectura": {
+        "id": { "type": "integer" },
+        "tenant_id": { "type": "string", "format": "uuid" },
+        "producto": { "type": "string" },
+        "nombre": { "type": "string" },
+        "precio": { "type": "number" },
+        "foto": { "type": ["string", "null"] },
+        "activo": { "type": "boolean", "default": true }
+      },
+      "campos_escritura_POST": {
+        "producto": { "type": "string", "required": true },
+        "nombre": { "type": "string", "required": true },
+        "precio": { "type": "number", "default": 0 },
+        "foto": { "type": "string", "default": "" },
+        "stock_inicial": { "type": ["number", "null"] },
+        "costo": { "type": ["number", "null"] }
+      },
+      "campos_escritura_PUT": {
+        "nombre": { "type": "string", "required": true },
+        "precio": { "type": "number", "required": true },
+        "foto": { "type": ["string", "null"], "description": "null = conservar foto actual, '' = quitar foto" }
+      }
+    },
+
+    "Lote": {
+      "description": "Lote de inventario de un producto. Algoritmo PEPS (FIFO): al vender se consume el lote más antiguo primero.",
+      "tabla_sql": "lotes",
+      "campos_lectura": {
+        "id": { "type": "string", "format": "uuid" },
+        "tenant_id": { "type": "string", "format": "uuid" },
+        "producto": { "type": "string" },
+        "costo": { "type": "number" },
+        "precio_venta": { "type": "number" },
+        "stock": { "type": "number" },
+        "etiqueta": { "type": ["string", "null"] },
+        "variacion": { "type": ["string", "null"], "description": "Nombre de la variación dueña de este lote. null = lote base" },
+        "created_at": { "type": "string", "format": "date-time" }
+      },
+      "campos_escritura_Restock_POST": {
+        "producto": { "type": "string", "required": true },
+        "costo": { "type": "number", "required": true },
+        "precio_venta": { "type": "number", "required": true },
+        "stock": { "type": "number", "required": true },
+        "etiqueta": { "type": ["string", "null"] },
+        "variacion": { "type": ["string", "null"] }
+      },
+      "campos_escritura_PUT": {
+        "costo": { "type": "number", "required": true },
+        "precio_venta": { "type": "number", "required": true },
+        "stock": { "type": "number", "required": true },
+        "etiqueta": { "type": ["string", "null"] },
+        "variacion": { "type": ["string", "null"], "description": "'' = desvincular variación (vuelve al lote base)" }
+      }
+    },
+
+    "RecetaAlta": {
+      "description": "Material de receta incluido en el alta de un producto compuesto.",
+      "campos": {
+        "material": { "type": "string", "required": true, "description": "Nombre del producto de stock que se consume" },
+        "cantidad": { "type": "number", "default": 1, "description": "Cantidad por unidad vendida del compuesto" }
+      }
+    },
+
+    "MaterialReceta": {
+      "description": "Ingrediente/material de la receta de un producto compuesto. Tabla: recetas.",
+      "tabla_sql": "recetas",
+      "campos_lectura": {
+        "id": { "type": "integer" },
+        "producto": { "type": "string", "description": "Nombre del compuesto (el que se vende)" },
+        "material": { "type": "string", "description": "Nombre del insumo (producto de stock)" },
+        "cantidad": { "type": "number" },
+        "variacion_id": { "type": ["integer", "null"] }
+      },
+      "campos_escritura_POST": {
+        "producto": { "type": "string", "required": true },
+        "material": { "type": "string", "required": true },
+        "cantidad": { "type": "number", "default": 1 },
+        "variacion_id": { "type": ["integer", "null"] }
+      },
+      "campos_escritura_PUT": {
+        "cantidad": { "type": "number", "required": true }
+      }
+    },
+
+    "Categoria": {
+      "description": "Categoría de producto del tenant. Tabla: categorias.",
+      "tabla_sql": "categorias",
+      "campos_lectura": {
+        "nombre": { "type": "string" },
+        "tenant_id": { "type": "string", "format": "uuid" },
+        "visible": { "type": "boolean", "default": true }
+      },
+      "campos_escritura_POST": {
+        "nombre": { "type": "string", "required": true, "minLength": 1 }
+      },
+      "campos_escritura_PUT": {
+        "nuevo_nombre": { "type": "string", "required": true, "minLength": 1 }
+      }
+    },
+
+    "Conteo": {
+      "description": "Sesión de conteo de auditoría (conteo físico vs sistema, migraciones 041 y 056). Ciclo: abrir → capturar → cerrar resolviendo cada diferencia como merma, venta declarada (crea orden retroactiva), ingreso hallado o error del sistema. Endpoints: POST /inventario/conteos (abrir), GET /inventario/conteos/activo, GET /inventario/conteos (historial), GET /inventario/conteos/{id}, PATCH /inventario/conteos/{id}/items (autosave), POST /inventario/conteos/{id}/items-manual (renglón de producto no registrado), POST /inventario/conteos/{id}/cerrar. Solo un conteo abierto por tenant.",
+      "tabla_sql": "conteos",
+      "campos_lectura": {
+        "id": { "type": "string", "format": "uuid" },
+        "tenant_id": { "type": "string", "format": "uuid", "description": "Se infiere del JWT — NUNCA se manda en requests" },
+        "estado": { "type": "string", "enum": ["abierto", "cerrado"] },
+        "abierto_at": { "type": "string", "format": "date-time" },
+        "cerrado_at": { "type": ["string", "null"], "format": "date-time" },
+        "resumen": { "type": ["object", "null"], "description": "Solo en cerrados: {cuadrados, sin_contar, omitidos, mermas, merma_costo, ventas, venta_total, entradas, ajustes, orden_id?, n_ticket?, gasto_merma_id?}. Si hubo mermas con costo, se crea automáticamente un gasto 'Merma' del día del cierre (gasto_merma_id apunta a él)." },
+        "alcance": { "type": ["object", "null"], "description": "Solo en conteos PARCIALES (057): {producto_ids: [ids resueltos], categorias?: [nombres pedidos]}. null = conteo completo. El snapshot real (renglones) es la fuente de verdad de qué se incluyó." }
+      }
+    },
+
+    "ConteoItem": {
+      "description": "Renglón de un conteo: un (producto, variación) con su stock esperado (snapshot al abrir), lo contado y —tras el cierre— el stock vivo, la diferencia y la resolución aplicada. Los renglones de origen 'manual' son productos nunca registrados (056): producto_id null, esperado 0 y 'inicial' opcional.",
+      "tabla_sql": "conteo_items",
+      "campos_lectura": {
+        "id": { "type": "string", "format": "uuid" },
+        "producto_id": { "type": ["integer", "null"], "description": "null en renglones manuales (producto aún sin alta)" },
+        "producto": { "type": "string" },
+        "variacion": { "type": "string", "description": "'' = stock base del producto" },
+        "esperado": { "type": "number", "description": "Stock del sistema congelado al abrir el conteo (0 en manuales)" },
+        "contado": { "type": ["number", "null"], "description": "Total contado físico (absoluto). null = aún sin contar" },
+        "vivo": { "type": ["number", "null"], "description": "Stock vivo al momento del cierre (se llena al cerrar)" },
+        "delta": { "type": ["number", "null"], "description": "contado − vivo al cierre; negativo = faltante, positivo = sobrante" },
+        "resolucion": { "type": ["string", "null"], "enum": ["merma", "venta", "error_sistema", "entrada_no_registrada", "cuadrado", "sin_contar", null] },
+        "origen": { "type": "string", "enum": ["snapshot", "manual"], "description": "'snapshot' = generado por abrir_conteo; 'manual' = producto no registrado agregado a mano (056)" },
+        "inicial": { "type": ["number", "null"], "description": "Solo manuales: cuánto había al inicio — al cerrar, contado < inicial se declara como venta con precio REAL" }
+      },
+      "campos_escritura_PATCH_items": {
+        "producto": { "type": "string", "required": true },
+        "variacion": { "type": "string", "default": "" },
+        "contado": { "type": ["number", "null"], "description": "Total contado absoluto (≥0). null = borrar la captura" }
+      }
+    },
+
+    "ConteoResolucion": {
+      "description": "Decisión de cierre para un renglón con diferencia (va dentro de POST /inventario/conteos/{id}/cerrar, campo items).",
+      "campos": {
+        "producto": { "type": "string", "required": true },
+        "variacion": { "type": "string", "default": "" },
+        "resolucion": { "type": ["string", "null"], "enum": ["merma", "venta", "error_sistema", "entrada_no_registrada", null], "description": "null = default del signo: merma (faltante) / error_sistema (sobrante)" },
+        "costo": { "type": ["number", "null"], "description": "Solo entrada_no_registrada; default = costo del último lote activo" },
+        "precio_venta": { "type": ["number", "null"], "description": "Solo entrada_no_registrada; default = precio del último lote activo" },
+        "precio_real": { "type": ["number", "null"], "description": "Solo venta: precio REAL al que se vendió (subasta, descuento); default = precio de lista del lote PEPS" }
+      }
+    },
+
+    "RenglonManualConteo": {
+      "description": "Alta de renglón MANUAL dentro del conteo abierto (POST /inventario/conteos/{id}/items-manual, migración 056): un producto que nunca se registró. Idempotente por nombre dentro del conteo. El nombre no debe existir ya en el inventario (422). El producto + lote 'Conteo' se crean al CERRAR, atómicamente.",
+      "campos": {
+        "producto": { "type": "string", "required": true, "max_length": 200 },
+        "inicial": { "type": ["number", "null"], "description": "Cuánto había al inicio (≥0). Si al cerrar contado < inicial, se declara la venta con precio REAL (requerido entonces)" },
+        "contado": { "type": ["number", "null"], "description": "Lo que queda físicamente (también capturable por autosave)" }
+      }
+    }
+  }
+}

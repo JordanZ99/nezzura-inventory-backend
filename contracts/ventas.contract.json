@@ -1,0 +1,103 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$comment": "Contrato de ventas, órdenes, tickets y cobros. Generado desde backend/schemas/ventas.py y backend/database/ventas.py.",
+  "entities": {
+
+    "Venta": {
+      "description": "Renglón de venta individual (un ítem de un ticket). Tabla: ventas.",
+      "tabla_sql": "ventas",
+      "nota_importante": "Una 'orden' (ticket) agrupa múltiples 'ventas' (ítems). El campo orden_id las une.",
+      "campos_lectura": {
+        "id": { "type": "integer" },
+        "tenant_id": { "type": "string", "format": "uuid" },
+        "fecha": { "type": "string", "format": "date-time" },
+        "producto": { "type": "string" },
+        "cantidad": { "type": "number", "description": "Soporta decimales: 0.5 kg, 150 g, etc." },
+        "precio_real": { "type": "number" },
+        "costo_unitario": { "type": "number" },
+        "total_venta": { "type": "number" },
+        "ganancia_bruta": { "type": "number" },
+        "orden_id": { "type": ["string", "null"], "format": "uuid", "description": "UUID del ticket al que pertenece esta venta" },
+        "variacion": { "type": ["string", "null"], "description": "Nombre de la variación vendida, si aplica" }
+      },
+      "campos_escritura_PUT": {
+        "fecha": { "type": ["string", "null"], "format": "date", "description": "YYYY-MM-DD. null = no modificar" },
+        "cantidad": { "type": ["number", "null"] },
+        "precio_real": { "type": ["number", "null"] },
+        "costo_unitario": { "type": ["number", "null"] },
+        "total_venta": { "type": ["number", "null"] },
+        "ganancia_bruta": { "type": ["number", "null"] }
+      }
+    },
+
+    "Orden": {
+      "description": "Ticket/orden de venta — agrupa múltiples ítems cobrados juntos. Tabla: ordenes.",
+      "tabla_sql": "ordenes",
+      "campos_lectura": {
+        "id": { "type": "string", "format": "uuid" },
+        "tenant_id": { "type": "string", "format": "uuid" },
+        "fecha": { "type": "string", "format": "date-time" },
+        "total": { "type": "number" },
+        "propina": { "type": "number", "default": 0 },
+        "metodo_pago": { "type": "string", "enum": ["efectivo", "tarjeta_debito", "tarjeta_credito", "mixto"] },
+        "monto_recibido": { "type": ["number", "null"], "description": "Solo para pago en efectivo" },
+        "cambio": { "type": ["number", "null"] },
+        "anulada": { "type": "boolean", "default": false },
+        "terminal_id": { "type": ["string", "null"], "format": "uuid" }
+      },
+      "campos_escritura_fecha_PUT": {
+        "fecha": { "type": "string", "format": "date", "required": true, "description": "YYYY-MM-DD — nuevo día contable del ticket (conserva la hora original)" }
+      }
+    },
+
+    "Carrito": {
+      "description": "Payload para cobrar un carrito completo. POST /ventas/cobrar.",
+      "campos": {
+        "items": {
+          "type": "array",
+          "required": true,
+          "items": { "$ref": "#/entities/ItemCarrito" }
+        },
+        "pago": {
+          "type": ["object", "null"],
+          "description": "null = cobro sin registrar método (modo legado)",
+          "$ref": "#/entities/PagoCarrito"
+        }
+      }
+    },
+
+    "ItemCarrito": {
+      "description": "Un ítem dentro del carrito de cobro.",
+      "campos": {
+        "producto": { "type": "string", "required": true, "description": "Nombre exacto del producto" },
+        "cantidad": { "type": "number", "required": true, "description": "Soporta fracciones: 0.5, 1.25, etc." },
+        "precio_real": { "type": "number", "required": true, "description": "Precio efectivamente cobrado (puede diferir del precio_venta del catálogo)" },
+        "id_lote": { "type": ["string", "null"], "description": "UUID del lote específico a descontar. null = PEPS automático" },
+        "variacion": { "type": ["string", "null"], "description": "Nombre de la variación vendida" }
+      }
+    },
+
+    "PagoCarrito": {
+      "description": "Método de pago del carrito.",
+      "campos": {
+        "metodo": { "type": "string", "required": true, "enum": ["efectivo", "tarjeta_debito", "tarjeta_credito", "mixto"] },
+        "propina": { "type": "number", "default": 0 },
+        "pagos": {
+          "type": ["array", "null"],
+          "description": "Obligatorio solo cuando metodo='mixto'. Lista de pagos parciales.",
+          "items": { "$ref": "#/entities/PagoItem" }
+        },
+        "monto_recibido": { "type": ["number", "null"], "description": "Solo para metodo='efectivo'. Permite calcular el cambio." }
+      }
+    },
+
+    "PagoItem": {
+      "description": "Pago parcial en una transacción mixta.",
+      "campos": {
+        "metodo": { "type": "string", "required": true, "enum": ["efectivo", "tarjeta_debito", "tarjeta_credito"] },
+        "monto": { "type": "number", "required": true },
+        "referencia": { "type": ["string", "null"], "description": "Últimos 4 dígitos o folio de voucher (opcional)" }
+      }
+    }
+  }
+}

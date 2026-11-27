@@ -1,0 +1,213 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$comment": "Contrato de cobros del giro 'servicios' (migración 061): cuotas mensuales por cliente, cobros (mensualidad de un mes o trabajo extra) y abonos. Generado desde backend/schemas/cobros.py y backend/database/cobros.py.",
+  "reglas_global": {
+    "descripcion": "El saldo, el estado y el flag vencido NUNCA se almacenan ni se escriben: se derivan en el backend de monto - SUM(pagos) y de las fechas/vencimiento. El dinero entra SOLO por POST /cobros/{id}/pagos (append al JSONB pagos) y se corrige con DELETE /cobros/{id}/pagos/{indice}.",
+    "tenant_id": { "type": "string", "format": "uuid", "nota": "Nunca se envía — sale del JWT de Supabase en el backend." }
+  },
+  "endpoints": {
+    "GET /cobros/": "Lista de cobros. Query: periodo ('YYYY-MM', filtro por mes de cuota), cliente_id, solo_pendientes (bool).",
+    "GET /cobros/resumen": "KPIs del dashboard: pendiente_total, num_pendientes, cobrado_periodo, aging (buckets de antigüedad del vencido), deudores[] ordenados por saldo y proximos[] (6 pagos por vencer más cercanos). Query: periodo opcional (default: mes en curso).",
+    "POST /cobros/generar": "Genera los cobros del periodo desde las cuotas activas. IDEMPOTENTE (índice parcial único tenant+cuota+vencimiento, mig 063). Respeta la frecuencia: mensual 1 cobro, semanal uno por cada día elegido del mes, quincenal 2 (día 1 y 15). Mig 079: NO genera vencimientos ANTERIORES a la fecha de creación de la cuota (no cobra retroactivo una venta creada a mitad de mes) — los salta y los reporta en 'saltados'. Body: {periodo}.",
+    "POST /cobros/": "Alta de cobro extra (trabajo puntual) con plan de pagos opcional.",
+    "GET /cobros/{id}": "Detalle con abonos y derivados.",
+    "PATCH /cobros/{id}": "Edita concepto/monto/vencimiento/promesa_fecha/programa/notas. Jamás edita pagos. promesa_fecha (mig 080): '' = quitar la promesa, 'YYYY-MM-DD' = fijar.",
+    "DELETE /cobros/{id}": "Elimina la deuda completa (para capturas hechas por error).",
+    "POST /cobros/{id}/moratorios": "Mig 079: materializa el interés moratorio derivado del cobro en un cobro extra 'Intereses moratorios — {concepto}' (vence hoy). El monto queda en cobros.interes_cargado del cobro original para NO derivarlo dos veces. Requiere tenants.moratorios {'activo': true, 'tasa_mensual': %, 'dias_gracia': días} (config del perfil, PATCH /inventario/me).",
+    "POST /cobros/{id}/pagos": "Abono (parcial o total). Body: {monto, metodo?, fecha?, cascada?}. Fecha default: hoy. Con cascada=true y cobro de cuenta (cuota_id, mig 081): el excedente sobre el saldo se reparte a los SIGUIENTES cobros pendientes de la misma cuota (orden por vencimiento); cada cobro recibe SU PORCIÓN como entrada propia; el sobrante final (pagó más que toda la deuda) va al último cobro como sobrepago. Respuesta: reparto[] + cuenta_saldo (saldo consolidado de la cuenta).",
+    "PATCH /cobros/{id}/pagos/{indice}": "Mig 081: corrige un abono EN SU POSICIÓN del ledger (monto/metodo/fecha); None = conservar el valor actual.",
+    "DELETE /cobros/{id}/pagos/{indice}": "Quita un abono por posición (corrección de captura).",
+    "GET /cobros/cuotas": "Cuotas recurrentes y VENTAS A PLAZOS con nombre del cliente (mig 063: frecuencias mensual/semanal/quincenal; mig 064: meta de cuenta finita + derivados programado_meta/abonado_meta; mig 076: tipo 'cuota'|'venta' + costo + ganancia derivada). Query: solo_activas.",
+    "POST /cobros/cuotas": "Alta de cuota recurrente o VENTA A PLAZOS. tipo='cuota': frecuencia mensual (dia_cobro 1..28) / semanal (dia_semana 0=Lunes..6=Domingo) / quincenal (fijo: día 1 y 15); monto_meta (opcional) la vuelve CUENTA FINITA. tipo='venta': concepto = el artículo, monto_meta = PRECIO TOTAL (obligatorio), costo opcional → ganancia = monto_meta - costo.",
+    "PATCH /cobros/cuotas/{id}": "Edita cliente/concepto/monto/frecuencia/dia_cobro/dia_semana/monto_meta/activo/notas (y tipo/costo, mig 076: una venta exige meta >0; costo 0 = quitarlo). Al salir de 'semanal' el backend limpia dia_semana; monto_meta: 0 la quita (vuelve infinita).",
+    "DELETE /cobros/cuotas/{id}": "Elimina la cuota; los cobros ya generados quedan (cuota_id pasa a NULL)."
+  },
+  "entities": {
+
+    "Cobro": {
+      "description": "Cada deuda concreta: la cuota de un periodo (origen 'cuota') o un trabajo puntual (origen 'extra'). Tabla: cobros.",
+      "tabla_sql": "cobros",
+      "campos_lectura": {
+        "id": { "type": "string", "format": "uuid" },
+        "tenant_id": { "type": "string", "format": "uuid" },
+        "cliente_id": { "type": "string", "format": "uuid" },
+        "cliente_nombre": { "type": "string", "description": "JOIN con clientes — se resuelve en el backend." },
+        "cuota_id": { "type": ["string", "null"], "format": "uuid", "description": "NULL para extras; la cuota que lo generó si origen='cuota'." },
+        "origen": { "type": "string", "enum": ["cuota", "extra"] },
+        "concepto": { "type": "string" },
+        "periodo": { "type": ["string", "null"], "pattern": "^\\d{4}-\\d{2}$", "description": "Solo cuotas. Los extras no tienen periodo." },
+        "monto": { "type": "number" },
+        "vencimiento": { "type": ["string", "null"], "format": "date" },
+        "programa": { "type": "array", "items": { "$ref": "#/entities/EntradaPrograma" }, "description": "Plan de pagos comprometido (el ACUERDO, no el dinero)." },
+        "notas": { "type": ["string", "null"] },
+        "pagos": { "type": "array", "items": { "$ref": "#/entities/PagoCobro" }, "description": "Abonos reales: fuente de verdad del saldo." },
+        "creado_en": { "type": "string", "format": "date-time" },
+        "pagado": { "type": "number", "description": "SUM(pagos) — derivado." },
+        "saldo": { "type": "number", "description": "monto - pagado, piso 0 — derivado." },
+        "estado": { "type": "string", "enum": ["pendiente", "parcial", "pagado"], "description": "Derivado del cruce monto↔pagos; nunca se persiste." },
+        "vencido": { "type": "boolean", "description": "Derivado: saldo>0 y vencimiento (o creado_en) < hoy." },
+        "dias_vencido": { "type": "integer" },
+        "interes_cargado": { "type": "number", "description": "HECHO (mig 079): moratorios ya facturados para este cobro vía POST /{id}/moratorios." },
+        "moratorios": { "type": "number", "description": "DERIVADO (mig 079): interés simple diario sobre el saldo vencido, más allá de los días de gracia, menos lo ya cargado. 0 si la política está desactivada." },
+        "total_con_moratorios": { "type": "number", "description": "DERIVADO: saldo + moratorios." },
+        "promesa_fecha": { "type": "string | null", "description": "HECHO (mig 080): 'me dijo que paga ese día' — los recordatorios automáticos se pausan mientras esté vigente (hoy <= fecha). '' en PATCH la quita." }
+      },
+      "campos_escritura_POST": {
+        "cliente_id": { "type": "string", "format": "uuid", "required": true },
+        "concepto": { "type": "string", "required": true, "minLength": 1 },
+        "monto": { "type": "number", "required": true, "minimum": "exclusivo 0" },
+        "vencimiento": { "type": ["string", "null"], "format": "date" },
+        "programa": { "type": ["array", "null"], "items": { "$ref": "#/entities/EntradaPrograma" } },
+        "notas": { "type": ["string", "null"] }
+      },
+      "campos_escritura_PATCH": {
+        "concepto": { "type": "string" },
+        "monto": { "type": "number", "minimum": "exclusivo 0" },
+        "vencimiento": { "type": ["string", "null"], "format": "date", "description": "'' explícito = quitar la fecha (misma semántica de cumpleaños/carpetas CRM)." },
+        "programa": { "type": ["array", "null"], "items": { "$ref": "#/entities/EntradaPrograma" } },
+        "notas": { "type": ["string", "null"] }
+      },
+      "no_editable": ["pagos", "saldo", "estado", "origen", "periodo"]
+    },
+
+    "PagoCobro": {
+      "description": "Abono registrado dentro de cobros.pagos (JSONB). Append-only; la corrección es DELETE por índice.",
+      "campos_lectura": {
+        "fecha": { "type": "string", "format": "date" },
+        "monto": { "type": "number" },
+        "metodo": { "type": ["string", "null"], "enum": ["efectivo", "transferencia", "tarjeta", "otro"] }
+      },
+      "campos_escritura_POST": {
+        "monto": { "type": "number", "required": true, "minimum": "exclusivo 0" },
+        "metodo": { "type": ["string", "null"] },
+        "fecha": { "type": ["string", "null"], "format": "date", "description": "default: hoy" }
+      }
+    },
+
+    "EntradaPrograma": {
+      "description": "Cuota del plan de pagos comprometido (ej. Anticipo 50% / Entrega final). Es el acuerdo con el cliente; el dinero real vive en pagos.",
+      "campos_lectura": {
+        "etiqueta": { "type": "string" },
+        "monto": { "type": "number" },
+        "fecha": { "type": "string", "format": "date" }
+      },
+      "campos_escritura_POST": {
+        "etiqueta": { "type": "string", "required": true, "minLength": 1 },
+        "monto": { "type": "number", "required": true, "minimum": "exclusivo 0" },
+        "fecha": { "type": "string", "required": true, "pattern": "^\\d{4}-\\d{2}-\\d{2}$" }
+      }
+    },
+
+    "CuotaCliente": {
+      "description": "Suscripción recurrente de un cliente ('Contabilidad mensual $2000', 'Mantenimiento cada Lunes $500', 'Refacción quincenal $300'). No guarda dinero: el generador crea uno o varios cobros por periodo (mig 063). Tabla: cuotas_clientes.",
+      "tabla_sql": "cuotas_clientes",
+      "campos_lectura": {
+        "id": { "type": "string", "format": "uuid" },
+        "tenant_id": { "type": "string", "format": "uuid" },
+        "cliente_id": { "type": "string", "format": "uuid" },
+        "cliente_nombre": { "type": "string", "description": "JOIN con clientes." },
+        "concepto": { "type": "string", "description": "En cuota: qué se cobra. En venta (076): el ARTÍCULO vendido." },
+        "monto": { "type": "number", "description": "Monto POR COBRO (no por mes): semanal se multiplica por las semanas del mes, quincenal por 2." },
+        "frecuencia": { "type": "string", "enum": ["mensual", "semanal", "quincenal"], "description": "mig 063. mensual: un cobro al mes. semanal: un cobro por cada día de la semana elegido. quincenal: día 1 y 15." },
+        "dia_cobro": { "type": "integer", "minimum": 1, "maximum": 28, "description": "Solo mensual: día del mes del vencimiento (1..28 para evitar fechas inexistentes). Placeholder 1 en las demás." },
+        "dia_semana": { "type": ["integer", "null"], "minimum": 0, "maximum": 6, "description": "Solo semanal: 0=Lunes..6=Domingo (orden de date.weekday())." },
+        "monto_meta": { "type": ["number", "null"], "description": "Cuenta finita (064): total a cubrir; NULL = cuota infinita. En VENTA (076) es el PRECIO TOTAL y es obligatorio. El generador deja de emitir al cubrirse y el ÚLTIMO cobro sale al residuo." },
+        "tipo": { "type": "string", "enum": ["cuota", "venta"], "description": "mig 076: 'cuota' = suscripción recurrente; 'venta' = venta a plazos de un artículo." },
+        "costo": { "type": ["number", "null"], "description": "mig 076, solo venta: lo que te costó el artículo (opcional)." },
+        "ganancia": { "type": ["number", "null"], "description": "DERIVADO (076): monto_meta - costo (solo venta con costo y meta)." },
+        "programado_meta": { "type": "number", "description": "DERIVADO: SUM de los montos de cobros ya generados a la cuenta (puede superar ligeramente la meta si se movió a mano)." },
+        "abonado_meta": { "type": "number", "description": "DERIVADO: SUM de abonos reales recibidos en los cobros de la cuota (JSONB pagos)." },
+        "activo": { "type": "boolean" },
+        "notas": { "type": ["string", "null"] },
+        "creado_en": { "type": "string", "format": "date-time" }
+      },
+      "campos_escritura_POST": {
+        "cliente_id": { "type": "string", "format": "uuid", "required": true },
+        "concepto": { "type": "string", "required": true },
+        "monto": { "type": "number", "required": true, "minimum": "exclusivo 0" },
+        "frecuencia": { "type": "string", "enum": ["mensual", "semanal", "quincenal"], "default": "mensual" },
+        "dia_cobro": { "type": "integer", "default": 1, "minimum": 1, "maximum": 28, "description": "Solo mensual" },
+        "dia_semana": { "type": ["integer", "null"], "minimum": 0, "maximum": 6, "description": "Requerido si frecuencia='semanal'" },
+        "monto_meta": { "type": ["number", "null"], "minimum": "exclusivo 0", "description": "Opcional en cuota: la convierte en cuenta finita. OBLIGATORIO en venta (precio total)." },
+        "tipo": { "type": "string", "enum": ["cuota", "venta"], "default": "cuota", "description": "mig 076: 'cuota' = suscripción; 'venta' = venta a plazos." },
+        "costo": { "type": ["number", "null"], "minimum": 0, "description": "mig 076, solo venta: lo que te costó (ganancia = meta - costo)." },
+        "notas": { "type": ["string", "null"] }
+      },
+      "campos_escritura_PATCH": {
+        "cliente_id": { "type": "string", "format": "uuid" },
+        "concepto": { "type": "string" },
+        "monto": { "type": "number" },
+        "frecuencia": { "type": "string", "enum": ["mensual", "semanal", "quincenal"], "description": "Al salir de 'semanal' el backend limpia dia_semana" },
+        "dia_cobro": { "type": "integer", "minimum": 1, "maximum": 28 },
+        "dia_semana": { "type": ["integer", "null"], "minimum": 0, "maximum": 6 },
+        "monto_meta": { "type": ["number", "null"], "minimum": 0, "description": "None = sin cambio; 0 = quitar la meta; >0 = fijar/ajustar (una venta exige meta >0)" },
+        "tipo": { "type": "string", "enum": ["cuota", "venta"], "description": "mig 076: cambiar cuota↔venta (una venta exige meta)" },
+        "costo": { "type": ["number", "null"], "minimum": 0, "description": "None = sin cambio; 0 = quitar; >0 = fijar" },
+        "activo": { "type": "boolean" },
+        "notas": { "type": ["string", "null"] }
+      }
+    },
+
+    "ResumenCobros": {
+      "description": "Respuesta de GET /cobros/resumen — KPIs del dashboard financiero.",
+      "campos_lectura": {
+        "periodo": { "type": "string", "pattern": "^\\d{4}-\\d{2}$" },
+        "pendiente_total": { "type": "number" },
+        "num_pendientes": { "type": "integer" },
+        "cobrado_periodo": { "type": "number", "description": "SUM de los abonos cuya fecha cae en el periodo (ingreso real, cualquier cobro)." },
+        "aging": {
+          "type": "object",
+          "description": "Buckets del saldo VENCIDO por antigüedad (AR aging). 'actual' = aún no vence.",
+          "properties": {
+            "actual": { "type": "number" },
+            "d30": { "type": "number", "description": "vencido ≤ 30 días" },
+            "d60": { "type": "number", "description": "vencido 31–60" },
+            "d90": { "type": "number", "description": "vencido 61–90" },
+            "mas90": { "type": "number", "description": "vencido +90 (riesgo incobrable)" }
+          }
+        },
+        "deudores": { "type": "array", "items": { "$ref": "#/entities/DeudorCobros" } },
+        "proximos": {
+          "type": "array",
+          "description": "Próximos 6 pagos por VENCER (no vencidos — los vencidos viven en aging/deudores), vencimiento ascendente. Alimenta la card del dashboard.",
+          "items": { "$ref": "#/entities/ProximoCobro" }
+        }
+      }
+    },
+
+    "ProximoCobro": {
+      "description": "Un pago por vencer para la card 'Próximos pagos' del dashboard.",
+      "campos_lectura": {
+        "cliente_id": { "type": "string", "format": "uuid" },
+        "cliente_nombre": { "type": "string" },
+        "concepto": { "type": "string" },
+        "saldo": { "type": "number" },
+        "vencimiento": { "type": ["string", "null"], "format": "date", "description": "NULL usa creado_en; siempre presente para cobros de cuota." },
+        "vencido": { "type": "boolean", "const": false },
+        "dias_vencido": { "type": "integer", "const": 0 }
+      }
+    },
+
+    "DeudorCobros": {
+      "description": "Agregado por cliente del saldo pendiente.",
+      "campos_lectura": {
+        "cliente_id": { "type": "string", "format": "uuid" },
+        "nombre": { "type": "string" },
+        "saldo": { "type": "number" },
+        "cobros_pendientes": { "type": "integer" }
+      }
+    },
+
+    "RespuestaGenerar": {
+      "description": "Respuesta de POST /cobros/generar (idempotente).",
+      "campos_lectura": {
+        "ok": { "type": "boolean" },
+        "creados": { "type": "integer" },
+        "omitidos": { "type": "integer", "description": "Cobros que ya existían (no duplicados)." },
+        "saltados": { "type": "integer", "description": "mig 079: vencimientos del periodo ANTERIORES a la fecha de creación de la cuota — nunca se generan (no cobra retroactivo)." },
+        "periodo": { "type": "string" },
+        "mensaje": { "type": "string" }
+      }
+    }
+  }
+}

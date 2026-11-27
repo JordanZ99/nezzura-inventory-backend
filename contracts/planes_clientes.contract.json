@@ -1,0 +1,48 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$comment": "Contrato de 'Mis cuentas' (migración 075): registro MANUAL de qué plan del gestor tiene cada cliente y su estado de cobro. Cuaderno personal — nunca genera cobros ni persiste dinero. Generado desde backend/schemas/planes_clientes.py y backend/database/planes_clientes.py.",
+  "reglas_global": {
+    "descripcion": "Registro informativo del dueño. NO es un panel administrativo del gestor ni una fuente de verdad de licencias: solo control personal. Si el estado es 'cobrando', el dinero real vive en cuotas_clientes/cobros (se crean aparte).",
+    "tenant_id": { "type": "string", "format": "uuid", "nota": "Nunca se envía — sale del JWT de Supabase en el backend." }
+  },
+  "endpoints": {
+    "GET /planes/": "Cuaderno completo con nombre del cliente, ordenado por cliente. Query: estado ('cobrando'|'gratis'|'pausado').",
+    "POST /planes/": "Alta de la anotación 'cliente tiene plan X'.",
+    "PATCH /planes/{id}": "Edita cliente/plan/estado/monto/fecha/notas. monto_acordado: 0 = quitar el monto.",
+    "DELETE /planes/{id}": "Borra la anotación (no toca cuotas ni cobros)."
+  },
+  "entities": {
+    "PlanCliente": {
+      "description": "Una anotación del cuaderno: el plan que le di a un cliente. Tabla: clientes_planes.",
+      "tabla_sql": "clientes_planes",
+      "campos_lectura": {
+        "id": { "type": "string", "format": "uuid" },
+        "tenant_id": { "type": "string", "format": "uuid" },
+        "cliente_id": { "type": "string", "format": "uuid" },
+        "cliente_nombre": { "type": "string", "description": "JOIN con clientes — se resuelve en el backend." },
+        "plan": { "type": "string", "description": "Texto libre: 'local', 'plus', 'básico'..." },
+        "estado_cobro": { "type": "string", "enum": ["cobrando", "gratis", "pausado"], "description": "Estado del COBRO: cobrando / de momento no le cobro nada (gratis) / pausado." },
+        "monto_acordado": { "type": ["number", "null"], "description": "Informativo: lo que se acordó cobrar (NULL = sin monto)." },
+        "otorgado": { "type": ["string", "null"], "format": "date", "description": "Cuándo se otorgó el plan." },
+        "notas": { "type": ["string", "null"] },
+        "creado_en": { "type": "string", "format": "date-time" }
+      },
+      "campos_escritura_POST": {
+        "cliente_id": { "type": "string", "format": "uuid", "required": true },
+        "plan": { "type": "string", "required": true, "minLength": 1 },
+        "estado_cobro": { "type": "string", "enum": ["cobrando", "gratis", "pausado"], "default": "cobrando" },
+        "monto_acordado": { "type": ["number", "null"], "minimum": 0 },
+        "otorgado": { "type": ["string", "null"], "format": "date", "description": "default: hoy" },
+        "notas": { "type": ["string", "null"] }
+      },
+      "campos_escritura_PATCH": {
+        "cliente_id": { "type": "string", "format": "uuid" },
+        "plan": { "type": "string", "minLength": 1 },
+        "estado_cobro": { "type": "string", "enum": ["cobrando", "gratis", "pausado"] },
+        "monto_acordado": { "type": ["number", "null"], "minimum": 0, "description": "None = sin cambio; 0 = quitar el monto; >0 = fijar" },
+        "otorgado": { "type": ["string", "null"], "format": "date" },
+        "notas": { "type": ["string", "null"] }
+      }
+    }
+  }
+}

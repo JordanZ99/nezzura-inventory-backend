@@ -1,0 +1,94 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$comment": "Contrato de gastos directos y gastos programados (recurrentes). Generado desde backend/schemas/gastos.py y backend/schemas/gastos_programados.py.",
+  "entities": {
+
+    "Gasto": {
+      "description": "Gasto operativo del negocio (egreso único). Tabla: gastos.",
+      "tabla_sql": "gastos",
+      "campos_lectura": {
+        "id": { "type": "integer" },
+        "tenant_id": { "type": "string", "format": "uuid" },
+        "fecha": { "type": "string", "format": "date" },
+        "categoria": { "type": "string" },
+        "descripcion": { "type": "string" },
+        "monto": { "type": "number" },
+        "estado": {
+          "type": "string",
+          "enum": ["pagado", "pendiente", "descartado"],
+          "description": "'pagado' = confirmado y descontado del flujo. 'pendiente' = agendado sin cobrar aún. 'descartado' = cancelado."
+        },
+        "gasto_programado_id": { "type": ["string", "null"], "format": "uuid", "description": "UUID de la regla de gasto programado que generó este gasto. null = gasto manual." },
+        "created_at": { "type": "string", "format": "date-time" }
+      },
+      "campos_escritura_POST": {
+        "fecha": { "type": "string", "format": "date", "required": true, "description": "YYYY-MM-DD" },
+        "categoria": { "type": "string", "required": true },
+        "descripcion": { "type": "string", "required": true },
+        "monto": { "type": "number", "required": true },
+        "estado": { "type": "string", "enum": ["pagado", "pendiente"], "default": "pagado" },
+        "gasto_programado_id": { "type": ["string", "null"] }
+      },
+      "campos_escritura_PUT": {
+        "monto": { "type": "number", "required": true },
+        "categoria": { "type": "string", "required": true },
+        "descripcion": { "type": "string", "required": true }
+      },
+      "acciones_especiales": {
+        "PUT /gastos/{id}/confirmar": "Cambia estado a 'pagado'",
+        "PUT /gastos/{id}/descartar": "Cambia estado a 'descartado'",
+        "DELETE /gastos/{id}": "Elimina el gasto permanentemente"
+      }
+    },
+
+    "CategoriaGasto": {
+      "description": "Categoría de gasto del tenant (personalizable). Tabla: categorias_gasto.",
+      "tabla_sql": "categorias_gasto",
+      "campos_lectura": {
+        "nombre": { "type": "string" },
+        "tenant_id": { "type": "string", "format": "uuid" }
+      },
+      "categorias_default": ["Servicios", "Proveedores", "Nómina", "Renta", "Marketing", "Otros"],
+      "campos_escritura_POST": {
+        "nombre": { "type": "string", "required": true, "minLength": 1 }
+      },
+      "campos_escritura_PUT": {
+        "nuevo_nombre": { "type": "string", "required": true, "minLength": 1 }
+      }
+    },
+
+    "GastoProgramado": {
+      "description": "Regla de gasto recurrente (ej: renta mensual, suscripción anual). El motor las ejecuta automáticamente al cargar /gastos. Tabla: gastos_programados.",
+      "tabla_sql": "gastos_programados",
+      "campos_lectura": {
+        "id": { "type": "string", "format": "uuid" },
+        "tenant_id": { "type": "string", "format": "uuid" },
+        "nombre": { "type": "string", "description": "Nombre descriptivo de la regla (ej: 'Renta del local')" },
+        "tipo": {
+          "type": "string",
+          "enum": ["fijo", "porcentaje"],
+          "description": "'fijo' = monto fijo en dinero. 'porcentaje' = % sobre las ventas del período."
+        },
+        "valor": { "type": "number", "description": "Monto si tipo='fijo', o porcentaje (ej: 5.0 para 5%) si tipo='porcentaje'" },
+        "frecuencia": { "type": "string", "enum": ["semanal", "mensual", "anual"] },
+        "proxima_fecha": { "type": "string", "format": "date", "description": "Próxima fecha en que se generará el gasto automáticamente (YYYY-MM-DD)" },
+        "ultimo_monto": { "type": ["number", "null"], "description": "Monto del último gasto generado por esta regla (campo calculado, solo lectura)" },
+        "created_at": { "type": "string", "format": "date-time" }
+      },
+      "campos_escritura_POST": {
+        "nombre": { "type": "string", "required": true },
+        "tipo": { "type": "string", "required": true, "enum": ["fijo", "porcentaje"] },
+        "valor": { "type": "number", "required": true },
+        "frecuencia": { "type": "string", "required": true, "enum": ["semanal", "mensual", "anual"] },
+        "proxima_fecha": { "type": "string", "required": true, "format": "date" }
+      },
+      "campos_escritura_PUT_PATCH": {
+        "nombre": { "type": ["string", "null"] },
+        "tipo": { "type": ["string", "null"], "enum": ["fijo", "porcentaje", null] },
+        "valor": { "type": ["number", "null"] },
+        "frecuencia": { "type": ["string", "null"], "enum": ["semanal", "mensual", "anual", null] },
+        "proxima_fecha": { "type": ["string", "null"], "format": "date" }
+      }
+    }
+  }
+}

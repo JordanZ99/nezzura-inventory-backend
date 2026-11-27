@@ -1,0 +1,66 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$comment": "Contrato de órdenes de servicio (migración 077): el registro del TRABAJO del giro 'servicios' — genérico (reparaciones, instalaciones, consultoría, mantenimiento, otro), no limitado a talleres. Generado desde backend/schemas/ordenes.py y backend/database/ordenes.py.",
+  "reglas_global": {
+    "descripcion": "El dinero NO vive aquí: el precio es informativo hasta que se cobra. El cobro (puntual o venta a plazos) se crea aparte en cobros/cuotas_clientes y queda enlazado vía cobro_id (trazabilidad). Al pasar a 'entregado' el backend sella fecha_entregado=HOY si no traía una; reabrir la limpia.",
+    "tenant_id": { "type": "string", "format": "uuid", "nota": "Nunca se envía — sale del JWT de Supabase en el backend." }
+  },
+  "endpoints": {
+    "GET /ordenes/": "Órdenes con nombre del cliente y saldo del cobro enlazado. Query: estado, cliente_id, solo_abiertas (todo menos entregado/cancelado = cola de trabajo vivo). Orden: abiertas primero, por fecha_recibido DESC.",
+    "POST /ordenes/": "Alta de orden (intake mínimo: título).",
+    "PATCH /ordenes/{id}": "Edita cualquier campo; transición de estado con sellado de fecha_entregado; precio 0 = quitarlo; cobro_id = enlazar el cobro/cuota.",
+    "DELETE /ordenes/{id}": "Borra la orden (el cobro enlazado solo pierde el enlace)."
+  },
+  "entities": {
+    "OrdenServicio": {
+      "description": "Una orden de trabajo: qué se pide, sobre qué, cómo fue, en qué estado y (si se cobró) el enlace al cobro. Tabla: ordenes_servicio.",
+      "tabla_sql": "ordenes_servicio",
+      "campos_lectura": {
+        "id": { "type": "string", "format": "uuid" },
+        "tenant_id": { "type": "string", "format": "uuid" },
+        "cliente_id": { "type": ["string", "null"], "format": "uuid" },
+        "cliente_nombre": { "type": ["string", "null"], "description": "JOIN con clientes — se resuelve en el backend." },
+        "tipo": { "type": "string", "enum": ["reparacion", "instalacion", "consultoria", "mantenimiento", "otro"] },
+        "titulo": { "type": "string", "description": "Qué se pide, en una línea ('Cambio de pantalla iPhone 11')." },
+        "equipo": { "type": ["string", "null"], "description": "Sobre qué se trabaja (modelo/serie/IMEI, dominio, local...). Genérico y opcional." },
+        "detalle_reportado": { "type": ["string", "null"], "description": "Lo que reportó el cliente, en sus palabras." },
+        "solucion": { "type": ["string", "null"], "description": "Lo que encontraste/hiciste (tu versión)." },
+        "estado": { "type": "string", "enum": ["recibido", "en_proceso", "esperando", "listo", "entregado", "cancelado"], "description": "Flujo del trabajo: recibido → en_proceso → esperando → listo → entregado (+ cancelado)." },
+        "fecha_recibido": { "type": "string", "format": "date" },
+        "fecha_entregado": { "type": ["string", "null"], "format": "date", "description": "Sellada por el backend al pasar a 'entregado'." },
+        "precio": { "type": ["number", "null"], "description": "Informativo hasta que se cobra." },
+        "cobro_id": { "type": ["string", "null"], "format": "uuid", "description": "Cobro puntual o cuota-venta generado por esta orden." },
+        "cobro_concepto": { "type": ["string", "null"], "description": "JOIN con cobros — concepto del cobro enlazado." },
+        "cobro_saldo": { "type": ["number", "null"], "description": "Saldo pendiente del cobro enlazado (derivado del backend)." },
+        "notas": { "type": ["string", "null"] },
+        "creado_en": { "type": "string", "format": "date-time" }
+      },
+      "campos_escritura_POST": {
+        "titulo": { "type": "string", "required": true, "minLength": 1 },
+        "tipo": { "type": "string", "enum": ["reparacion", "instalacion", "consultoria", "mantenimiento", "otro"], "default": "otro" },
+        "cliente_id": { "type": ["string", "null"], "format": "uuid" },
+        "equipo": { "type": ["string", "null"] },
+        "detalle_reportado": { "type": ["string", "null"] },
+        "solucion": { "type": ["string", "null"] },
+        "estado": { "type": "string", "enum": ["recibido", "en_proceso", "esperando", "listo", "entregado", "cancelado"], "default": "recibido" },
+        "fecha_recibido": { "type": ["string", "null"], "format": "date", "description": "default: hoy" },
+        "precio": { "type": ["number", "null"], "minimum": 0 },
+        "notas": { "type": ["string", "null"] }
+      },
+      "campos_escritura_PATCH": {
+        "cliente_id": { "type": ["string", "null"], "format": "uuid" },
+        "tipo": { "type": "string", "enum": ["reparacion", "instalacion", "consultoria", "mantenimiento", "otro"] },
+        "titulo": { "type": "string", "minLength": 1 },
+        "equipo": { "type": ["string", "null"] },
+        "detalle_reportado": { "type": ["string", "null"] },
+        "solucion": { "type": ["string", "null"] },
+        "estado": { "type": "string", "enum": ["recibido", "en_proceso", "esperando", "listo", "entregado", "cancelado"], "description": "→ 'entregado' sella fecha_entregado=HOY; reabrir la limpia." },
+        "fecha_recibido": { "type": ["string", "null"], "format": "date" },
+        "fecha_entregado": { "type": ["string", "null"], "format": "date", "description": "'' explícito = quitarla" },
+        "precio": { "type": ["number", "null"], "minimum": 0, "description": "None = sin cambio; 0 = quitar; >0 = fijar" },
+        "cobro_id": { "type": ["string", "null"], "format": "uuid" },
+        "notas": { "type": ["string", "null"] }
+      }
+    }
+  }
+}

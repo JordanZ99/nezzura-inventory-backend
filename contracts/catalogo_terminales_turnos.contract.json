@@ -1,0 +1,140 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$comment": "Contratos del catálogo público, posts automáticos, terminales bancarias y turnos de caja. Generado desde backend/schemas/catalogo.py, terminales.py y turnos.py.",
+  "entities": {
+
+    "ConfigCatalogo": {
+      "description": "Configuración del catálogo público del tenant. Tabla: catalogo_config. Se autocrea al primer acceso.",
+      "tabla_sql": "catalogo_config",
+      "campos_lectura": {
+        "id": { "type": "string", "format": "uuid" },
+        "slug": { "type": "string", "description": "Slug único en la URL pública: /catalogo/{slug}" },
+        "activo": { "type": "boolean" },
+        "tema": { "type": "string", "enum": ["default", "midnightBlack", "strawberry", "cozyYellow"] },
+        "template": { "type": "string", "enum": ["grid-clasico", "menu-carta"] },
+        "titulo": { "type": ["string", "null"] },
+        "subtitulo": { "type": ["string", "null"] },
+        "mostrar_precios": { "type": "boolean" },
+        "mostrar_stock": { "type": "boolean" },
+        "mostrar_categorias": { "type": "boolean" },
+        "agrupar_por_categoria": { "type": "boolean" },
+        "columnas_movil": { "type": "integer", "enum": [1, 2] },
+        "relacion_imagen": { "type": "string", "enum": ["1:1", "4:5"] },
+        "permitir_descarga": { "type": "boolean" },
+        "ocultar_agotados": { "type": "boolean" },
+        "banner_url": { "type": ["string", "null"], "description": "URL de Cloudinary del banner/hero" },
+        "banner_url_movil": { "type": ["string", "null"] },
+        "hero_estilo": { "type": ["string", "null"], "enum": ["gradiente", "imagen", null] },
+        "banner_texto_color": { "type": ["string", "null"], "description": "Color hex del texto sobre el banner" },
+        "banner_mostrar_texto": { "type": ["boolean", "null"] },
+        "banner_mostrar_logo": { "type": ["boolean", "null"] },
+        "anuncio_texto": { "type": ["string", "null"], "description": "Texto de la barra de anuncios. Vacío = oculta" },
+        "logo": { "type": ["string", "null"], "description": "Logo del negocio (JOIN desde tabla tenants)" }
+      },
+      "campos_escritura_PATCH": {
+        "activo": { "type": ["boolean", "null"] },
+        "tema": { "type": ["string", "null"], "enum": ["default", "midnightBlack", "strawberry", "cozyYellow", null] },
+        "template": { "type": ["string", "null"], "enum": ["grid-clasico", "menu-carta", null] },
+        "titulo": { "type": ["string", "null"] },
+        "subtitulo": { "type": ["string", "null"] },
+        "mostrar_precios": { "type": ["boolean", "null"] },
+        "mostrar_stock": { "type": ["boolean", "null"] },
+        "mostrar_categorias": { "type": ["boolean", "null"] },
+        "agrupar_por_categoria": { "type": ["boolean", "null"] },
+        "columnas_movil": { "type": ["integer", "null"], "enum": [1, 2, null] },
+        "relacion_imagen": { "type": ["string", "null"] },
+        "permitir_descarga": { "type": ["boolean", "null"] },
+        "ocultar_agotados": { "type": ["boolean", "null"] },
+        "banner_url": { "type": ["string", "null"] },
+        "banner_url_movil": { "type": ["string", "null"] },
+        "hero_estilo": { "type": ["string", "null"] },
+        "banner_texto_color": { "type": ["string", "null"] },
+        "banner_mostrar_texto": { "type": ["boolean", "null"] },
+        "banner_mostrar_logo": { "type": ["boolean", "null"] },
+        "anuncio_texto": { "type": ["string", "null"] }
+      }
+    },
+
+    "PostConfig": {
+      "description": "Defaults de tarjetas de post automático del negocio. Tabla: post_config. Cascada: post_config (negocio) → productos.post_override (por producto).",
+      "tabla_sql": "post_config",
+      "campos_lectura": {
+        "tenant_id": { "type": "string", "format": "uuid" },
+        "template_default": { "type": "string", "enum": ["marco", "overlay"] },
+        "font": { "type": "string", "enum": ["moderna", "elegante", "redondeada"] },
+        "posicion": { "type": "string", "enum": ["arriba", "abajo"] },
+        "mostrar": {
+          "type": "object",
+          "properties": {
+            "nombre": { "type": "boolean" },
+            "precio": { "type": "boolean" },
+            "negocio": { "type": "boolean" }
+          }
+        },
+        "color_primario": { "type": "string", "description": "Hex #RRGGBB o '' = automático por plantilla" },
+        "color_secundario": { "type": "string", "description": "Hex #RRGGBB o '' = azul por defecto" }
+      },
+      "campos_escritura_PATCH": {
+        "template_default": { "type": ["string", "null"], "enum": ["marco", "overlay", null] },
+        "font": { "type": ["string", "null"], "enum": ["moderna", "elegante", "redondeada", null] },
+        "posicion": { "type": ["string", "null"], "enum": ["arriba", "abajo", null] },
+        "mostrar": { "type": ["object", "null"] },
+        "color_primario": { "type": ["string", "null"] },
+        "color_secundario": { "type": ["string", "null"] }
+      }
+    },
+
+    "Terminal": {
+      "description": "Terminal bancaria de cobro con comisiones configurables. Tabla: terminales.",
+      "tabla_sql": "terminales",
+      "campos_lectura": {
+        "id": { "type": "string", "format": "uuid" },
+        "tenant_id": { "type": "string", "format": "uuid" },
+        "nombre": { "type": "string", "description": "Ej: 'Banorte móvil', 'Clip'" },
+        "banco": { "type": ["string", "null"] },
+        "comision_debito_pct": { "type": "number", "minimum": 0, "description": "% de comisión sobre pagos con débito" },
+        "comision_credito_pct": { "type": "number", "minimum": 0, "description": "% de comisión sobre pagos con crédito" },
+        "comision_fija": { "type": "number", "minimum": 0, "description": "Cuota fija por transacción (en moneda local)" },
+        "activo": { "type": "boolean", "default": true }
+      },
+      "campos_escritura_POST": {
+        "nombre": { "type": "string", "required": true, "minLength": 1 },
+        "banco": { "type": ["string", "null"] },
+        "comision_debito_pct": { "type": "number", "minimum": 0, "default": 0 },
+        "comision_credito_pct": { "type": "number", "minimum": 0, "default": 0 },
+        "comision_fija": { "type": "number", "minimum": 0, "default": 0 }
+      },
+      "campos_escritura_PUT": {
+        "nombre": { "type": ["string", "null"] },
+        "banco": { "type": ["string", "null"] },
+        "comision_debito_pct": { "type": ["number", "null"], "minimum": 0 },
+        "comision_credito_pct": { "type": ["number", "null"], "minimum": 0 },
+        "comision_fija": { "type": ["number", "null"], "minimum": 0 },
+        "activo": { "type": ["boolean", "null"] }
+      }
+    },
+
+    "Turno": {
+      "description": "Turno de caja con arqueo. Registra el fondo de apertura y el conteo de efectivo al cierre. Tabla: turnos.",
+      "tabla_sql": "turnos",
+      "campos_lectura": {
+        "id": { "type": "string", "format": "uuid" },
+        "tenant_id": { "type": "string", "format": "uuid" },
+        "monto_apertura": { "type": "number", "description": "Fondo de caja con el que abrió el turno" },
+        "efectivo_esperado": { "type": ["number", "null"], "description": "Calculado en vivo: apertura + ventas en efectivo. null = turno cerrado (ver efectivo_contado)" },
+        "efectivo_contado": { "type": ["number", "null"], "description": "Efectivo físico contado al cierre. null = turno aún abierto" },
+        "diferencia": { "type": ["number", "null"], "description": "efectivo_contado - efectivo_esperado. null = turno abierto" },
+        "notas": { "type": ["string", "null"] },
+        "abierto_en": { "type": "string", "format": "date-time" },
+        "cerrado_en": { "type": ["string", "null"], "format": "date-time" }
+      },
+      "campos_escritura_apertura_POST": {
+        "monto_apertura": { "type": "number", "required": true, "description": "Fondo de caja inicial en moneda local" }
+      },
+      "campos_escritura_cierre_POST": {
+        "efectivo_contado": { "type": "number", "required": true, "description": "Efectivo físico contado al cerrar el cajón" },
+        "notas": { "type": ["string", "null"], "description": "Observaciones del arqueo (opcional)" }
+      }
+    }
+  }
+}
