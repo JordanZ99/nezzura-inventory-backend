@@ -1995,8 +1995,11 @@ def cobrar_carrito(
         # los errores internos para que el router responda 422 y no 500.
         conn.rollback()
         return {"ok": False, "tipo": "validacion", "mensaje": str(e)}
-    except Exception as e:
+    except Exception:
         conn.rollback()
-        return {"ok": False, "mensaje": f"Error al cobrar el carrito: {str(e)}"}
+        # El detalle de Postgres (tabla, constraint, DSN) no viaja al POS:
+        # se registra aquí y el cliente recibe un mensaje accionable.
+        logger.exception("Error interno al cobrar el carrito")
+        return {"ok": False, "mensaje": "No se pudo completar el cobro. Inténtalo de nuevo."}
     finally:
         release_conn(conn)

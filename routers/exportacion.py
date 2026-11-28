@@ -20,6 +20,7 @@ import time
 import urllib.request
 import zipfile
 from collections import defaultdict, deque
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Response
 from starlette.background import BackgroundTask
@@ -128,6 +129,20 @@ def _slug(nombre: str) -> str:
     return (base[:60] or "foto").replace(" ", "_") or "foto"
 
 
+def _es_url_cloudinary(url: str) -> bool:
+    """Solo https://res.cloudinary.com/... — evita SSRF al descargar fotos.
+
+    `listar_imagenes` filtra por la subcadena 'res.cloudinary.com'; una URL
+    como http://169.254.169.254/?x=res.cloudinary.com la pasaría. Aquí se
+    exige host exacto y https antes de abrir la conexión.
+    """
+    try:
+        partes = urlparse(url)
+    except ValueError:
+        return False
+    return partes.scheme == "https" and partes.hostname == "res.cloudinary.com"
+
+
 def _extension_de_url(url: str) -> str:
     try:
         ruta = url.split("?", 1)[0].split("upload/")[-1]
@@ -189,6 +204,9 @@ def exportar_respaldo(tenant_id: str = Depends(get_tenant_id)):
             for indice, (url, contexto) in enumerate(fotos, start=1):
                 if total >= _TOPE_FOTOS_BYTES:
                     omitidas.append(f"{url} (tope de {_TOPE_FOTOS_BYTES // (1024 * 1024)} MB alcanzado)")
+                    continue
+                if not _es_url_cloudinary(url):
+                    omitidas.append(f"{url} (host no permitido)")
                     continue
                 try:
                     with urllib.request.urlopen(urllib.request.Request(url),

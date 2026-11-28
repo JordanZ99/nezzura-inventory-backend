@@ -12,6 +12,7 @@
 # ==============================================================================
 
 import json
+from urllib.parse import urlparse
 
 from database.conexion import query, execute
 from database.helpers import _obtener_categorias_subquery
@@ -59,6 +60,24 @@ def obtener_config(tenant_id: str) -> dict:
         _asegurar_config(tenant_id)
         resultado = query(_SELECT_CONFIG_GESTION, (tenant_id,))
     return resultado[0] if resultado else {}
+
+
+def _validar_url_cloudinary(valor: str, campo: str) -> str | None:
+    """Acepta vacío o una URL https de res.cloudinary.com.
+
+    Las URLs de banner/hero/fondo se descargan en el respaldo ZIP; aceptar
+    cualquier host convertía ese endpoint en un SSRF autenticado. El filtro
+    exacto del ZIP es la última barrera; esta evita guardar el vector.
+    """
+    if valor == "":
+        return None
+    try:
+        partes = urlparse(valor)
+    except ValueError:
+        return f"{campo} no es una URL válida"
+    if partes.scheme != "https" or partes.hostname != "res.cloudinary.com":
+        return f"{campo} debe ser una URL https de res.cloudinary.com"
+    return None
 
 
 def _validar_hero_layout(layout) -> str | None:
@@ -212,9 +231,15 @@ def actualizar_config(campos: dict, tenant_id: str) -> dict:
         asignaciones.append("ocultar_agotados = %s")
         valores.append(campos["ocultar_agotados"])
     if campos.get("banner_url") is not None:
+        err = _validar_url_cloudinary(campos["banner_url"], "banner_url")
+        if err:
+            return {"ok": False, "status": 422, "mensaje": err}
         asignaciones.append("banner_url = %s")
         valores.append(campos["banner_url"])
     if campos.get("banner_url_movil") is not None:
+        err = _validar_url_cloudinary(campos["banner_url_movil"], "banner_url_movil")
+        if err:
+            return {"ok": False, "status": 422, "mensaje": err}
         asignaciones.append("banner_url_movil = %s")
         valores.append(campos["banner_url_movil"])
     if campos.get("hero_estilo") is not None:
@@ -236,6 +261,9 @@ def actualizar_config(campos: dict, tenant_id: str) -> dict:
         asignaciones.append("anuncio_texto = %s")
         valores.append(campos["anuncio_texto"])
     if campos.get("fondo_url") is not None:
+        err = _validar_url_cloudinary(campos["fondo_url"], "fondo_url")
+        if err:
+            return {"ok": False, "status": 422, "mensaje": err}
         asignaciones.append("fondo_url = %s")
         valores.append(campos["fondo_url"])
     if campos.get("fondo_modo") is not None:
@@ -256,9 +284,15 @@ def actualizar_config(campos: dict, tenant_id: str) -> dict:
         valores.append(campos["relacion_imagen"])
     # Modo Hero de la portada (migración 047)
     if campos.get("hero_url") is not None:
+        err = _validar_url_cloudinary(campos["hero_url"], "hero_url")
+        if err:
+            return {"ok": False, "status": 422, "mensaje": err}
         asignaciones.append("hero_url = %s")
         valores.append(campos["hero_url"])
     if campos.get("hero_url_movil") is not None:
+        err = _validar_url_cloudinary(campos["hero_url_movil"], "hero_url_movil")
+        if err:
+            return {"ok": False, "status": 422, "mensaje": err}
         asignaciones.append("hero_url_movil = %s")
         valores.append(campos["hero_url_movil"])
     if campos.get("hero_opacidad") is not None:

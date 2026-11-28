@@ -8,7 +8,6 @@ import os
 import psycopg2
 from psycopg2 import pool
 from psycopg2.extras import RealDictCursor
-from psycopg2.errors import UndefinedTable, UndefinedColumn
 from dotenv import load_dotenv
 from pathlib import Path
 
@@ -32,7 +31,13 @@ def release_conn(conn):
 
 
 def query(sql: str, params: tuple = None) -> list[dict]:
-    """Ejecuta un SELECT y devuelve lista de dicts."""
+    """Ejecuta un SELECT y devuelve lista de dicts.
+
+    No auto-migra: si falta una tabla/columna, el error sube al caller. El DDL
+    corre solo en el lifespan (y en /init-db, autenticado). Hacerlo desde un
+    SELECT retenía una conexión del pool mientras inicializar_db() pedía otra:
+    con 10 requests concurrentes el pool se agotaba y el worker se colgaba.
+    """
     conn = get_conn()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -40,40 +45,28 @@ def query(sql: str, params: tuple = None) -> list[dict]:
             result = [dict(row) for row in cur.fetchall()]
         conn.commit()
         return result
-    except (UndefinedTable, UndefinedColumn):
-        # Si falta una tabla o columna (ej: migración nueva aún no aplicada),
-        # re-ejecutamos inicializar_db() para crear/alterar y reintentamos.
+    except Exception:
         conn.rollback()
-        inicializar_db()
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(sql, params or ())
-            result = [dict(row) for row in cur.fetchall()]
-        conn.commit()
-        return result
-    except Exception as e:
-        conn.rollback()
-        raise e
+        raise
     finally:
         release_conn(conn)
 
 
 def execute(sql: str, params: tuple = None) -> None:
-    """Ejecuta INSERT, UPDATE o DELETE."""
+    """Ejecuta INSERT, UPDATE o DELETE.
+
+    No auto-migra: el DDL no se dispara desde un request de negocio. Si falta
+    una tabla/columna, el error sube y el lifespan (o /init-db) es el único
+    camino para aplicar el esquema.
+    """
     conn = get_conn()
     try:
         with conn.cursor() as cur:
             cur.execute(sql, params or ())
         conn.commit()
-    except (UndefinedTable, UndefinedColumn):
-        # Igual que en query(): si falta tabla/columna, migrar automáticamente y reintentar.
+    except Exception:
         conn.rollback()
-        inicializar_db()
-        with conn.cursor() as cur:
-            cur.execute(sql, params or ())
-        conn.commit()
-    except Exception as e:
-        conn.rollback()
-        raise e
+        raise
     finally:
         release_conn(conn)
 
@@ -225,11 +218,18 @@ def _ejecutar_migraciones(cur) -> None:
             "INSERT INTO schema_migrations (nombre) VALUES (%s)", (archivo.name,))
 
 
+# Lock transaccional para las migraciones. Dos procesos (rolling deploy,
+# /init-db concurrente) no deben correr el mismo DDL a la vez; xact se libera
+# solo al commit/rollback de inicializar_db().
+_LOCK_MIGRACIONES = 918273645
+
+
 def inicializar_db():
     """Crea las tablas si no existen al arrancar."""
     conn = get_conn()
     try:
         with conn.cursor() as cur:
+            cur.execute("SELECT pg_advisory_xact_lock(%s)", (_LOCK_MIGRACIONES,))
             # 1. Tablas Core
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS productos (
@@ -334,5 +334,10 @@ def inicializar_db():
             _ejecutar_migraciones(cur)
 
         conn.commit()
+    except Exception:
+        # Sin rollback explícito la conexión vuelve al pool con la transacción
+        # abortada y el advisory lock retenido hasta que el pool la recicle.
+        conn.rollback()
+        raise
     finally:
         release_conn(conn)

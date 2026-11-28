@@ -288,6 +288,20 @@ def cambiar_ver_costos(clave_id: int, tenant_id: str, ver_costos: bool) -> bool:
     return True
 
 
+def _contexto_de_fila(fila: dict):
+    """Normaliza la fila de mcp_api_keys al contrato del middleware."""
+    crudos_roles = (fila.get("roles") or "").strip()
+    roles = tuple(r.strip() for r in crudos_roles.split(",") if r.strip()) or None
+    return (
+        str(fila["tenant_id"]),
+        int(fila["nivel"] or 1),
+        int(fila["id"]),
+        None,
+        bool(fila["ver_costos"]),
+        roles,
+    )
+
+
 def validar_clave(clave: str, contar_uso: bool = True):
     """
     Valida una clave para el middleware del servidor MCP.
@@ -303,34 +317,57 @@ def validar_clave(clave: str, contar_uso: bool = True):
     if not clave:
         return None, None, None, 401, False, None
 
-    filas = query(
-        "SELECT id, tenant_id, nivel, roles, revocada_en, llamadas_hoy, dia_uso, "
-        "limite_llamadas_diarias, ver_costos FROM mcp_api_keys WHERE key_hash = %s",
-        (_hashear(clave),),
-    )
-    if not filas or filas[0]["revocada_en"]:
-        return None, None, None, 401, False, None
+    clave_hash = _hashear(clave)
 
-    fila = filas[0]
-    nivel = int(fila["nivel"] or 1)
-    hoy = date.today()
-    usadas = fila["llamadas_hoy"] if fila["dia_uso"] == hoy else 0
-    # Override por clave (NULL = default del nivel, migrations/067)
-    limite = fila["limite_llamadas_diarias"] or _LIMITE_POR_NIVEL.get(nivel, LIMITE_LLAMADAS_DIARIO)
-    if contar_uso and usadas >= limite:
-        return None, None, None, 429, False, None
-
-    if contar_uso:
-        execute(
-            "UPDATE mcp_api_keys SET llamadas_hoy = %s, dia_uso = %s, "
-            "ultimo_uso_en = now() WHERE id = %s",
-            (usadas + 1, hoy, fila["id"]),
+    # Sin contar uso no se modifica el contador: basta una lectura.
+    if not contar_uso:
+        filas = query(
+            "SELECT id, tenant_id, nivel, roles, revocada_en, ver_costos "
+            "FROM mcp_api_keys WHERE key_hash = %s",
+            (clave_hash,),
         )
-    # 5ª posición: el agente de esta clave puede ver costos internos (068).
-    # 6ª: roles activos (081); vacío = todas (compatibilidad pre-migración).
-    crudos_roles = (fila.get("roles") or "").strip()
-    roles = tuple(r.strip() for r in crudos_roles.split(",") if r.strip()) or None
-    return str(fila["tenant_id"]), nivel, int(fila["id"]), None, bool(fila["ver_costos"]), roles
+        if not filas or filas[0]["revocada_en"]:
+            return None, None, None, 401, False, None
+        return _contexto_de_fila(filas[0])
+
+    # Con uso: SELECT ... FOR UPDATE + UPDATE en la MISMA transacción. Antes
+    # eran query() y execute() en conexiones distintas: N requests paralelos
+    # leían el mismo contador y todos pasaban el límite.
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "SELECT id, tenant_id, nivel, roles, revocada_en, llamadas_hoy, "
+                "dia_uso, limite_llamadas_diarias, ver_costos "
+                "FROM mcp_api_keys WHERE key_hash = %s FOR UPDATE",
+                (clave_hash,),
+            )
+            fila = cur.fetchone()
+            if not fila or fila["revocada_en"]:
+                conn.rollback()
+                return None, None, None, 401, False, None
+
+            nivel = int(fila["nivel"] or 1)
+            hoy = date.today()
+            usadas = fila["llamadas_hoy"] if fila["dia_uso"] == hoy else 0
+            # Override por clave (NULL = default del nivel, migrations/067)
+            limite = fila["limite_llamadas_diarias"] or _LIMITE_POR_NIVEL.get(nivel, LIMITE_LLAMADAS_DIARIO)
+            if usadas >= limite:
+                conn.rollback()
+                return None, None, None, 429, False, None
+
+            cur.execute(
+                "UPDATE mcp_api_keys SET llamadas_hoy = %s, dia_uso = %s, "
+                "ultimo_uso_en = now() WHERE id = %s",
+                (usadas + 1, hoy, fila["id"]),
+            )
+        conn.commit()
+        return _contexto_de_fila(fila)
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_conn(conn)
 
 
 def contar_escritura(clave_id: int) -> bool:
@@ -338,24 +375,39 @@ def contar_escritura(clave_id: int) -> bool:
     Reserva una cuota de escritura para una clave nivel 3.
     Devuelve False si ya alcanzó el límite diario. La escritura SE cuenta
     aunque luego falle la creación: el costo de intentarlo ya se pagó.
+
+    El SELECT ... FOR UPDATE serializa las reservas concurrentes de la misma
+    clave; sin él, dos confirmaciones simultáneas leían el mismo contador y
+    ambas pasaban el límite.
     """
-    filas = query(
-        "SELECT escrituras_hoy, dia_escrituras, limite_escrituras_diarias "
-        "FROM mcp_api_keys WHERE id = %s",
-        (clave_id,),
-    )
-    if not filas:
-        return False
-    fila = filas[0]
-    hoy = date.today()
-    usadas = fila["escrituras_hoy"] if fila["dia_escrituras"] == hoy else 0
-    # Override por clave (NULL = default global, migrations/067)
-    limite = fila["limite_escrituras_diarias"] or LIMITE_ESCRITURAS_DIARIO
-    if usadas >= limite:
-        return False
-    execute(
-        "UPDATE mcp_api_keys SET escrituras_hoy = %s, dia_escrituras = %s "
-        "WHERE id = %s",
-        (usadas + 1, hoy, clave_id),
-    )
-    return True
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "SELECT escrituras_hoy, dia_escrituras, limite_escrituras_diarias "
+                "FROM mcp_api_keys WHERE id = %s FOR UPDATE",
+                (clave_id,),
+            )
+            fila = cur.fetchone()
+            if not fila:
+                conn.rollback()
+                return False
+            hoy = date.today()
+            usadas = fila["escrituras_hoy"] if fila["dia_escrituras"] == hoy else 0
+            # Override por clave (NULL = default global, migrations/067)
+            limite = fila["limite_escrituras_diarias"] or LIMITE_ESCRITURAS_DIARIO
+            if usadas >= limite:
+                conn.rollback()
+                return False
+            cur.execute(
+                "UPDATE mcp_api_keys SET escrituras_hoy = %s, dia_escrituras = %s "
+                "WHERE id = %s",
+                (usadas + 1, hoy, clave_id),
+            )
+        conn.commit()
+        return True
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_conn(conn)

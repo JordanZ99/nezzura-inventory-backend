@@ -30,7 +30,6 @@
 import json
 
 from psycopg2.extras import RealDictCursor
-from psycopg2.errors import UndefinedColumn, UndefinedTable
 
 from database.conexion import get_conn, release_conn, query, execute
 
@@ -167,25 +166,12 @@ def actualizar_estimaciones(tenant_id: str | None = None) -> dict:
                         (tid, datos_hist["datos"], datos_hist["historial"], sin_uso),
                     )
                 conn.commit()
-            except (UndefinedColumn, UndefinedTable):
-                # Migración 073 aún no aplicada (conn cruda no dispara el
-                # auto-heal de conexion.py): migrar y reintentar UNA vez.
+            except Exception:
+                # Sin DDL desde un request: si falta la tabla/columna de la
+                # migración 073, el error sube al except externo (se registra
+                # y se sigue con el siguiente tenant). El lifespan ya migró.
                 conn.rollback()
-                from database.conexion import inicializar_db
-                inicializar_db()
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "INSERT INTO tenant_storage "
-                        "(tenant_id, datos_bytes, historial_bytes, sin_uso_bytes) "
-                        "VALUES (%s, %s, %s, %s) "
-                        "ON CONFLICT (tenant_id) DO UPDATE SET "
-                        "datos_bytes = EXCLUDED.datos_bytes, "
-                        "historial_bytes = EXCLUDED.historial_bytes, "
-                        "sin_uso_bytes = EXCLUDED.sin_uso_bytes, "
-                        "actualizado_en = now()",
-                        (tid, datos_hist["datos"], datos_hist["historial"], sin_uso),
-                    )
-                conn.commit()
+                raise
             finally:
                 release_conn(conn)
             actualizados += 1

@@ -52,11 +52,12 @@ def validar_sesion(
         )
         return True
 
-    except Exception as e:
-        print(f"DEBUG AUTH: Fallo en la validación de sesión: {str(e)}")
+    except Exception:
+        # El detalle de PyJWT (algoritmo, kid, expiración) no viaja al cliente:
+        # sirve para afinar un token. El 401 genérico es suficiente.
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Sesión inválida o expirada: {str(e)}",
+            detail="Sesión inválida o expirada.",
         )
 
 def get_tenant_id(
@@ -89,8 +90,11 @@ def get_tenant_id(
             
         return tenant_id
 
-    except Exception as e:
+    except HTTPException:
+        # Conserva el 401 específico de "el token no contiene un ID".
+        raise
+    except Exception:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Token inválido: {str(e)}",
+            detail="Token inválido o expirado.",
         )

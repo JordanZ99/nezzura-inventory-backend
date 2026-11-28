@@ -5,14 +5,16 @@
 # Documentación automática en: http://localhost:8000/docs
 # ==============================================================================
 
+import os
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from psycopg2.errors import UndefinedTable
 
 from database.conexion import inicializar_db
+from dependencies import get_tenant_id
 from routers import inventario, ventas, gastos, gastos_programados, catalogo_gestion, publico, exportacion, terminales, turnos, stats, mesas, clientes, analitica, licencias, cobros, actividad, mcp_conexion, catalogo_publicado, sync, almacenamiento, planes_clientes, ordenes
 from muse.server import app_mcp, servidor
 
@@ -43,15 +45,19 @@ async def lifespan(app: FastAPI):
         yield
 
 
+# En producción (Render) no se publica la documentación interactiva: /docs,
+# /redoc y /openapi.json revelan el mapa completo de la API. En local sigue.
+ES_PRODUCCION = bool(os.getenv("RENDER")) or os.getenv("ENV") == "production"
+
 app = FastAPI(
     title="Nezzura Digital API",
     description="Nezzura Digital — Backend para gestión de inventario, ventas PEPS y gastos.",
     version="1.0.0",
     lifespan=lifespan,
+    docs_url=None if ES_PRODUCCION else "/docs",
+    redoc_url=None if ES_PRODUCCION else "/redoc",
+    openapi_url=None if ES_PRODUCCION else "/openapi.json",
 )
-
-import os
-import re
 
 # URL por defecto del frontend desplegado en Vercel.
 # En producción (Render) se sobreescribe con la variable de entorno FRONTEND_URL
@@ -123,30 +129,27 @@ app.include_router(mcp_conexion.router)
 
 @app.get("/")
 def root():
-    from database.conexion import query
-    stats = {}
-    try:
-        stats["productos"] = query("SELECT COUNT(*) as c FROM productos")[0]["c"]
-        stats["lotes"] = query("SELECT COUNT(*) as c FROM lotes")[0]["c"]
-        stats["ventas"] = query("SELECT COUNT(*) as c FROM ventas")[0]["c"]
-        stats["gastos"] = query("SELECT COUNT(*) as c FROM gastos")[0]["c"]
-        return {
-            "mensaje": "Nezzura Digital API funcionando ✓",
-            "database_stats": stats,
-            "nota": "Si los números son 0, el backend está conectado a una DB vacía."
-        }
-    except Exception as e:
-        return {"mensaje": "Error obteniendo stats", "error": str(e)}
+    """Healthcheck sin datos: no expone conteos globales ni el error de la DB.
+
+    Antes hacía COUNT(*) de productos/lotes/ventas/gastos sin tenant_id (fuga
+    cross-tenant) y devolvía str(e) con el detalle de Postgres.
+    """
+    return {"ok": True, "servicio": "Nezzura Digital API"}
 
 
 @app.get("/init-db")
-def forzar_init_db():
-    """Re-crea las tablas si fueron borradas accidentalmente."""
+def forzar_init_db(tenant_id: str = Depends(get_tenant_id)):
+    """Re-crea las tablas si fueron borradas accidentalmente.
+
+    Requiere JWT: el frontend lo llama al recibir DB_NO_INICIALIZADA. El
+    advisory lock de inicializar_db() impide migraciones concurrentes.
+    """
     try:
         inicializar_db()
         return {"ok": True, "mensaje": "Tablas verificadas / creadas correctamente ✓"}
     except Exception as e:
-        return {"ok": False, "mensaje": str(e)}
+        print(f"init-db falló: {e}")
+        return {"ok": False, "mensaje": "No se pudo inicializar la base de datos."}
 
 # ── Servidor MCP (conector IA / Muse) ─────────────────────────────────────────
 # Se monta AL FINAL DEL ARCHIVO y en "/": el Mount captura cualquier path que

@@ -64,6 +64,14 @@ class AutenticacionAPIKey:
         self.app = app
 
     async def __call__(self, scope, receive, send):
+        # lifespan sí pasa (arranque del SDK). WebSocket no: el transporte
+        # actual es HTTP/SSE y un upgrade sin X-API-Key sería un bypass.
+        if scope["type"] == "lifespan":
+            await self.app(scope, receive, send)
+            return
+        if scope["type"] == "websocket":
+            await send({"type": "websocket.close", "code": 1008})
+            return
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
